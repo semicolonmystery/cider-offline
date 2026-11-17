@@ -20,7 +20,7 @@ cider-offline-trust = { version = "0.1.0", path = "../trust" }
 directories = "6.0.0"
 flate2 = "1.1.11"
 http-body-util = "0.1.5"
-hudsucker = "0.24.1"
+hudsucker = "0.25.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["brotli", "gzip", "json", "query", "rustls"] }
 rusqlite = { version = "0.42.0", features = ["bundled", "functions"] }
 serde = { version = "1.0.229", features = ["derive"] }
