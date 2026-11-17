@@ -1,0 +1,497 @@
+import { LineEdit, ComboBox, ScrollView, CheckBox } from "std-widgets.slint";
+import {
+    Theme, Icons, Icon, IconButton, ActionButton, Segmented, Artwork,
+} from "../components.slint";
+import { LibraryAddState } from "../globals.slint";
+
+// A labelled field: label above the control.
+component Field inherits VerticalLayout {
+    in property <string> label;
+    spacing: 4px;
+    Text {
+        text: root.label;
+        font-size: Theme.callout;
+        color: Theme.text-secondary;
+    }
+
+    @children
+}
+
+// A group of fields under a headline.
+component FieldGroup inherits VerticalLayout {
+    in property <string> title;
+    spacing: 16px;
+    Text {
+        text: root.title;
+        font-size: Theme.headline;
+        font-weight: 600;
+        color: Theme.text-primary;
+    }
+
+    @children
+}
+
+// A file row: glyph, the chosen file name (or placeholder) and a button.
+component FileRow inherits Rectangle {
+    in property <image> icon;
+    in property <bool> chosen;
+    in property <string> name;
+    in property <string> placeholder: "No file chosen";
+    in property <string> button-text: "Choose…";
+    callback pick();
+
+    height: 40px;
+    border-radius: Theme.radius-sm;
+    background: Theme.bg-fill;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 4px;
+        spacing: 10px;
+        Icon {
+            y: (parent.height - self.height) / 2;
+            source: root.icon;
+            size: 18px;
+            tint: root.chosen ? Theme.text-primary : Theme.text-secondary;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            overflow: elide;
+            font-size: Theme.body;
+            color: root.chosen ? Theme.text-primary : Theme.text-tertiary;
+            text: root.chosen ? root.name : root.placeholder;
+        }
+
+        ActionButton {
+            y: (parent.height - self.height) / 2;
+            text: root.button-text;
+            clicked => {
+                root.pick();
+            }
+        }
+    }
+}
+
+/// Modal Add / Edit dialog for custom songs, albums and playlists.
+export component LibraryAddDialog inherits Rectangle {
+    visible: LibraryAddState.open;
+
+    property <bool> is-song: LibraryAddState.kind == 0;
+    property <bool> is-collection: LibraryAddState.kind != 0;
+    property <string> noun: LibraryAddState.kind == 0 ? "song" : LibraryAddState.kind == 1 ? "album" : "playlist";
+    property <bool> more-open: false;
+    property <length> dialog-w: min(560px, root.width - 48px);
+
+    changed visible => {
+        if self.visible {
+            keys.focus();
+        }
+    }
+
+    // Scrim.
+    Rectangle {
+        background: Theme.scrim;
+        TouchArea {
+            clicked => {
+                LibraryAddState.cancel();
+            }
+        }
+    }
+
+    Rectangle {
+        width: root.dialog-w;
+        height: min(root.height - 96px, 720px);
+        border-radius: Theme.radius-md;
+        background: Theme.bg-raised;
+        border-width: 1px;
+        border-color: Theme.raised-border;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: Theme.raised-shadow;
+        clip: true;
+
+        TouchArea { }
+
+        keys := FocusScope {
+            focus-on-click: false;
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    LibraryAddState.cancel();
+                    return accept;
+                }
+                reject
+            }
+
+            VerticalLayout {
+                // Header.
+                HorizontalLayout {
+                    height: 56px;
+                    padding-left: 20px;
+                    padding-right: 12px;
+                    Text {
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        text: (LibraryAddState.editing ? "Edit " : "Add ") + root.noun;
+                        font-size: Theme.headline;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: Icons.close;
+                            tooltip: "Close";
+                            clicked => {
+                                LibraryAddState.cancel();
+                            }
+                        }
+                    }
+                }
+
+                if !LibraryAddState.editing: HorizontalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    padding-bottom: 12px;
+                    alignment: start;
+                    Segmented {
+                        options: ["Song", "Album", "Playlist"];
+                        current <=> LibraryAddState.kind;
+                        changed(index) => {
+                            LibraryAddState.set-kind(index);
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.separator;
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding-left: 20px;
+                        padding-right: 24px;
+                        padding-top: 16px;
+                        padding-bottom: 20px;
+                        spacing: 24px;
+                        alignment: start;
+
+                        FieldGroup {
+                            title: "Details";
+                            Field {
+                                label: root.is-collection ? "Name" : "Title";
+                                LineEdit {
+                                    placeholder-text: "Required";
+                                    text <=> LibraryAddState.title;
+                                }
+                            }
+
+                            if LibraryAddState.kind != 2: Field {
+                                label: "Artist";
+                                LineEdit {
+                                    text <=> LibraryAddState.artist;
+                                }
+                            }
+
+                            if root.is-song: HorizontalLayout {
+                                spacing: 12px;
+                                Field {
+                                    label: "Album";
+                                    LineEdit {
+                                        text <=> LibraryAddState.album;
+                                    }
+                                }
+
+                                Field {
+                                    label: "Album artist";
+                                    LineEdit {
+                                        text <=> LibraryAddState.album-artist;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Field {
+                                    label: "Genre";
+                                    LineEdit {
+                                        text <=> LibraryAddState.genre;
+                                    }
+                                }
+
+                                Field {
+                                    label: "Release date";
+                                    LineEdit {
+                                        placeholder-text: "YYYY-MM-DD";
+                                        text <=> LibraryAddState.release-date;
+                                    }
+                                }
+                            }
+
+                            if root.is-collection: Field {
+                                label: "Description";
+                                LineEdit {
+                                    text <=> LibraryAddState.description;
+                                }
+                            }
+                        }
+
+                        FieldGroup {
+                            title: root.is-collection ? "Cover" : "Artwork";
+                            FileRow {
+                                icon: Icons.image-file;
+                                chosen: root.is-collection ? LibraryAddState.has-cover : LibraryAddState.has-artwork;
+                                name: root.is-collection ? LibraryAddState.cover-name : LibraryAddState.artwork-name;
+                                placeholder: "No image chosen";
+                                button-text: "Choose image…";
+                                pick => {
+                                    if root.is-collection {
+                                        LibraryAddState.pick-cover();
+                                    } else {
+                                        LibraryAddState.pick-artwork();
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.is-song: FieldGroup {
+                            title: "Placement";
+                            HorizontalLayout {
+                                alignment: start;
+                                Segmented {
+                                    options: ["None", "Existing", "Apple album", "New album"];
+                                    current <=> LibraryAddState.placement;
+                                }
+                            }
+
+                            if LibraryAddState.placement == 1: Field {
+                                label: "Album or playlist";
+                                ComboBox {
+                                    model: LibraryAddState.collections-labels;
+                                    current-index <=> LibraryAddState.collection-index;
+                                }
+                            }
+
+                            if LibraryAddState.placement == 2: Field {
+                                label: "Apple Music album";
+                                LineEdit {
+                                    placeholder-text: "Album ID or music.apple.com link";
+                                    text <=> LibraryAddState.real-album-id;
+                                }
+                            }
+
+                            if LibraryAddState.placement == 3: Field {
+                                label: "New album name";
+                                LineEdit {
+                                    placeholder-text: "Required";
+                                    text <=> LibraryAddState.new-album-name;
+                                }
+                            }
+                        }
+
+                        if root.is-song: FieldGroup {
+                            title: "Audio";
+                            HorizontalLayout {
+                                alignment: start;
+                                Segmented {
+                                    options: ["None", "File", "Another song"];
+                                    current <=> LibraryAddState.audio-mode;
+                                }
+                            }
+
+                            if LibraryAddState.audio-mode == 1: FileRow {
+                                icon: Icons.audio-file;
+                                chosen: LibraryAddState.has-audio-file;
+                                name: LibraryAddState.audio-name;
+                                placeholder: "No audio file chosen";
+                                pick => {
+                                    LibraryAddState.pick-audio();
+                                }
+                            }
+
+                            if LibraryAddState.audio-mode == 2: Field {
+                                label: "Song ID to use the audio of";
+                                LineEdit {
+                                    placeholder-text: "Apple Music song ID";
+                                    text <=> LibraryAddState.reference-id;
+                                }
+                            }
+                        }
+
+                        if root.is-song: FieldGroup {
+                            title: "Lyrics";
+                            HorizontalLayout {
+                                spacing: 8px;
+                                FileRow {
+                                    horizontal-stretch: 1;
+                                    icon: Icons.lyrics;
+                                    chosen: LibraryAddState.has-lyrics-file;
+                                    name: LibraryAddState.lyrics-name;
+                                    placeholder: "No lyrics file (TTML or LRC)";
+                                    pick => {
+                                        LibraryAddState.pick-lyrics();
+                                    }
+                                }
+
+                                if LibraryAddState.has-lyrics-file: ActionButton {
+                                    y: 4px;
+                                    text: "Clear";
+                                    kind: "plain";
+                                    clicked => {
+                                        LibraryAddState.clear-lyrics();
+                                    }
+                                }
+                            }
+
+                            CheckBox {
+                                text: "Also fetch from LRCLIB";
+                                checked <=> LibraryAddState.fetch-lyrics;
+                            }
+                        }
+
+                        if root.is-song: VerticalLayout {
+                            spacing: 16px;
+
+                            Rectangle {
+                                height: 24px;
+                                accessible-role: button;
+                                accessible-label: "More details";
+                                accessible-expandable: true;
+                                accessible-expanded: root.more-open;
+                                accessible-action-default => {
+                                    root.more-open = !root.more-open;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    Text {
+                                        text: "More details";
+                                        font-size: Theme.headline;
+                                        font-weight: 600;
+                                        color: Theme.text-primary;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Icon {
+                                        y: (parent.height - self.height) / 2;
+                                        source: Icons.chevron-down;
+                                        size: 16px;
+                                        transform-rotation: root.more-open ? 0deg : -90deg;
+                                        animate transform-rotation { duration: 150ms; }
+                                    }
+                                }
+
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.more-open = !root.more-open;
+                                    }
+                                }
+                            }
+
+                            if root.more-open: Field {
+                                label: "Composer";
+                                LineEdit {
+                                    text <=> LibraryAddState.composer;
+                                }
+                            }
+
+                            if root.more-open: HorizontalLayout {
+                                spacing: 12px;
+                                Field {
+                                    label: "Track no.";
+                                    LineEdit {
+                                        input-type: number;
+                                        text <=> LibraryAddState.track-number;
+                                    }
+                                }
+
+                                Field {
+                                    label: "Disc no.";
+                                    LineEdit {
+                                        input-type: number;
+                                        text <=> LibraryAddState.disc-number;
+                                    }
+                                }
+                            }
+
+                            if root.more-open: Field {
+                                label: "ISRC";
+                                LineEdit {
+                                    text <=> LibraryAddState.isrc;
+                                }
+                            }
+
+                            if root.more-open: Field {
+                                label: "Apple Music URL";
+                                LineEdit {
+                                    text <=> LibraryAddState.url;
+                                }
+                            }
+
+                            if root.more-open: Field {
+                                label: "Content rating";
+                                ComboBox {
+                                    model: ["None", "Clean", "Explicit"];
+                                    current-index <=> LibraryAddState.content-rating;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Sticky footer.
+                Rectangle {
+                    height: 1px;
+                    background: Theme.separator;
+                }
+
+                HorizontalLayout {
+                    height: 64px;
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    spacing: 8px;
+
+                    if LibraryAddState.message != "": Icon {
+                        y: (parent.height - self.height) / 2;
+                        source: Icons.alert;
+                        size: 16px;
+                        tint: Theme.error;
+                    }
+
+                    Text {
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        text: LibraryAddState.message;
+                        font-size: Theme.callout;
+                        color: Theme.text-secondary;
+                        overflow: elide;
+                    }
+
+                    ActionButton {
+                        y: (parent.height - self.height) / 2;
+                        text: "Cancel";
+                        enabled: !LibraryAddState.busy;
+                        clicked => {
+                            LibraryAddState.cancel();
+                        }
+                    }
+
+                    ActionButton {
+                        y: (parent.height - self.height) / 2;
+                        text: LibraryAddState.busy ? "Saving…" : LibraryAddState.editing ? "Save" : "Add";
+                        kind: "primary";
+                        enabled: !LibraryAddState.busy;
+                        clicked => {
+                            LibraryAddState.submit();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

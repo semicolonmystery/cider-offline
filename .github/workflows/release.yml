@@ -1,0 +1,652 @@
+name: Release
+
+# Build every installer and portable archive and create a DRAFT GitHub Release
+# when a version tag is pushed:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The workflow fails fast unless the tag (without its leading `v`) equals both
+# the workspace version in Cargo.toml and the version in crates/app/Packager.toml.
+# Every job smoke-tests its build with `--version` before uploading, and the
+# release job publishes one combined SHA256SUMS.txt. Review the draft, then
+# publish it by hand.
+#
+# | Runner           | Target(s)                                   | Outputs                                     |
+# |------------------|---------------------------------------------|---------------------------------------------|
+# | windows-latest   | x86_64-pc-windows-msvc, i686-pc-windows-msvc | NSIS setup .exe, portable .zip              |
+# | windows-11-arm   | aarch64-pc-windows-msvc                     | NSIS setup .exe, portable .zip              |
+# | macos-15         | aarch64 + x86_64-apple-darwin -> lipo       | universal .dmg, portable .zip (.app+data/)  |
+# | ubuntu-24.04     | x86_64-unknown-linux-gnu                    | AppImage (+ portable .tar.gz), .deb, .rpm,  |
+# | ubuntu-24.04-arm | aarch64-unknown-linux-gnu                   |   pacman .tar.gz and its PKGBUILD           |
+#
+# Optional signing / notarization — each runs ONLY when its secrets are present
+# and is skipped cleanly (unsigned artifacts) otherwise:
+#
+#   macOS notarization + signing (repository or environment secrets):
+#     APPLE_CERTIFICATE            base64 of the Developer ID .p12
+#     APPLE_CERTIFICATE_PASSWORD   password for that .p12
+#     APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: NAME (TEAMID)";
+#                                  without it the .app is ad-hoc signed (codesign -s -)
+#     APPLE_ID                     Apple ID email used for notarization
+#     APPLE_PASSWORD               app-specific password for that Apple ID
+#     APPLE_TEAM_ID                Apple Developer team id
+#
+#   Windows Authenticode signing:
+#     WINDOWS_CERTIFICATE_THUMBPRINT   SHA-1 thumbprint of a cert already in the
+#                                      runner's certificate store (used by signtool)
+#
+# Only the built-in GITHUB_TOKEN is needed to create the release.
+#
+# cargo-packager is pinned to 0.11.8: packaging/nsis/installer.nsi is a patched
+# copy of that version's template. Its `--binaries-dir` flag is parsed but never
+# applied when `--config` is given, so each job also rewrites `binaries-dir` in
+# its checkout of Packager.toml to point at the per-target build folder.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PACKAGER_VERSION: 0.11.8
+  CARGO_GENERATE_RPM_VERSION: 0.21.1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Fail early if the tag does not match the app version.
+  verify-version:
+    name: Verify tag matches version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compare.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compare tag, workspace version and Packager.toml version
+        id: compare
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          workspace="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          packager="$(grep -m1 '^version' crates/app/Packager.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "tag=$tag workspace=$workspace packager=$packager"
+          if [ "$tag" != "$workspace" ] || [ "$tag" != "$packager" ]; then
+            echo "::error::version mismatch: tag=$tag workspace=$workspace packager=$packager" >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    # Job-level so the Windows-signing step's `if:` can read it (step-level env
+    # is not available to that same step's `if`). Empty when the secret is unset.
+    env:
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+      VERSION: ${{ needs.verify-version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            arch: x86
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aws-lc-sys ships prebuilt NASM objects for x86_64 Windows only; the
+      # 32-bit build assembles them itself and needs NASM on PATH.
+      - name: Install NASM (i686)
+        if: matrix.target == 'i686-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1
+
+      # aws-lc-sys needs clang-cl for aarch64-pc-windows-msvc. It looks in PATH
+      # and in Visual Studio's bundled LLVM; fail here with a clear message if
+      # neither has it, rather than deep inside the build.
+      - name: Check clang-cl (arm64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: |
+          set -euo pipefail
+          if command -v clang-cl >/dev/null 2>&1; then
+            clang-cl --version
+            exit 0
+          fi
+          vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          if [ ! -x "$vswhere" ]; then
+            echo "::error::clang-cl is not on PATH and vswhere.exe is missing ($vswhere), so Visual Studio's bundled LLVM cannot be located; aws-lc-sys needs clang-cl for aarch64-pc-windows-msvc" >&2
+            exit 1
+          fi
+          vs="$("$vswhere" -latest -products '*' -property installationPath | tr -d '\r')"
+          if [ -z "$vs" ]; then
+            echo "::error::vswhere.exe found no Visual Studio installation; aws-lc-sys needs clang-cl for aarch64-pc-windows-msvc" >&2
+            exit 1
+          fi
+          vs="$(cygpath -u "$vs")"
+          for d in "$vs/VC/Tools/Llvm/ARM64/bin" "$vs/VC/Tools/Llvm/x64/bin" "/c/Program Files/LLVM/bin"; do
+            if [ -x "$d/clang-cl.exe" ]; then
+              "$d/clang-cl.exe" --version
+              cygpath -w "$d" >> "$GITHUB_PATH"
+              exit 0
+            fi
+          done
+          echo "::error::clang-cl not found; aws-lc-sys needs it for aarch64-pc-windows-msvc" >&2
+          exit 1
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-packager
+        run: |
+          if ! cargo packager --version 2>/dev/null | grep -qx "cargo-packager ${CARGO_PACKAGER_VERSION}"; then
+            cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked -p cider-offline --target "$TARGET"
+
+      # Release builds use the Windows GUI subsystem, so `--version` prints
+      # nothing to this console: check the exit code only. `--version` returns
+      # before logging starts, so it must not create the app's folders.
+      - name: Smoke test (--version)
+        run: |
+          set -euo pipefail
+          "target/$TARGET/release/cider-offline.exe" --version
+          echo "exit code 0"
+          appdir="$LOCALAPPDATA/cider-offline"
+          if [ -e "$appdir" ]; then
+            echo "::warning::--version left $appdir behind (it should not touch the app's folders)"
+            ls -laR "$appdir" || true
+          fi
+
+      - name: Point cargo-packager at the target build
+        run: |
+          set -euo pipefail
+          sed -i "s|^binaries-dir = .*|binaries-dir = \"../../target/${TARGET}/release\"|" crates/app/Packager.toml
+          grep '^binaries-dir' crates/app/Packager.toml
+
+      # Opt-in Windows Authenticode signing: append a [windows] table only when
+      # the thumbprint secret is set, so default runs stay unsigned and green.
+      - name: Configure Windows signing
+        if: env.WINDOWS_CERTIFICATE_THUMBPRINT != ''
+        run: |
+          cat >> crates/app/Packager.toml <<EOF
+
+          [windows]
+          certificate-thumbprint = "${WINDOWS_CERTIFICATE_THUMBPRINT}"
+          digest-algorithm = "sha256"
+          timestamp-url = "http://timestamp.digicert.com"
+          EOF
+
+      - name: Package NSIS installer
+        run: cargo packager --config crates/app/Packager.toml --target "$TARGET" --formats nsis --verbose
+
+      # Portable: exe + README.txt + a `data` folder. The folder is what turns
+      # portable mode on; `.keep` stops unzip tools from dropping it.
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "cider-offline_$($env:VERSION)_${{ matrix.arch }}-portable"
+          $stage = Join-Path 'target/portable' 'cider-offline'
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'data') | Out-Null
+          Copy-Item "target/$($env:TARGET)/release/cider-offline.exe" $stage
+          Copy-Item 'packaging/portable/README.txt' $stage
+          New-Item -ItemType File -Force -Path (Join-Path $stage 'data/.keep') | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = Join-Path (Resolve-Path 'target/packages').Path "$name.zip"
+          [System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path $stage).Path, $zip, 'Optimal', $true)
+          Get-Item $zip
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          setup=(target/packages/*-setup.exe)
+          if [ ${#setup[@]} -ne 1 ]; then
+            echo "::error::expected one NSIS setup in target/packages" >&2
+            ls -la target/packages
+            exit 1
+          fi
+          # Already named cider-offline_<version>_<arch>-setup.exe.
+          cp "${setup[0]}" dist/
+          cp target/packages/*-portable.zip dist/
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal
+    needs: verify-version
+    runs-on: macos-15
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+      UNIVERSAL: target/universal-apple-darwin/release
+      APP: target/packages/Cider Offline.app
+      # Job-level so step `if:`s and scripts can test it. Empty when unset:
+      # the .app is then ad-hoc signed and the .dmg built by hand from it.
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: universal-apple-darwin
+
+      - name: Install cargo-packager
+        run: |
+          if ! cargo packager --version 2>/dev/null | grep -qx "cargo-packager ${CARGO_PACKAGER_VERSION}"; then
+            cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked
+          fi
+
+      - name: Build release binaries (arm64, x86_64)
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p cider-offline --target aarch64-apple-darwin
+          cargo build --release --locked -p cider-offline --target x86_64-apple-darwin
+
+      - name: Join into a universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p "$UNIVERSAL"
+          lipo -create \
+            target/aarch64-apple-darwin/release/cider-offline \
+            target/x86_64-apple-darwin/release/cider-offline \
+            -output "$UNIVERSAL/cider-offline"
+          archs="$(lipo -archs "$UNIVERSAL/cider-offline")"
+          echo "archs: $archs"
+          case "$archs" in *arm64*x86_64*|*x86_64*arm64*) ;; *)
+            echo "::error::universal binary is missing an architecture: $archs" >&2; exit 1 ;;
+          esac
+
+      - name: Point cargo-packager at the universal build
+        run: |
+          set -euo pipefail
+          sed -i '' "s|^binaries-dir = .*|binaries-dir = \"../../${UNIVERSAL}\"|" crates/app/Packager.toml
+          grep '^binaries-dir' crates/app/Packager.toml
+
+      # Optional: a layered Icon Composer icon for macOS 26 (Liquid Glass).
+      # Only Xcode 26's actool can compile it. On success the Assets.car is
+      # added as a resource and CFBundleIconName set; the .icns stays the
+      # fallback. On failure the .icns ships alone and the reason goes into the
+      # job summary. This step never fails the job.
+      - name: Liquid Glass icon (optional)
+        run: |
+          set -uo pipefail
+          xcode26="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$xcode26" ]; then
+            sudo xcode-select -s "$xcode26"
+          fi
+          if log="$(sh packaging/macos/liquid-glass-icon.sh target/liquid-glass 2>&1)"; then
+            perl -0pi -e 's|^resources = \[\n|resources = [\n  { src = "../../target/liquid-glass/Assets.car", target = "Assets.car" },\n|m' crates/app/Packager.toml
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" packaging/macos/Info.plist
+            grep -n 'Assets.car' crates/app/Packager.toml
+            {
+              echo "### Liquid Glass icon: built"
+              echo "Assets.car (AppIcon) added with CFBundleIconName; the .icns stays the fallback."
+              echo '```'; echo "$log"; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Liquid Glass icon not built; shipping the .icns only"
+            {
+              echo "### Liquid Glass icon: not built"
+              echo "The app ships the .icns only. Reason:"
+              echo '```'; echo "$log"; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "$log"
+          # Back to the image's default Xcode for packaging.
+          sudo xcode-select -r
+
+      # cargo-packager 0.11.8 signs only when `[macos] signing-identity` is in
+      # the config (it does not read APPLE_SIGNING_IDENTITY itself), so put the
+      # secret there. It then signs the .app and the .dmg and notarizes.
+      - name: Configure macOS signing
+        if: env.APPLE_SIGNING_IDENTITY != ''
+        run: |
+          set -euo pipefail
+          perl -pi -e 's|^\[macos\]$|[macos]\nsigning-identity = "$ENV{APPLE_SIGNING_IDENTITY}"|' crates/app/Packager.toml
+          grep -c '^signing-identity = ' crates/app/Packager.toml
+
+      # Signed: cargo-packager builds and signs the .app and the .dmg (the dmg
+      # format always rebuilds the .app first). Unsigned: only the .app here;
+      # it is ad-hoc signed next and the .dmg is built from the signed bundle.
+      - name: Package .app (and signed .dmg)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APPLE_SIGNING_IDENTITY" ]; then formats=app,dmg; else formats=app; fi
+          cargo packager --config crates/app/Packager.toml --target universal-apple-darwin --binaries-dir target/universal-apple-darwin/release --formats "$formats" --verbose
+
+      - name: Ad-hoc sign the .app
+        if: env.APPLE_SIGNING_IDENTITY == ''
+        run: |
+          set -euo pipefail
+          codesign --force --deep --sign - "$APP"
+
+      - name: Verify the .app signature
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --display --verbose=2 "$APP" 2>&1 | grep -E '^(Identifier|Signature|Authority|TeamIdentifier)=' || true
+
+      - name: Smoke test (--version)
+        run: |
+          set -euo pipefail
+          app="$APP"
+          lipo -archs "$app/Contents/MacOS/cider-offline"
+          out="$("$app/Contents/MacOS/cider-offline" --version)"
+          echo "$out"
+          if [ "$out" != "cider-offline ${VERSION}" ]; then
+            echo "::error::--version printed '$out', expected 'cider-offline ${VERSION}'" >&2
+            exit 1
+          fi
+          # The runner is Apple silicon, so the line above ran the arm64
+          # slice. Run the x86_64 slice too when Rosetta is installed.
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            out="$(arch -x86_64 "$app/Contents/MacOS/cider-offline" --version)"
+            echo "x86_64: $out"
+            if [ "$out" != "cider-offline ${VERSION}" ]; then
+              echo "::error::x86_64 --version printed '$out', expected 'cider-offline ${VERSION}'" >&2
+              exit 1
+            fi
+          else
+            echo "::notice::Rosetta is not available on this runner; the x86_64 slice was not run"
+          fi
+          if [ -f target/liquid-glass/Assets.car ] && [ ! -f "$app/Contents/Resources/Assets.car" ]; then
+            echo "::error::Assets.car was built but is missing from the .app" >&2
+            exit 1
+          fi
+
+      # Unsigned path: a compressed .dmg of the ad-hoc signed .app plus an
+      # /Applications link (the signed path already has cargo-packager's).
+      - name: Build .dmg from the ad-hoc signed .app
+        if: env.APPLE_SIGNING_IDENTITY == ''
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          ditto "$APP" "$root/Cider Offline.app"
+          ln -s /Applications "$root/Applications"
+          dmg="target/packages/Cider Offline_${VERSION}_universal.dmg"
+          hdiutil create -volname "Cider Offline" -srcfolder "$root" -fs HFS+ -format UDZO -ov "$dmg"
+          hdiutil verify "$dmg"
+
+      # Portable: the .app next to a `data` folder (portable mode looks for
+      # `data` beside the .app), plus README.txt. ditto keeps the bundle's
+      # permissions, symlinks and extended attributes.
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          stage="target/portable/cider-offline"
+          mkdir -p "$stage/data"
+          touch "$stage/data/.keep"
+          ditto "$APP" "$stage/Cider Offline.app"
+          codesign --verify --deep --strict "$stage/Cider Offline.app"
+          cp packaging/portable/README.txt "$stage/"
+          ditto -c -k --keepParent "$stage" "dist/cider-offline_${VERSION}_universal-portable.zip"
+          shopt -s nullglob
+          dmg=(target/packages/*.dmg)
+          if [ ${#dmg[@]} -ne 1 ]; then
+            echo "::error::expected one .dmg in target/packages" >&2
+            ls -la target/packages
+            exit 1
+          fi
+          cp "${dmg[0]}" "dist/cider-offline_${VERSION}_universal.dmg"
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+      # linuxdeploy and the smoke test run AppImages; extract instead of
+      # mounting so FUSE is not needed on the runner.
+      APPIMAGE_EXTRACT_AND_RUN: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        run: sh packaging/ci/install-linux-deps.sh
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Native build into target/release: the rpm assets in
+      # crates/app/Cargo.toml and Packager.toml's binaries-dir both read it.
+      - name: Check runner target
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "host=$host"
+          if [ "$host" != "${{ matrix.target }}" ]; then
+            echo "::error::runner host $host is not ${{ matrix.target }}" >&2
+            exit 1
+          fi
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-packager and cargo-generate-rpm
+        run: |
+          if ! cargo packager --version 2>/dev/null | grep -qx "cargo-packager ${CARGO_PACKAGER_VERSION}"; then
+            cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked
+          fi
+          if ! cargo generate-rpm --version 2>/dev/null | grep -qx "cargo-generate-rpm ${CARGO_GENERATE_RPM_VERSION}"; then
+            cargo install cargo-generate-rpm --version "${CARGO_GENERATE_RPM_VERSION}" --locked
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked -p cider-offline
+
+      - name: Package AppImage, .deb and pacman
+        run: cargo packager --config crates/app/Packager.toml --formats appimage,deb,pacman --verbose
+
+      # The generated PKGBUILD's package() copies all of $srcdir, which also
+      # holds makepkg's symlink to the source .tar.gz; copy only the extracted
+      # usr/ tree so the package does not carry that dangling link.
+      - name: Fix PKGBUILD package()
+        run: |
+          set -euo pipefail
+          sed -i 's|cp -r "${srcdir}"/\* "${pkgdir}"/|cp -r "${srcdir}"/usr "${pkgdir}"/|' target/packages/PKGBUILD
+          if ! grep -qF 'cp -r "${srcdir}"/usr "${pkgdir}"/' target/packages/PKGBUILD; then
+            echo "::error::PKGBUILD package() not in the expected form" >&2
+            cat target/packages/PKGBUILD
+            exit 1
+          fi
+          cat target/packages/PKGBUILD
+
+      - name: Package .rpm
+        run: cargo generate-rpm -p crates/app
+
+      - name: Smoke test (--version)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=(target/packages/*.AppImage)
+          if [ ${#images[@]} -ne 1 ]; then
+            echo "::error::expected one AppImage in target/packages" >&2
+            ls -la target/packages
+            exit 1
+          fi
+          chmod +x "${images[0]}"
+          expect="cider-offline ${VERSION}"
+          check() {
+            local what="$1" out
+            shift
+            out="$("$@")"
+            echo "$what: $out"
+            if [ "$out" != "$expect" ]; then
+              echo "::error::$what --version printed '$out', expected '$expect'" >&2
+              exit 1
+            fi
+          }
+          check AppImage env APPIMAGE_EXTRACT_AND_RUN=1 "./${images[0]}" --version
+          # The .deb and .rpm binaries, each extracted into an empty temp dir
+          # (no `data/` beside them, so portable mode stays off).
+          debs=(target/packages/*.deb)
+          rpms=(target/generate-rpm/*.rpm)
+          if [ ${#debs[@]} -ne 1 ] || [ ${#rpms[@]} -ne 1 ]; then
+            echo "::error::expected one .deb and one .rpm" >&2
+            ls -la target/packages target/generate-rpm || true
+            exit 1
+          fi
+          if ! command -v rpm2cpio >/dev/null || ! command -v cpio >/dev/null; then
+            sudo apt-get install -y --no-install-recommends rpm2cpio cpio
+          fi
+          debdir="$(mktemp -d)"
+          dpkg-deb -x "${debs[0]}" "$debdir"
+          check .deb "$debdir/usr/bin/cider-offline" --version
+          rpmdir="$(mktemp -d)"
+          rpm="$(realpath "${rpms[0]}")"
+          (cd "$rpmdir" && rpm2cpio "$rpm" | cpio -idm --quiet)
+          check .rpm "$rpmdir/usr/bin/cider-offline" --version
+          for d in "$debdir" "$rpmdir"; do
+            if [ -e "$d/usr/bin/data" ]; then
+              echo "::error::--version created $d/usr/bin/data" >&2
+              exit 1
+            fi
+          done
+          # The rpm ships the removal scripts like the .deb.
+          test -x "$rpmdir/usr/lib/cider-offline/scripts/remove-ca-linux.sh"
+          test -x "$debdir/usr/lib/cider-offline/scripts/remove-ca-linux.sh"
+
+      # Portable: the AppImage next to a `data` folder (portable mode looks for
+      # `data` beside the .AppImage), plus README.txt.
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          base="cider-offline_${VERSION}_${{ matrix.arch }}"
+          shopt -s nullglob
+          one() {
+            local files=("$@")
+            if [ ${#files[@]} -ne 1 ]; then
+              echo "::error::expected exactly one of: $*" >&2
+              ls -la target/packages target/generate-rpm >&2 || true
+              exit 1
+            fi
+            printf '%s' "${files[0]}"
+          }
+          # Keep the packagers' own (already per-arch) file names: the PKGBUILD's
+          # `source=` names the pacman .tar.gz exactly.
+          # `one` runs in a subshell: its `exit 1` only fails the assignment,
+          # so stop the step explicitly.
+          appimage=$(one target/packages/*.AppImage) || exit 1
+          deb=$(one target/packages/*.deb) || exit 1
+          pacman=$(one "target/packages/${base}.tar.gz") || exit 1
+          rpm=$(one target/generate-rpm/*.rpm) || exit 1
+          cp "$appimage" "$deb" "$pacman" "$rpm" dist/
+          # Both Linux jobs make a file named PKGBUILD: give each a unique asset
+          # name (rename it back to PKGBUILD next to the .tar.gz to use it).
+          cp target/packages/PKGBUILD "dist/${base}.PKGBUILD"
+          stage="target/portable/cider-offline"
+          mkdir -p "$stage/data"
+          touch "$stage/data/.keep"
+          cp "$appimage" "$stage/${base}.AppImage"
+          chmod +x "$stage/${base}.AppImage"
+          cp packaging/portable/README.txt "$stage/"
+          tar -C target/portable -czf "dist/${base}-portable.tar.gz" cider-offline
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create draft GitHub Release
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS.txt
+          sha256sum -- * | tee ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          ls -la
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --draft \
+            --generate-notes \
+            dist/*

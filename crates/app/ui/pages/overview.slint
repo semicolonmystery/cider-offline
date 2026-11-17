@@ -1,0 +1,400 @@
+import { Switch, ListView, ScrollView } from "std-widgets.slint";
+import {
+    Theme, Icons, Icon, BigToggle, Dot, ActionButton, Group, GroupHeading, ListRow,
+    RowSeparator, PageTitle,
+} from "../components.slint";
+import { ProxyState, CiderState } from "../globals.slint";
+
+/// Shown while the local CA is not trusted: the two first-run steps.
+component Onboarding inherits Rectangle {
+    border-radius: Theme.radius-md;
+    background: Theme.accent-soft;
+    height: body.preferred-height;
+
+    body := VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+
+        Text {
+            text: "Two steps to get started";
+            font-size: Theme.headline;
+            font-weight: 600;
+            color: Theme.text-primary;
+        }
+
+        Text {
+            wrap: word-wrap;
+            font-size: Theme.body;
+            color: Theme.text-primary;
+            text: "1. Trust the local certificate. The proxy creates its own certificate authority on this computer so it can read Apple Music traffic and keep Cider working offline. Your system asks for confirmation.";
+        }
+
+        Text {
+            wrap: word-wrap;
+            font-size: Theme.body;
+            color: Theme.text-primary;
+            text: "2. Route Cider through the proxy (below), or set Cider's HTTP and HTTPS proxy to " + ProxyState.address + " and restart it.";
+        }
+
+        HorizontalLayout {
+            alignment: start;
+            ActionButton {
+                text: ProxyState.trust-busy ? "Working…" : "Trust certificate";
+                kind: "primary";
+                enabled: !ProxyState.trust-busy;
+                clicked => {
+                    ProxyState.install-ca();
+                }
+            }
+        }
+    }
+}
+
+/// A dismissable notice at the top of the Overview page.
+component HintBanner inherits Rectangle {
+    in property <string> text;
+    callback dismiss();
+
+    border-radius: Theme.radius-md;
+    background: Theme.accent-soft;
+    height: row.preferred-height;
+
+    row := HorizontalLayout {
+        padding: 16px;
+        spacing: 16px;
+
+        Text {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            font-size: Theme.body;
+            color: Theme.text-primary;
+            text: root.text;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            ActionButton {
+                text: "Dismiss";
+                clicked => {
+                    root.dismiss();
+                }
+            }
+        }
+    }
+}
+
+/// Overview page: the mode switch as the hero, status groups and the live
+/// activity feed.
+export component OverviewPage inherits Rectangle {
+    property <length> pad: root.width >= 1100px ? 32px : 24px;
+    // Certificate row status line (dot + text under the row title). States
+    // come from `TrustState::ui_key`: trusted, untrusted, error; plus checking.
+    property <string> trust-status: ProxyState.trust-busy ? "Working…"
+        : ProxyState.trust-state == "trusted"
+        ? (ProxyState.trust-message != "" ? ProxyState.trust-message : "Trusted by this computer")
+        : ProxyState.trust-state == "untrusted" ? "Not installed"
+        : ProxyState.trust-state == "checking" ? "Checking…" : "Needs attention";
+    property <color> trust-tone: ProxyState.trust-busy || ProxyState.trust-state == "checking" ? Theme.text-tertiary
+        : ProxyState.trust-state == "trusted" ? Theme.ok
+        : ProxyState.trust-state == "untrusted" ? Theme.warn : Theme.error;
+
+    VerticalLayout {
+        padding-left: root.pad;
+        padding-right: root.pad;
+        padding-top: 16px;
+        padding-bottom: root.pad;
+        spacing: 16px;
+
+        PageTitle {
+            height: 56px;
+            title: "Overview";
+            subtitle: "A local proxy between Cider and Apple Music.";
+        }
+
+        // Shown when no system tray exists: closing the window quits the app.
+        if ProxyState.tray-hint: HintBanner {
+            text: "No system tray found, so closing the window quits the app. On GNOME, install the “AppIndicator and KStatusNotifierItem Support” extension to keep it running in the background.";
+            dismiss => {
+                ProxyState.dismiss-tray-hint();
+            }
+        }
+
+        // macOS runs a quarantined portable copy from a read-only temporary
+        // folder (App Translocation), where the `data` folder is not found.
+        if ProxyState.translocation-hint: HintBanner {
+            text: "macOS is running this copy from a temporary read-only location, so the portable “data” folder next to it is not used. Quit, run  xattr -dr com.apple.quarantine  on the unzipped folder in Terminal, and open the app again.";
+            dismiss => {
+                ProxyState.translocation-hint = false;
+            }
+        }
+
+        if ProxyState.trust-state != "trusted" && ProxyState.trust-state != "checking": Onboarding { }
+
+        // Hero: the mode switch.
+        Rectangle {
+            border-radius: Theme.radius-md;
+            background: Theme.bg-fill;
+            height: hero.preferred-height;
+
+            hero := HorizontalLayout {
+                padding: 16px;
+                spacing: 16px;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 4px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: ProxyState.active ? "Active" : "Passthrough";
+                        font-size: Theme.title;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                    }
+
+                    Text {
+                        wrap: word-wrap;
+                        font-size: Theme.body;
+                        color: Theme.text-secondary;
+                        text: ProxyState.active
+                            ? "Apple Music traffic is cached and served from this computer when offline."
+                            : "All traffic is forwarded untouched. Nothing is cached.";
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    BigToggle {
+                        checked <=> ProxyState.active;
+                        enabled: ProxyState.running;
+                        toggled(on) => {
+                            ProxyState.set-active(on);
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 16px;
+            alignment: stretch;
+            vertical-stretch: 0;
+
+            // Status.
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 8px;
+                alignment: start;
+                GroupHeading {
+                    text: "Proxy";
+                }
+
+                Group {
+                    ListRow {
+                        title: ProxyState.starting ? "Starting…"
+                            : !ProxyState.running ? "Proxy stopped"
+                            : ProxyState.online ? "Online" : "Offline, serving from this computer";
+                        description: ProxyState.running && ProxyState.online ? "Apple Music is reachable." : "";
+                        Dot {
+                            tone: !ProxyState.running ? Theme.error : ProxyState.online ? Theme.ok : Theme.warn;
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Address";
+                        description: ProxyState.address;
+                        address := TextInput {
+                            width: 0px;
+                            height: 0px;
+                            read-only: true;
+                            text: ProxyState.address;
+                        }
+
+                        ActionButton {
+                            text: "Copy";
+                            clicked => {
+                                address.select-all();
+                                address.copy();
+                                address.clear-selection();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Requests seen";
+                        Text {
+                            text: ProxyState.requests-seen;
+                            font-size: Theme.body;
+                            color: Theme.text-secondary;
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Served from this computer";
+                        Text {
+                            text: ProxyState.served-locally;
+                            font-size: Theme.body;
+                            color: Theme.text-secondary;
+                        }
+                    }
+                }
+            }
+
+            // Certificate and Cider.
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 8px;
+                alignment: start;
+                GroupHeading {
+                    text: "Setup";
+                }
+
+                Group {
+                    ListRow {
+                        title: "Certificate";
+                        status: root.trust-status;
+                        status-tone: root.trust-tone;
+                        // A trusted CA's note (if any) is the status itself.
+                        description: ProxyState.trust-state == "trusted" ? "" : ProxyState.trust-message;
+
+                        if ProxyState.trust-state != "trusted" && ProxyState.trust-state != "checking": ActionButton {
+                            text: ProxyState.trust-state == "untrusted" ? "Install" : "Fix";
+                            enabled: !ProxyState.trust-busy;
+                            clicked => {
+                                ProxyState.install-ca();
+                            }
+                        }
+
+                        ActionButton {
+                            text: "Check again";
+                            enabled: !ProxyState.trust-busy;
+                            clicked => {
+                                ProxyState.recheck-ca();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    if CiderState.automatic: ListRow {
+                        title: "Route Cider through this proxy";
+                        // Status line, then the settings file in use (the
+                        // description sits under the label).
+                        description: (!CiderState.available
+                            ? (CiderState.message != "" ? CiderState.message : "Cider's settings file was not found. Choose it to continue.")
+                            : CiderState.message != "" ? CiderState.message
+                            : CiderState.routed ? "Changing this restarts Cider." : "Turning this on edits Cider's settings and restarts it.")
+                            + (CiderState.config-path != "" ? "\nSettings file: " + CiderState.config-path : "");
+                        ActionButton {
+                            text: "Choose config file…";
+                            enabled: !CiderState.busy;
+                            clicked => {
+                                CiderState.choose-config();
+                            }
+                        }
+
+                        Switch {
+                            checked <=> CiderState.routed;
+                            enabled: CiderState.available && !CiderState.busy;
+                            toggled => {
+                                CiderState.set-routed(self.checked);
+                            }
+                        }
+                    }
+
+                    if !CiderState.automatic: ListRow {
+                        title: "Use Cider with this proxy";
+                        description: CiderState.guide;
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Capture Apple traffic to disk";
+                        description: "For troubleshooting. Saved in the capture folder.";
+                        Switch {
+                            checked <=> ProxyState.capture;
+                            enabled: ProxyState.running;
+                            toggled => {
+                                ProxyState.set-capture(self.checked);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ProxyState.last-error != "": Rectangle {
+            border-radius: Theme.radius-md;
+            background: Theme.error.with-alpha(0.12);
+            height: error-row.preferred-height;
+            error-row := HorizontalLayout {
+                padding: 12px;
+                spacing: 8px;
+                Icon {
+                    source: Icons.alert;
+                    size: 16px;
+                    tint: Theme.error;
+                }
+
+                Text {
+                    text: ProxyState.last-error;
+                    font-size: Theme.body;
+                    wrap: word-wrap;
+                    color: Theme.error;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        // Activity.
+        GroupHeading {
+            text: "Activity";
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            min-height: 96px;
+            border-radius: Theme.radius-md;
+            background: Theme.bg-fill;
+
+            if ProxyState.activity.length == 0: Text {
+                text: "Nothing yet.";
+                font-size: Theme.body;
+                color: Theme.text-secondary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            if ProxyState.activity.length > 0: ListView {
+                for row in ProxyState.activity: HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 12px;
+                    height: 32px;
+                    Text {
+                        text: row.time;
+                        width: 64px;
+                        vertical-alignment: center;
+                        color: Theme.text-tertiary;
+                        font-size: Theme.caption;
+                    }
+
+                    Text {
+                        text: row.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        font-size: Theme.body;
+                        color: row.level == "error" ? Theme.error : row.level == "warn" ? Theme.warn : Theme.text-primary;
+                    }
+                }
+            }
+        }
+    }
+}

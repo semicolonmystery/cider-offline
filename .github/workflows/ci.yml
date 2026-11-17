@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Only the minimum: CI just reads the code and reports status.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save runner time.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
+          - os: windows-latest
+            name: Windows
+          - os: macos-latest
+            name: macOS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Slint (winit) build libraries plus libnss3-tools (`certutil`, used by
+      # the trust crate's tests). The tray (ksni) and file pickers are pure
+      # Rust, so no GTK, appindicator or libxdo.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sh packaging/ci/install-linux-deps.sh
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace

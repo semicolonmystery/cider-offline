@@ -1,0 +1,65 @@
+name: Bug report
+description: Something doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [Troubleshooting](https://cider-offline.podik.cz/docs/troubleshooting.html) first; your problem may already be covered there.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: Windows 11 24H2, macOS 15.5, Fedora 43 (KDE, Wayland)
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: Cider Offline version
+      description: The version in the file name you downloaded, or the output of `cider-offline --version` (macOS and Linux).
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: Install type
+      options:
+        - Installer or package
+        - Portable
+    validations:
+      required: true
+  - type: input
+    id: cider-version
+    attributes:
+      label: Cider version
+      placeholder: "4.0.30"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        The relevant lines from the newest `cider-offline.*.log` in the `logs` folder of the app's cache directory (Windows `%LOCALAPPDATA%\cider-offline\CiderOffline\cache\logs`, macOS `~/Library/Caches/sh.cider-offline.CiderOffline/logs`, Linux `~/.cache/cideroffline/logs`, portable `data/cache/logs`).
+
+        **Read them before you paste and remove anything that looks like a token, a cookie or an `Authorization` header.** This issue is public.
+      render: text

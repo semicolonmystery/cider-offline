@@ -1,0 +1,11 @@
+[book]
+title = "Cider Offline"
+authors = ["Lukáš Poddaný"]
+description = "Documentation for Cider Offline, a local proxy that keeps the Cider music client working offline."
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/docs/"
+git-repository-url = "https://github.com/semicolonmystery/cider-offline"
+edit-url-template = "https://github.com/semicolonmystery/cider-offline/edit/main/docs/{path}"

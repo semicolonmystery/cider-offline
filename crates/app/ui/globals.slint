@@ -1,0 +1,470 @@
+// Data types and globals shared between the UI and Rust.
+//
+// Rust writes properties through `app.global::<…>()` and handles the
+// callbacks; pages only read state and invoke callbacks.
+
+/// One line of the live activity feed on the Overview page.
+export struct ActivityRow {
+    time: string,
+    text: string,
+    // "info" | "warn" | "error"
+    level: string,
+}
+
+/// An album or playlist cover card in the Library grid (real or custom).
+export struct CollectionRow {
+    id: string,
+    name: string,
+    // Card subtitle: the artist for albums, "Playlist" for playlists
+    // (", Custom" appended for custom items).
+    subtitle: string,
+    // Album artist ("" for playlists or when unknown).
+    artist: string,
+    has-artwork: bool,
+    artwork: image,
+    // "album" | "playlist" — drives the detail "Add song" affordance and glyph.
+    kind: string,
+    // User-created fake item (shows a "Custom" badge).
+    is-custom: bool,
+    // Inline download state aggregated over the collection's tracks:
+    // "" (none) | "queued" | "downloading" | "done" | "failed" | "paused".
+    dl-status: string,
+    // Aggregate download progress 0.0 .. 1.0.
+    dl-progress: float,
+    // Every track in the collection is available locally.
+    downloaded: bool,
+    // The collection was downloaded as a whole (has a download pin), so
+    // "Remove download" applies to it.
+    pinned: bool,
+    // Not loaded yet (paged model): draw a skeleton card, not data.
+    placeholder: bool,
+}
+
+/// A track in the Library song list / collection detail.
+export struct TrackRow {
+    id: string,
+    // Numeric catalog (adam) id used to match the live download queue, which
+    // keys status by catalog id. Falls back to `id` when the catalog id is
+    // unknown. `id` stays the library id for import/map/remove/reorder.
+    catalog-id: string,
+    title: string,
+    artist: string,
+    album: string,
+    duration: string,
+    has-audio: bool,
+    // "apple" | "lrclib" | "amll" | "netease" | "kugou" | "musixmatch" | "community" | "none"
+    lyrics: string,
+    // Timing of the local lyrics: 0 none, 1 plain, 2 line-synced, 3 word-synced.
+    lyrics-quality: int,
+    has-artwork: bool,
+    artwork: image,
+    busy: bool,
+    // User-created fake song (shows a "Custom" badge).
+    is-custom: bool,
+    // A user track-id → local file mapping exists (Mappings replacement).
+    has-mapping: bool,
+    // Live download state for this track (matched by catalog id):
+    // "" (none) | "queued" | "downloading" | "done" | "failed" | "paused".
+    dl-status: string,
+    // Download progress 0.0 .. 1.0.
+    dl-progress: float,
+    // Position within its album (1-based, 0 = unknown), for album details.
+    track-number: int,
+    // Not loaded yet (paged model): draw a skeleton row, not data.
+    placeholder: bool,
+}
+
+/// One queued or running download in the Downloads list.
+export struct DownloadRow {
+    // Unique row id (track id or job id).
+    id: string,
+    track-id: string,
+    title: string,
+    artist: string,
+    album: string,
+    // "queued" | "downloading" | "done" | "failed" | "paused" | "unavailable"
+    status: string,
+    // 0.0 .. 1.0
+    progress: float,
+    // Current stage line ("Requesting", "Downloading 42%", "Retrying in 12 s",
+    // "Can't download yet: …"); "" when idle.
+    detail: string,
+    // Error or informational message.
+    message: string,
+    has-artwork: bool,
+    artwork: image,
+    // "album:pl.xxx" | "playlist:pl.xxx" | "song" — used for grouping.
+    source: string,
+    // "Album Name" or "Playlist Name" or "".
+    source-name: string,
+    // Optional user action offered on a "Can't download yet" row, e.g.
+    // "Download album version" for a music video; "" when none.
+    alt-action: string,
+}
+
+/// Proxy state shown on the Overview page and kept in sync with the tray.
+export global ProxyState {
+    in-out property <bool> active: true;
+    in-out property <bool> capture: false;
+    in property <bool> online: true;
+    in property <bool> running: false;
+    in property <bool> starting: true;
+    in property <string> address: "127.0.0.1:8000";
+    in property <string> requests-seen: "0";
+    in property <string> served-locally: "0";
+    in property <string> last-error;
+    in property <[ActivityRow]> activity;
+
+    // "unknown" | "checking" | "trusted" | "untrusted" | "error"
+    in property <string> trust-state: "checking";
+    in property <string> trust-message;
+    in property <bool> trust-busy: false;
+
+    // No system tray host found and the hint was not dismissed yet.
+    in-out property <bool> tray-hint: false;
+
+    // macOS App Translocation moved the app away from its portable `data` folder.
+    in-out property <bool> translocation-hint: false;
+
+    callback set-active(bool);
+    callback set-capture(bool);
+    callback install-ca();
+    callback recheck-ca();
+    callback dismiss-tray-hint();
+}
+
+/// Cider integration state shown on the Overview page.
+export global CiderState {
+    // Whether the app can change Cider's settings on this OS (false: guide only).
+    in property <bool> automatic: false;
+    // Whether the control can be used (Cider's config file was found).
+    in property <bool> available: false;
+    // Path of the config file in use (empty when none was found).
+    in property <string> config-path;
+    // Manual steps for this OS, shown when `automatic` is false.
+    in property <string> guide;
+    // Whether Cider is currently routed through this proxy
+    // (UseProxy && ProxyServer points at us).
+    in-out property <bool> routed: false;
+    // True while an apply or refresh is in flight.
+    in property <bool> busy: false;
+    // Short status / result line (e.g. why the control is disabled).
+    in property <string> message;
+
+    // User flipped the switch to `on`.
+    callback set-routed(bool);
+    // Re-read Cider's current proxy state.
+    callback refresh();
+    // Let the user pick Cider's config file.
+    callback choose-config();
+}
+
+/// Unified Library page state.
+///
+/// The grouped grid reads `collections`; the flat songs view and the collection
+/// detail both read `tracks` (filtered in Rust). Mappings, Custom-songs and the
+/// Downloads page are folded in here (per-row actions, the Add stub, and the
+/// Downloads drawer whose data still lives in `DownloadsState`).
+export global LibraryState {
+    in property <[CollectionRow]> collections;
+    in property <[TrackRow]> tracks;
+    in property <int> total-tracks;
+    in property <int> total-collections;
+    in property <bool> loading: false;
+    in property <bool> bulk-busy: false;
+    // Latest status message, shown as a toast. `message-seq` increments per
+    // message so a repeated text restarts the toast; errors stay until closed.
+    in property <string> message;
+    in property <bool> message-is-error: false;
+    in property <int> message-seq: 0;
+    // Header count line ("248 albums and playlists, 3,120 songs").
+    in property <string> count-line;
+
+    in-out property <string> search;
+    // 0 = all, 1 = missing audio, 2 = missing lyrics
+    in-out property <int> filter: 0;
+    // Source: 0 = Apple Music library (the user's saved library), 1 = Downloaded
+    // (only items available locally in the proxy), 2 = All (everything observed),
+    // 3 = Custom (user-created items only). Each maps 1:1 to a core LibraryFilter.
+    in-out property <int> source: 0;
+    // View toggle: 0 = grouped grid, 1 = flat songs list.
+    in-out property <int> view: 0;
+    // "" = all tracks, otherwise the detail collection id.
+    in-out property <string> collection;
+
+    // Collection detail sub-view (pushed when a card is clicked).
+    in-out property <bool> detail-open: false;
+    in property <string> detail-title;
+    // "Album by Artist" / "Playlist".
+    in property <string> detail-subtitle;
+    // "14 songs, 61 minutes" (", Custom" appended for custom collections).
+    in property <string> detail-meta;
+    in property <bool> detail-is-custom;
+    in property <string> detail-kind;
+    in property <bool> detail-has-artwork;
+    in property <image> detail-artwork;
+    // Aggregate download state of the open collection (same vocabulary as the
+    // card `dl-status`), used by the detail "Download all" control.
+    in property <string> detail-dl-status;
+    in property <float> detail-dl-progress;
+    in property <bool> detail-downloaded;
+    // The open collection has a download pin ("Remove download" applies).
+    in property <bool> detail-pinned;
+
+    callback refresh();
+    callback search-changed(string);
+    callback filter-changed(int);
+    // Switch the library source (0 = Apple Music library, 1 = Downloaded).
+    callback set-source(int);
+    callback set-view(int);
+    // Open the detail sub-view for a collection card.
+    callback open-collection(string);
+    // Leave the detail sub-view.
+    callback close-collection();
+    callback import-audio(string);
+    // Set / clear a track-id → local file mapping (Mappings replacement).
+    callback map-audio(string);
+    callback clear-mapping(string);
+    callback refetch-lyrics(string);
+    // Pick a local TTML/LRC lyrics file for a track (pass-2 backend).
+    callback choose-lyrics-file(string);
+    // Delete a custom song (after the confirm dialog).
+    callback remove-track(string);
+    // Delete a song's downloaded audio (after the confirm dialog).
+    callback remove-download(string);
+    // Remove a collection's download (after the confirm dialog): drops its
+    // pin and deletes audio no other download still needs.
+    callback remove-collection-download(string);
+    callback fetch-missing-lyrics();
+    // Fetch lyrics for every track of one collection (the detail header action).
+    callback fetch-collection-lyrics(string);
+    callback download-track(string);
+    // Enqueue every track of a collection (the "Download all" / card action).
+    callback download-collection(string);
+    // Pause / resume (or retry, when failed) a collection's in-flight download.
+    callback toggle-collection-download(string);
+    callback download-missing-audio();
+    // Add custom album / song — opens the Add/Edit dialog.
+    callback add-item();
+    // Edit a custom item (song or collection) — opens the Add/Edit dialog.
+    callback edit-item(string);
+    // Reorder a song within the open custom collection: move `id` to `position`
+    // (0-based). Wired to `place_track_in_collection`.
+    callback reorder-track(string, int);
+    // The grid's card width changed (picks the cover decode size).
+    callback card-width-changed(length);
+}
+
+/// One existing album / playlist offered as a placement target in the Add
+/// dialog's "album" picker (covers real and custom collections).
+export struct AddCollectionRow {
+    id: string,
+    // "Name — Album · Artist" style label shown in the dropdown.
+    label: string,
+    // Whether this is a custom (local) collection a song can be placed into.
+    is-custom: bool,
+}
+
+/// State of the Library Add / Edit dialog (custom album, playlist or song).
+///
+/// A single dialog serves all three item types; `kind` switches the visible
+/// fields. Rust reads the two-way-bound fields on submit and keeps the picked
+/// file paths (cover / artwork / audio / lyrics) on its own side.
+export global LibraryAddState {
+    in-out property <bool> open: false;
+    // 0 = Custom song, 1 = Custom album, 2 = Custom playlist.
+    in-out property <int> kind: 0;
+    // Editing an existing item (type switch is locked) vs creating a new one.
+    in property <bool> editing: false;
+    in property <bool> busy: false;
+    in property <string> message;
+
+    // Shared / collection fields.
+    in-out property <string> title;
+    in-out property <string> artist;
+    in-out property <string> description;
+    in-out property <string> genre;
+    in-out property <string> release-date;
+    in property <bool> has-cover: false;
+    in property <string> cover-name;
+
+    // Song-only fields.
+    in-out property <string> album;
+    in-out property <string> album-artist;
+    in-out property <string> composer;
+    in-out property <string> track-number;
+    in-out property <string> disc-number;
+    in-out property <string> isrc;
+    in-out property <string> url;
+    // 0 = none, 1 = clean, 2 = explicit.
+    in-out property <int> content-rating: 0;
+    in property <bool> has-artwork: false;
+    in property <string> artwork-name;
+
+    // Placement: 0 = standalone, 1 = existing collection, 2 = real album id/URL,
+    // 3 = new custom album.
+    in-out property <int> placement: 0;
+    in property <[AddCollectionRow]> collections;
+    // Dropdown labels parallel to `collections` (ComboBox needs a string model).
+    in property <[string]> collections-labels;
+    in-out property <int> collection-index: 0;
+    in-out property <string> real-album-id;
+    in-out property <string> new-album-name;
+
+    // Audio: 0 = none, 1 = local file, 2 = another track's audio (by id).
+    in-out property <int> audio-mode: 0;
+    in property <bool> has-audio-file: false;
+    in property <string> audio-name;
+    in-out property <string> reference-id;
+
+    // Lyrics: an optional local TTML/LRC file, or a one-off LRCLIB refetch.
+    in property <bool> has-lyrics-file: false;
+    in property <string> lyrics-name;
+    in-out property <bool> fetch-lyrics: false;
+
+    // Switch the item type (clears type-specific state in Rust).
+    callback set-kind(int);
+    callback pick-cover();
+    callback pick-artwork();
+    callback pick-audio();
+    callback pick-lyrics();
+    callback clear-lyrics();
+    callback submit();
+    callback cancel();
+}
+
+/// Downloads state. Still populated by `ui/downloads.rs`, now rendered inside
+/// the Library page's Downloads drawer instead of a dedicated nav page.
+export global DownloadsState {
+    in property <[DownloadRow]> rows;
+    in property <int> total;
+    in property <int> active-count;
+    in property <int> queued-count;
+    in property <int> done-count;
+    in property <int> failed-count;
+    in property <int> paused-count;
+    // Rows that can never be downloaded ("Can't download yet").
+    in property <int> unavailable-count;
+    // Overall progress of the current batch (every row except unavailable).
+    in property <float> batch-progress;
+    // "12 of 40 songs, 3 downloading, 2 failed".
+    in property <string> summary-line;
+    in property <bool> busy;
+    in property <string> message;
+
+    in-out property <string> search;
+    // 0 = all, 1 = active, 2 = queued, 3 = done, 4 = failed
+    in-out property <int> filter;
+    in-out property <string> url-input;
+
+    // Paste a URL/ID, enqueue album/playlist/song.
+    callback enqueue-url(string);
+    callback search-changed(string);
+    callback filter-changed(int);
+    // Retry a failed row by id.
+    callback retry(string);
+    // Pause a downloading / queued row (click-to-stop half of the ring).
+    callback pause(string);
+    // Resume a paused row (click-to-continue half of the ring).
+    callback resume(string);
+    // Cancel a queued/downloading row.
+    callback cancel(string);
+    // Run the row's `alt-action` (queue the album version of a music video).
+    callback download-album-version(string);
+    // Remove all done rows.
+    callback clear-finished();
+    // Retry every failed row (never the "Can't download yet" ones).
+    callback retry-failed();
+    callback pause-all();
+    callback resume-all();
+    callback refresh();
+}
+
+/// Settings page state.
+/// One lyrics provider in Settings, in priority order.
+export struct LyricsProviderRow {
+    // Stable key ("apple", "lrclib").
+    id: string,
+    name: string,
+    note: string,
+    enabled: bool,
+    // Whether the failure rule applies to it.
+    policy: bool,
+}
+
+export global SettingsState {
+    in-out property <int> port: 8000;
+    in property <int> applied-port: 8000;
+    in-out property <bool> start-with-os: false;
+    in-out property <bool> start-minimized: false;
+    // 0 = Off, 1 = Instant, 2 = Deferred
+    in-out property <int> auto-cache-mode: 0;
+    // Simultaneous downloads, 1..=6 (applied live).
+    in-out property <int> download-concurrency: 2;
+    // 0 = Full, 1 = Minimal (how much metadata is stored for observed songs).
+    in-out property <int> detail-level: 0;
+    // Replace existing audio when importing / downloading instead of skipping.
+    in-out property <bool> overwrite-audio: false;
+    // Library Songs page: 0 = only songs added to the library (like Apple), 1 = every song.
+    in-out property <int> songs-page: 0;
+    // Replace existing lyrics when refetching instead of keeping them.
+    in-out property <bool> overwrite-lyrics: false;
+    // Lyrics providers in priority order.
+    in property <[LyricsProviderRow]> lyrics-providers;
+    // 0 = skip and retry at the end, 1 = wait and retry, 2 = skip.
+    in-out property <int> lyrics-failure-policy: 0;
+    // Search until: 0 = word-synced (best), 1 = line-synced, 2 = any lyrics.
+    in-out property <int> lyrics-target-quality: 0;
+    in-out property <bool> lyrics-after-download: true;
+    // Online, answer lyrics requests from downloaded lyrics without asking Apple (applied live).
+    in-out property <bool> lyrics-always-local: false;
+    // Pause between LRCLIB lookups (ms).
+    in-out property <int> lrclib-spacing: 250;
+    // Retry passes for "skip and retry at the end".
+    in-out property <int> lyrics-retry-passes: 3;
+    // The Lyrics group's "More options" disclosure.
+    in-out property <bool> lyrics-more-open: false;
+    in property <bool> autostart-supported: true;
+    in property <string> data-dir;
+    in property <string> captures-dir;
+    in property <string> message;
+    // "Remove all data" is running (its button is disabled).
+    in property <bool> removing;
+
+    callback apply-port(int);
+    callback set-start-with-os(bool);
+    callback set-start-minimized(bool);
+    callback set-auto-cache-mode(int);
+    callback set-download-concurrency(int);
+    callback set-detail-level(int);
+    callback set-overwrite-audio(bool);
+    callback set-songs-page(int);
+    callback set-overwrite-lyrics(bool);
+    callback move-lyrics-provider(string, bool);
+    callback set-lyrics-provider-enabled(string, bool);
+    callback set-lyrics-policy-provider(string, bool);
+    callback set-lyrics-failure-policy(int);
+    callback set-lyrics-target-quality(int);
+    callback set-lyrics-after-download(bool);
+    callback set-lyrics-always-local(bool);
+    callback set-lrclib-spacing(int);
+    callback set-lyrics-retry-passes(int);
+    callback open-data-dir();
+    callback open-captures-dir();
+    callback clear-cache();
+    callback uninstall-ca();
+    callback remove-all-data();
+}
+
+/// In-app confirmation dialog (see `dialog.slint`). Rust fills the
+/// properties and opens it through `dialogs::ask`.
+export global DialogState {
+    in property <bool> open;
+    in property <string> title;
+    in property <string> message;
+    in property <string> confirm-label: "OK";
+    in property <string> cancel-label: "Cancel";
+    in property <bool> destructive;
+    // Esc and a click outside the card answer `false`.
+    callback answer(bool);
+}

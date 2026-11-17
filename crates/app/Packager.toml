@@ -1,0 +1,88 @@
+# cargo-packager configuration for the Cider Offline desktop app.
+# Reference: https://docs.rs/cargo-packager/latest/cargo_packager/config/struct.Config.html
+#
+# cargo-packager switches to this file's directory before packaging, so every
+# relative path below is relative to `crates/app/`. From the repository root:
+#
+#   cargo build --release --locked -p cider-offline
+#   cargo packager --config crates/app/Packager.toml --formats <formats>
+#
+# Configs loaded from a file get no defaults from Cargo metadata, hence the
+# explicit version / binaries / directories below. `version` must equal
+# `[workspace.package].version`; CI fails when they differ.
+#
+# Windows: a current-user NSIS installer only (no MSI/WiX, unsigned unless CI adds it, no
+# auto-update). It uses a patched copy of cargo-packager's NSIS template that adds
+# an uninstall checkbox and runs the app's own cleanup (see packaging/nsis/).
+# Linux: .deb, AppImage, pacman (plus its PKGBUILD) and an rpm built from
+# `[package.metadata.generate-rpm]` in crates/app/Cargo.toml. macOS: a universal
+# .app / .dmg; packaging/macos/Info.plist is merged into the generated one.
+# Builds are unsigned by default, so keep signing settings out of this file:
+# release.yml appends a `[windows]` signing table only when the
+# WINDOWS_CERTIFICATE_THUMBPRINT secret exists, and adds `signing-identity` to
+# `[macos]` only when APPLE_SIGNING_IDENTITY exists (else it ad-hoc signs the .app).
+
+name = "cider-offline"
+product-name = "Cider Offline"
+version = "0.1.0"
+identifier = "sh.cider-offline.CiderOffline"
+description = "Local HTTPS proxy that keeps the Cider music client working offline from a local cache."
+authors = ["Lukáš Poddaný"]
+publisher = "Cider Offline"
+category = "Utility"
+license-file = "../../LICENSE"
+out-dir = "../../target/packages"
+binaries-dir = "../../target/release"
+binaries = [{ path = "cider-offline", main = true }]
+icons = [
+  "../../packaging/icons/16x16.png",
+  "../../packaging/icons/32x32.png",
+  "../../packaging/icons/128x128.png",
+  "../../packaging/icons/256x256.png",
+  "../../packaging/icons/512x512.png",
+  "../../packaging/icons/icon.ico",
+]
+# Shipped alongside the app: helper scripts that remove the local CA from the
+# OS trust store, for users who uninstall without using the in-app button
+# first (see the "Uninstalling" chapter of the user guide). The repository
+# README is not bundled: its relative links and images only work on GitHub.
+resources = [
+  { src = "../../packaging/scripts", target = "scripts" },
+]
+
+[nsis]
+# Per-user install: no administrator prompt, matching the per-user trust store.
+installer-mode = "currentUser"
+installer-icon = "../../packaging/icons/icon.ico"
+# Upstream 0.11.8 template plus the uninstall cleanup checkbox / ExecWait lines.
+template = "../../packaging/nsis/installer.nsi"
+
+[macos]
+# Universal (arm64 + x86_64) builds need macOS 11.
+minimum-system-version = "11.0"
+# Merged into the generated Info.plist: menu-bar-only app (LSUIElement).
+info-plist-path = "../../packaging/macos/Info.plist"
+
+[deb]
+section = "sound"
+# libnss3-tools provides `certutil`, which the app needs to trust its CA for Cider
+# (Chromium / NSS); pkexec elevates the system-anchor step; xdg-utils opens links.
+# The rest are the runtime libraries Slint (winit) loads. No GTK, appindicator
+# or libxdo: the tray is pure Rust (ksni).
+depends = [
+  "libnss3-tools",
+  "pkexec | policykit-1",
+  "xdg-utils",
+  "libxkbcommon0",
+  "libfontconfig1",
+  "libgl1",
+  "libegl1",
+  "libwayland-client0",
+  "libx11-6",
+]
+
+[pacman]
+depends = ["nss", "polkit", "xdg-utils", "libxkbcommon", "fontconfig", "mesa"]
+
+# No [appimage] table: nothing beyond linuxdeploy's own excludelist needs excluding,
+# since the app doesn't link GTK, appindicator or libxdo.
