@@ -1,0 +1,95 @@
+// In-app confirmation modal (replaces native message dialogs, which need
+// zenity on Linux). Driven by `DialogState`.
+
+import { Theme, ActionButton } from "components.slint";
+import { DialogState } from "globals.slint";
+
+/// Scrim plus a centred card with a title, message and two buttons. Esc and
+/// a click on the scrim answer `false`; Enter does not confirm, so a stray
+/// keypress can never trigger a destructive action. Tab reaches the buttons.
+export component ConfirmDialog inherits Rectangle {
+    init => {
+        keys.focus();
+    }
+
+    Rectangle {
+        background: Theme.scrim;
+        TouchArea {
+            clicked => {
+                DialogState.answer(false);
+            }
+        }
+    }
+
+    Rectangle {
+        width: min(400px, root.width - 48px);
+        height: body.preferred-height;
+        border-radius: Theme.radius-md;
+        background: Theme.bg-raised;
+        border-width: 1px;
+        border-color: Theme.raised-border;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: Theme.raised-shadow;
+
+        accessible-role: groupbox;
+        accessible-label: DialogState.title;
+
+        // Keep clicks on the card from reaching the scrim.
+        TouchArea { }
+
+        keys := FocusScope {
+            focus-on-click: false;
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    DialogState.answer(false);
+                    return accept;
+                }
+                reject
+            }
+
+            body := VerticalLayout {
+                padding: 20px;
+                spacing: 8px;
+                Text {
+                    text: DialogState.title;
+                    font-size: Theme.headline;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: DialogState.message;
+                    font-size: Theme.callout;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 12px;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    ActionButton {
+                        text: DialogState.cancel-label;
+                        kind: "secondary";
+                        clicked => {
+                            DialogState.answer(false);
+                        }
+                    }
+
+                    ActionButton {
+                        text: DialogState.confirm-label;
+                        kind: DialogState.destructive ? "destructive" : "primary";
+                        clicked => {
+                            DialogState.answer(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

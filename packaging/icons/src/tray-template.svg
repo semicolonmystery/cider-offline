@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="40 34 192 192">
+  <!-- macOS menu-bar template icon: the app.svg glyph (eighth note whose flag turns into a download arrow) in black on transparent, no tile. The viewBox crops to the glyph with a small margin; macOS tints the shape from its alpha. -->
+  <g fill="#000" stroke="#000" stroke-linejoin="round" stroke-linecap="round">
+    <ellipse cx="92" cy="180" rx="36" ry="28" transform="rotate(-22 92 180)" stroke="none"/>
+    <path d="M115 176 V64 H176 V124" fill="none" stroke-width="26"/>
+    <path d="M142 124 L210 124 L176 168 Z" stroke-width="12"/>
+  </g>
+</svg>

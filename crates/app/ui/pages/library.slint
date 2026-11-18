@@ -1,0 +1,2011 @@
+// Library page: header + adaptive toolbar, the
+// collection grid, the songs list, search results, the collection detail,
+// the Downloads drawer, the remove confirmation and the status toast.
+
+import { ListView, LineEdit } from "std-widgets.slint";
+import {
+    Theme, Icons, Icon, IconButton, IconToggle, PillButton, Segmented, IconSegmented,
+    ActionButton, SearchField, Badge, Artwork, Skeleton, DownloadControl, CircularProgress,
+    Toast, Busy, FocusRing,
+} from "../components.slint";
+import { LibraryState, CollectionRow, TrackRow, DownloadsState, DownloadRow } from "../globals.slint";
+import { LibraryAddDialog } from "library-add.slint";
+
+/// Page-local UI state shared by deeply nested rows (the remove confirmation
+/// and the Downloads drawer). Exported only for the screenshot harness.
+export global LibraryUi {
+    // Track awaiting the remove confirmation ("" = dialog closed).
+    in-out property <string> confirm-id;
+    in-out property <string> confirm-title;
+    // What the confirmation is for: "download" (a song's downloaded audio),
+    // "collection" (an album's / playlist's download) or "delete" (a custom
+    // song).
+    in-out property <string> confirm-kind: "download";
+    in-out property <bool> drawer-open: false;
+}
+
+// ----- Grid ------------------------------------------------------------------
+
+/// One album / playlist card: a square cover, title and subtitle. Width is
+/// set by the grid; height is width + 42. Children are placed explicitly so
+/// nothing can overflow.
+component CollectionCard inherits Rectangle {
+    in property <CollectionRow> item;
+
+    property <length> cover: root.width;
+    property <bool> live: !root.item.placeholder;
+    property <bool> hovered: touch.has-hover && root.live;
+    property <bool> active: root.item.dl-status == "queued" || root.item.dl-status == "downloading";
+
+    accessible-role: button;
+    accessible-label: root.item.name;
+    accessible-action-default => {
+        LibraryState.open-collection(root.item.id);
+    }
+
+    touch := TouchArea {
+        enabled: root.live;
+        mouse-cursor: pointer;
+        clicked => {
+            LibraryState.open-collection(root.item.id);
+        }
+
+        cover-box := Rectangle {
+            x: 0;
+            y: 0;
+            width: root.cover;
+            height: root.cover;
+            border-radius: Theme.radius-sm;
+            clip: true;
+            background: Theme.cover-placeholder;
+
+            if root.live && !root.item.has-artwork: Icon {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                source: root.item.kind == "playlist" ? Icons.playlist : Icons.album;
+                size: root.cover * 0.4;
+                tint: Theme.text-tertiary;
+            }
+
+            if root.live && root.item.has-artwork: Image {
+                width: root.cover;
+                height: root.cover;
+                source: root.item.artwork;
+                image-fit: ImageFit.cover;
+            }
+
+            // Hover dims the cover slightly.
+            Rectangle {
+                background: root.hovered ? #0000001A : transparent;
+                animate background { duration: 120ms; }
+            }
+
+            // Download chip (top-right), display only.
+            if root.live && (root.item.dl-status != "" || root.item.downloaded): Rectangle {
+                x: parent.width - self.width - 8px;
+                y: 8px;
+                width: 28px;
+                height: 28px;
+                border-radius: 14px;
+                background: #00000080;
+                DownloadControl {
+                    x: 4px;
+                    y: 4px;
+                    ring-size: 20px;
+                    on-dark: true;
+                    can-toggle: false;
+                    status: root.item.dl-status;
+                    progress: root.item.dl-progress;
+                    downloaded: root.item.downloaded;
+                }
+            }
+
+            // ⋯ chip (bottom-right), only while hovered.
+            more := IconButton {
+                x: parent.width - self.width - 8px;
+                y: parent.height - self.height - 8px;
+                visible: root.hovered;
+                diameter: 28px;
+                icon-size: 16px;
+                chip: true;
+                icon: Icons.more;
+                tooltip: root.item.kind == "playlist" ? "More playlist actions" : "More album actions";
+                clicked => {
+                    menu.show({ x: self.x, y: self.y + self.height + 4px });
+                }
+            }
+        }
+
+        if root.live: Text {
+            x: 0;
+            y: root.cover + 8px;
+            width: root.cover;
+            height: 18px;
+            text: root.item.name;
+            font-size: Theme.body;
+            font-weight: 600;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if root.live: Text {
+            x: 0;
+            y: root.cover + 26px;
+            width: root.cover;
+            height: 16px;
+            text: root.item.subtitle;
+            font-size: Theme.callout;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        // Skeleton text lines (same slots as the real text).
+        if !root.live: Skeleton {
+            x: 0;
+            y: root.cover + 12px;
+            width: root.cover * 0.6;
+            height: 10px;
+        }
+
+        if !root.live: Skeleton {
+            x: 0;
+            y: root.cover + 30px;
+            width: root.cover * 0.4;
+            height: 9px;
+        }
+
+        // On top: right-click anywhere on the card opens the same menu.
+        menu := ContextMenuArea {
+            enabled: root.live;
+            Menu {
+                if root.item.dl-status == "" && !root.item.downloaded: MenuItem {
+                    title: "Download";
+                    activated => {
+                        LibraryState.download-collection(root.item.id);
+                    }
+                }
+                if root.active: MenuItem {
+                    title: "Pause download";
+                    activated => {
+                        LibraryState.toggle-collection-download(root.item.id);
+                    }
+                }
+                if root.item.dl-status == "paused": MenuItem {
+                    title: "Resume download";
+                    activated => {
+                        LibraryState.toggle-collection-download(root.item.id);
+                    }
+                }
+                if root.item.dl-status == "failed": MenuItem {
+                    title: "Retry download";
+                    activated => {
+                        LibraryState.toggle-collection-download(root.item.id);
+                    }
+                }
+                MenuItem {
+                    title: "Fetch lyrics for all songs";
+                    enabled: !LibraryState.bulk-busy;
+                    activated => {
+                        LibraryState.fetch-collection-lyrics(root.item.id);
+                    }
+                }
+                if (root.item.pinned || root.item.downloaded) && !root.active: MenuSeparator { }
+                if (root.item.pinned || root.item.downloaded) && !root.active: MenuItem {
+                    title: "Remove download…";
+                    activated => {
+                        LibraryUi.confirm-kind = "collection";
+                        LibraryUi.confirm-title = root.item.name;
+                        LibraryUi.confirm-id = root.item.id;
+                    }
+                }
+                if root.item.is-custom: MenuSeparator { }
+                if root.item.is-custom: MenuItem {
+                    title: "Edit details…";
+                    activated => {
+                        LibraryState.edit-item(root.item.id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Card geometry from an available width: the column count and card size
+/// follow the window width.
+global GridMetrics {
+    out property <length> gap-x: 20px;
+    out property <length> gap-y: 24px;
+    out property <length> min-card: 180px;
+    // Text below the cover: 8 gap + 18 title + 16 subtitle.
+    out property <length> text-h: 42px;
+
+    public pure function columns(width: length) -> int {
+        max(2, floor((width + root.gap-x) / (root.min-card + root.gap-x)))
+    }
+
+    public pure function card-width(width: length, cols: int) -> length {
+        max(0px, (width - root.gap-x * (cols - 1)) / max(1, cols))
+    }
+}
+
+/// Virtualized grid of cards: a ListView over grid rows (only visible rows,
+/// and therefore only visible cards, are instantiated). Cards stretch so the
+/// row fills the width exactly.
+component CollectionGrid inherits Rectangle {
+    in property <[CollectionRow]> model;
+    // Placeholder cards drawn while the model is still empty and loading.
+    in property <bool> skeleton;
+    // Extra width on the right (the page padding) where the overlay
+    // scrollbar sits, so it never covers the last column.
+    in property <length> gutter;
+
+    property <length> avail: lv.visible-width - root.gutter;
+    property <int> cols: GridMetrics.columns(root.avail);
+    property <length> card-w: GridMetrics.card-width(root.avail, root.cols);
+    property <length> card-h: root.card-w + GridMetrics.text-h;
+    property <int> count: root.model.length > 0 ? root.model.length : root.skeleton ? root.cols * 3 : 0;
+    property <int> rows: ceil(root.count / max(1, root.cols));
+
+    init => {
+        LibraryState.card-width-changed(root.card-w);
+    }
+    changed card-w => {
+        LibraryState.card-width-changed(root.card-w);
+    }
+
+    lv := ListView {
+        x: 0;
+        width: root.width + root.gutter;
+        height: 100%;
+
+        for r in root.rows: Rectangle {
+            height: root.card-h + GridMetrics.gap-y;
+
+            for c in root.cols: cell := Rectangle {
+                property <int> index: r * root.cols + c;
+                x: c * (root.card-w + GridMetrics.gap-x);
+                y: 0;
+                width: root.card-w;
+                height: root.card-h;
+
+                if cell.index < root.model.length: CollectionCard {
+                    width: cell.width;
+                    height: cell.height;
+                    item: root.model[cell.index];
+                }
+
+                if root.model.length == 0 && cell.index < root.count: CollectionCard {
+                    width: parent.width;
+                    height: parent.height;
+                    item: { placeholder: true };
+                }
+            }
+        }
+    }
+}
+
+// ----- Song rows -----------------------------------------------------------
+
+/// Slot widths shared by the song rows and their column header.
+global RowMetrics {
+    out property <length> pad: 8px;
+    out property <length> grip: 20px;
+    out property <length> art: 36px;
+    out property <length> number: 28px;
+    out property <length> art-gap: 12px;
+    out property <length> col-gap: 16px;
+    out property <length> lyrics: 24px;
+    out property <length> status: 28px;
+    out property <length> duration: 48px;
+    out property <length> more: 32px;
+    // Below this row width the album column is removed.
+    out property <length> album-min-row: 720px;
+}
+
+/// One song row (52px) for every list: songs view, search, detail.
+component TrackItem inherits Rectangle {
+    in property <TrackRow> item;
+    in property <int> index;
+    in property <int> count;
+    // Album detail: track number instead of the artwork thumb.
+    in property <bool> show-number;
+    // Custom collection detail: drag grip + Move up / Move down.
+    in property <bool> reorderable;
+    in property <bool> hide-separator;
+    in property <bool> dragging;
+    in property <length> drag-offset;
+    // 0 none, 1 drop line above this row, 2 below it.
+    in property <int> drop-line;
+    out property <bool> hovered: touch.has-hover && !root.item.placeholder;
+    callback hover-changed(bool);
+    callback drag-moved(length);
+    callback drag-ended();
+    callback move-up();
+    callback move-down();
+
+    property <bool> live: !root.item.placeholder;
+    property <bool> show-album: root.width >= RowMetrics.album-min-row;
+    property <bool> active: root.item.dl-status == "queued" || root.item.dl-status == "downloading";
+    property <bool> dim: !root.item.has-audio && !root.item.has-mapping;
+    property <length> lead: RowMetrics.pad + (root.reorderable ? RowMetrics.grip : 0px);
+    property <length> title-x: root.lead + (root.show-number ? RowMetrics.number : RowMetrics.art) + RowMetrics.art-gap;
+    property <length> right-w: RowMetrics.lyrics + RowMetrics.status + RowMetrics.duration + RowMetrics.more + RowMetrics.pad;
+    property <length> text-w: root.width - root.title-x - root.right-w - RowMetrics.col-gap;
+    // Title stack : album = 3 : 2 of the text width.
+    property <length> title-w: root.show-album ? (root.text-w - RowMetrics.col-gap) * 3 / 5 : root.text-w;
+    property <length> album-x: root.title-x + root.title-w + RowMetrics.col-gap;
+    property <length> album-w: root.text-w - root.title-w - RowMetrics.col-gap;
+    property <length> lyrics-x: root.width - root.right-w;
+    property <length> status-x: root.lyrics-x + RowMetrics.lyrics;
+    property <bool> has-lyrics: root.item.lyrics != "none" && root.item.lyrics != "";
+    property <string> lyrics-provider: root.item.lyrics == "apple" ? "Apple" : root.item.lyrics == "lrclib" ? "LRCLIB" : root.item.lyrics == "amll" ? "AMLL" : root.item.lyrics == "netease" ? "NetEase" : root.item.lyrics == "kugou" ? "Kugou" : root.item.lyrics == "musixmatch" ? "Musixmatch" : root.item.lyrics == "community" ? "Cider Community" : root.item.lyrics == "custom" ? "Custom" : "";
+    property <string> lyrics-tip: !root.has-lyrics ? "No lyrics"
+        : (root.item.lyrics-quality >= 3 ? "Word-synced lyrics" : root.item.lyrics-quality == 2 ? "Line-synced lyrics" : "Plain lyrics")
+            + (root.lyrics-provider != "" ? " (\{root.lyrics-provider})" : "");
+
+    height: Theme.row-h;
+    accessible-role: list-item;
+    accessible-label: root.item.title + ", " + root.item.artist;
+
+    changed hovered => {
+        root.hover-changed(self.hovered);
+    }
+
+    content := Rectangle {
+        y: root.drag-offset;
+        width: root.width;
+        height: root.height;
+        border-radius: Theme.radius-sm;
+        background: root.dragging ? Theme.bg-raised : root.hovered ? Theme.hover : transparent;
+        drop-shadow-blur: root.dragging ? 12px : 0px;
+        drop-shadow-color: Theme.raised-shadow;
+
+        touch := TouchArea {
+            // Grip.
+            if root.reorderable && root.live: Rectangle {
+                x: RowMetrics.pad;
+                width: RowMetrics.grip;
+                height: root.height;
+                Icon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    source: Icons.grip;
+                    size: 16px;
+                    tint: grip-touch.has-hover || root.dragging ? Theme.text-primary : Theme.text-tertiary;
+                }
+
+                grip-touch := TouchArea {
+                    mouse-cursor: grab;
+                    moved => {
+                        if self.pressed {
+                            root.drag-moved(self.mouse-y - self.pressed-y);
+                        }
+                    }
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.up {
+                            root.drag-ended();
+                        }
+                    }
+                }
+            }
+
+            // Artwork thumb or track number.
+            if !root.show-number && root.live: Artwork {
+                x: root.lead;
+                y: (root.height - self.height) / 2;
+                size: RowMetrics.art;
+                source: root.item.artwork;
+                has-image: root.item.has-artwork;
+            }
+
+            if root.show-number && root.live: Text {
+                x: root.lead;
+                width: RowMetrics.number;
+                height: root.height;
+                text: root.item.track-number > 0 ? root.item.track-number : root.index + 1;
+                font-size: Theme.callout;
+                color: Theme.text-tertiary;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+
+            // Title (+ Custom badge) and artist.
+            if root.live: Rectangle {
+                x: root.title-x;
+                y: 8px;
+                width: root.title-w;
+                height: 18px;
+                property <length> badge-w: root.item.is-custom ? badge.width + 6px : 0px;
+
+                title := Text {
+                    x: 0;
+                    width: min(self.preferred-width, parent.width - parent.badge-w);
+                    height: parent.height;
+                    text: root.item.title;
+                    font-size: Theme.body;
+                    color: root.dim ? Theme.text-secondary : Theme.text-primary;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                badge := Badge {
+                    x: title.width + 6px;
+                    y: 1px;
+                    visible: root.item.is-custom;
+                }
+            }
+
+            if root.live: Text {
+                x: root.title-x;
+                y: 27px;
+                width: root.title-w;
+                height: 16px;
+                text: root.item.artist;
+                font-size: Theme.callout;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            if root.live && root.show-album: Text {
+                x: root.album-x;
+                width: root.album-w;
+                height: root.height;
+                text: root.item.album;
+                font-size: Theme.callout;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            // Lyrics state: word-synced, line-synced, plain, or a muted "no lyrics".
+            if root.live: Rectangle {
+                x: root.lyrics-x;
+                y: (root.height - self.height) / 2;
+                width: RowMetrics.lyrics;
+                height: RowMetrics.lyrics;
+                accessible-role: AccessibleRole.image;
+                accessible-label: root.lyrics-tip;
+                Tooltip {
+                    text: @markdown("\{root.lyrics-tip}");
+                }
+
+                Icon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    size: 16px;
+                    source: !root.has-lyrics ? Icons.lyrics
+                        : root.item.lyrics-quality >= 3 ? Icons.lyrics-word
+                        : root.item.lyrics-quality == 2 ? Icons.lyrics-synced : Icons.lyrics;
+                    tint: root.has-lyrics ? Theme.text-secondary : Theme.text-tertiary;
+                    opacity: root.has-lyrics ? 1 : 0.45;
+                }
+            }
+
+            // Status: busy spinner or the download control.
+            if root.live && root.item.busy: Busy {
+                x: root.status-x + (RowMetrics.status - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                size: 18px;
+            }
+
+            if root.live && !root.item.busy: DownloadControl {
+                x: root.status-x + (RowMetrics.status - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                ring-size: 22px;
+                show-idle: root.hovered;
+                status: root.item.dl-status;
+                progress: root.item.dl-progress;
+                downloaded: root.item.has-audio;
+                label: "song";
+                start => {
+                    LibraryState.download-track(root.item.id);
+                }
+                toggle => {
+                    if root.item.dl-status == "failed" {
+                        DownloadsState.retry(root.item.catalog-id);
+                    } else if root.item.dl-status == "paused" {
+                        DownloadsState.resume(root.item.catalog-id);
+                    } else {
+                        DownloadsState.pause(root.item.catalog-id);
+                    }
+                }
+            }
+
+            if root.live: Text {
+                x: root.status-x + RowMetrics.status;
+                width: RowMetrics.duration;
+                height: root.height;
+                text: root.item.duration;
+                font-size: Theme.callout;
+                color: Theme.text-tertiary;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+
+            // ⋯ (space always reserved, drawn on hover).
+            more := IconButton {
+                x: root.status-x + RowMetrics.status + RowMetrics.duration + (RowMetrics.more - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                visible: root.hovered;
+                diameter: 28px;
+                icon-size: 18px;
+                icon: Icons.more;
+                tooltip: "More song actions";
+                clicked => {
+                    menu.show({ x: self.x, y: self.y + self.height });
+                }
+            }
+
+            // Skeleton (identical geometry).
+            if !root.live: Skeleton {
+                x: root.lead;
+                y: (root.height - self.height) / 2;
+                width: root.show-number ? RowMetrics.number : RowMetrics.art;
+                height: root.show-number ? 10px : RowMetrics.art;
+            }
+
+            if !root.live: Skeleton {
+                x: root.title-x;
+                y: 12px;
+                width: root.title-w * 0.6;
+                height: 10px;
+            }
+
+            if !root.live: Skeleton {
+                x: root.title-x;
+                y: 30px;
+                width: root.title-w * 0.4;
+                height: 9px;
+            }
+
+            menu := ContextMenuArea {
+                enabled: root.live;
+                Menu {
+                    if (root.item.dl-status == "" || root.item.dl-status == "done") && !root.item.has-audio && !root.item.is-custom: MenuItem {
+                        title: "Download";
+                        activated => {
+                            LibraryState.download-track(root.item.id);
+                        }
+                    }
+                    if root.active: MenuItem {
+                        title: "Pause download";
+                        activated => {
+                            DownloadsState.pause(root.item.catalog-id);
+                        }
+                    }
+                    if root.item.dl-status == "paused": MenuItem {
+                        title: "Resume download";
+                        activated => {
+                            DownloadsState.resume(root.item.catalog-id);
+                        }
+                    }
+                    if root.item.dl-status == "failed": MenuItem {
+                        title: "Retry download";
+                        activated => {
+                            DownloadsState.retry(root.item.catalog-id);
+                        }
+                    }
+                    MenuItem {
+                        title: root.item.has-audio ? "Replace audio file…" : "Import audio file…";
+                        enabled: !root.item.busy;
+                        activated => {
+                            LibraryState.import-audio(root.item.id);
+                        }
+                    }
+                    MenuItem {
+                        title: root.item.has-mapping ? "Unlink local file" : "Link to local file…";
+                        enabled: !root.item.busy;
+                        activated => {
+                            if root.item.has-mapping {
+                                LibraryState.clear-mapping(root.item.id);
+                            } else {
+                                LibraryState.map-audio(root.item.id);
+                            }
+                        }
+                    }
+                    MenuSeparator { }
+                    MenuItem {
+                        title: "Fetch lyrics";
+                        enabled: !root.item.busy;
+                        activated => {
+                            LibraryState.refetch-lyrics(root.item.id);
+                        }
+                    }
+                    MenuItem {
+                        title: "Choose lyrics file…";
+                        enabled: !root.item.busy;
+                        activated => {
+                            LibraryState.choose-lyrics-file(root.item.id);
+                        }
+                    }
+                    if root.item.is-custom || root.reorderable: MenuSeparator { }
+                    if root.item.is-custom: MenuItem {
+                        title: "Edit details…";
+                        activated => {
+                            LibraryState.edit-item(root.item.id);
+                        }
+                    }
+                    if root.reorderable: MenuItem {
+                        title: "Move up";
+                        enabled: root.index > 0;
+                        activated => {
+                            root.move-up();
+                        }
+                    }
+                    if root.reorderable: MenuItem {
+                        title: "Move down";
+                        enabled: root.index < root.count - 1;
+                        activated => {
+                            root.move-down();
+                        }
+                    }
+                    if !root.item.is-custom && root.item.has-audio && !root.active: MenuSeparator { }
+                    if !root.item.is-custom && root.item.has-audio && !root.active: MenuItem {
+                        title: "Remove download…";
+                        enabled: !root.item.busy;
+                        activated => {
+                            LibraryUi.confirm-kind = "download";
+                            LibraryUi.confirm-title = root.item.title;
+                            LibraryUi.confirm-id = root.item.id;
+                        }
+                    }
+                    if root.item.is-custom: MenuSeparator { }
+                    if root.item.is-custom: MenuItem {
+                        title: "Delete…";
+                        enabled: !root.item.busy;
+                        activated => {
+                            LibraryUi.confirm-kind = "delete";
+                            LibraryUi.confirm-title = root.item.title;
+                            LibraryUi.confirm-id = root.item.id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Inset separator (title stack → right padding), hidden next to hover.
+    if !root.hovered && !root.hide-separator && !root.dragging: Rectangle {
+        x: root.title-x;
+        y: root.height - 1px;
+        width: root.width - root.title-x - RowMetrics.pad;
+        height: 1px;
+        background: Theme.separator;
+    }
+
+    // Reorder drop indicator.
+    if root.drop-line != 0: Rectangle {
+        x: root.title-x;
+        y: root.drop-line == 1 ? 0px : root.height - 2px;
+        width: root.width - root.title-x - RowMetrics.pad;
+        height: 2px;
+        background: Theme.accent;
+    }
+}
+
+/// Column header aligned with the TrackItem slots (not interactive).
+component SongColumns inherits Rectangle {
+    in property <bool> show-number;
+    in property <bool> reorderable;
+
+    property <bool> show-album: root.width >= RowMetrics.album-min-row;
+    property <length> lead: RowMetrics.pad + (root.reorderable ? RowMetrics.grip : 0px);
+    property <length> title-x: root.lead + (root.show-number ? RowMetrics.number : RowMetrics.art) + RowMetrics.art-gap;
+    property <length> right-w: RowMetrics.lyrics + RowMetrics.status + RowMetrics.duration + RowMetrics.more + RowMetrics.pad;
+    property <length> text-w: root.width - root.title-x - root.right-w - RowMetrics.col-gap;
+    property <length> title-w: root.show-album ? (root.text-w - RowMetrics.col-gap) * 3 / 5 : root.text-w;
+    property <length> status-x: root.width - root.right-w + RowMetrics.lyrics;
+
+    height: 28px;
+
+    if root.show-number: Text {
+        x: root.lead;
+        width: RowMetrics.number;
+        height: parent.height;
+        text: "#";
+        font-size: Theme.caption;
+        font-weight: 500;
+        color: Theme.text-tertiary;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: root.title-x;
+        height: parent.height;
+        text: "Title";
+        font-size: Theme.caption;
+        font-weight: 500;
+        color: Theme.text-tertiary;
+        vertical-alignment: center;
+    }
+
+    if root.show-album: Text {
+        x: root.title-x + root.title-w + RowMetrics.col-gap;
+        height: parent.height;
+        text: "Album";
+        font-size: Theme.caption;
+        font-weight: 500;
+        color: Theme.text-tertiary;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: root.status-x + RowMetrics.status;
+        width: RowMetrics.duration;
+        height: parent.height;
+        text: "Time";
+        font-size: Theme.caption;
+        font-weight: 500;
+        color: Theme.text-tertiary;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: RowMetrics.pad;
+        y: parent.height - 1px;
+        width: parent.width - 2 * RowMetrics.pad;
+        height: 1px;
+        background: Theme.separator;
+    }
+}
+
+/// Virtualized song list (ListView, fixed 52px rows). Custom collections
+/// reorder by dragging the grip; the drag state lives here, not in the
+/// recycled rows.
+component SongList inherits Rectangle {
+    in property <[TrackRow]> model;
+    in property <bool> show-number;
+    in property <bool> reorderable;
+    // Placeholder rows while the model is still empty and loading.
+    in property <bool> skeleton;
+
+    property <int> hover-index: -1;
+    property <int> drag-index: -1;
+    property <length> drag-dy: 0;
+    property <int> target: root.drag-index < 0
+        ? -1
+        : min(max(floor((root.drag-index * Theme.row-h + root.drag-dy + Theme.row-h / 2) / Theme.row-h), 0), root.model.length - 1);
+
+    if root.model.length > 0: ListView {
+        width: 100%;
+        height: 100%;
+        for row[i] in root.model: TrackItem {
+            item: row;
+            index: i;
+            count: root.model.length;
+            show-number: root.show-number;
+            reorderable: root.reorderable;
+            hide-separator: i == root.hover-index - 1 || i == root.model.length - 1;
+            dragging: root.drag-index == i;
+            drag-offset: root.drag-index == i ? root.drag-dy : 0px;
+            drop-line: root.drag-index >= 0 && root.target == i && root.target != root.drag-index
+                ? (root.target < root.drag-index ? 1 : 2) : 0;
+            hover-changed(on) => {
+                if on {
+                    root.hover-index = i;
+                } else if root.hover-index == i {
+                    root.hover-index = -1;
+                }
+            }
+            drag-moved(dy) => {
+                root.drag-index = i;
+                root.drag-dy = dy;
+            }
+            drag-ended => {
+                if root.drag-index == i && root.target >= 0 && root.target != i {
+                    LibraryState.reorder-track(row.id, root.target);
+                }
+                root.drag-index = -1;
+                root.drag-dy = 0;
+            }
+            move-up => {
+                LibraryState.reorder-track(row.id, i - 1);
+            }
+            move-down => {
+                LibraryState.reorder-track(row.id, i + 1);
+            }
+        }
+    }
+
+    if root.model.length == 0 && root.skeleton: VerticalLayout {
+        alignment: start;
+        for i in 10: TrackItem {
+            item: { placeholder: true };
+            show-number: root.show-number;
+            reorderable: root.reorderable;
+        }
+    }
+}
+
+/// Centred empty / no-results message.
+component EmptyState inherits VerticalLayout {
+    in property <string> title;
+    in property <string> body;
+    alignment: center;
+    spacing: 6px;
+
+    Text {
+        text: root.title;
+        font-size: Theme.headline;
+        font-weight: 600;
+        color: Theme.text-primary;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
+
+    if root.body != "": Text {
+        text: root.body;
+        font-size: Theme.callout;
+        color: Theme.text-secondary;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
+}
+
+/// Section heading with a tertiary count ("Songs  87").
+component SectionTitle inherits HorizontalLayout {
+    in property <string> title;
+    in property <int> count: -1;
+    spacing: 8px;
+    height: 24px;
+
+    Text {
+        text: root.title;
+        font-size: Theme.headline;
+        font-weight: 600;
+        color: Theme.text-primary;
+        vertical-alignment: center;
+    }
+
+    if root.count >= 0: Text {
+        text: root.count;
+        font-size: Theme.callout;
+        color: Theme.text-tertiary;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        horizontal-stretch: 1;
+    }
+}
+
+// ----- Detail ----------------------------------------------------------------
+
+/// Collection detail: hero (cover, title, meta, one download control, ⋯)
+/// above a virtualized track list. Only the list scrolls; Esc goes back.
+component CollectionDetail inherits Rectangle {
+    in property <length> pad;
+    in property <bool> short;
+
+    property <bool> is-album: LibraryState.detail-kind != "playlist";
+    property <length> content-w: root.width - 2 * root.pad;
+    property <length> cover: root.short ? 96px : root.content-w >= 1000px ? 220px : 160px;
+
+    init => {
+        keys.focus();
+    }
+
+    keys := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                LibraryState.close-collection();
+                return accept;
+            }
+            reject
+        }
+
+        VerticalLayout {
+            padding-left: root.pad;
+            padding-right: root.pad;
+            padding-top: 16px;
+            spacing: 0px;
+
+            HorizontalLayout {
+                height: Theme.control-h;
+                IconButton {
+                    icon: Icons.back;
+                    tooltip: "Back to library";
+                    clicked => {
+                        LibraryState.close-collection();
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+
+            Rectangle {
+                height: 12px;
+            }
+
+            // Never shorter than the text stack + actions (short windows
+            // shrink the cover to 96px).
+            HorizontalLayout {
+                height: max(root.cover, 116px);
+                spacing: 24px;
+
+                Artwork {
+                    size: root.cover;
+                    radius: Theme.radius-md;
+                    source: LibraryState.detail-artwork;
+                    has-image: LibraryState.detail-has-artwork;
+                    placeholder-icon: root.is-album ? Icons.album : Icons.playlist;
+                }
+
+                VerticalLayout {
+                    spacing: 4px;
+                    horizontal-stretch: 1;
+
+                    Text {
+                        height: min(self.preferred-height, 60px);
+                        text: LibraryState.detail-title;
+                        font-size: Theme.title;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                        wrap: word-wrap;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        text: LibraryState.detail-subtitle;
+                        font-size: Theme.headline;
+                        color: Theme.text-secondary;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        text: LibraryState.detail-meta;
+                        font-size: Theme.callout;
+                        color: Theme.text-tertiary;
+                        overflow: elide;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                    }
+
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: 12px;
+                        height: 36px;
+
+                        DownloadControl {
+                            y: 0;
+                            ring-size: 36px;
+                            status: LibraryState.detail-dl-status;
+                            progress: LibraryState.detail-dl-progress;
+                            downloaded: LibraryState.detail-downloaded;
+                            label: root.is-album ? "album" : "playlist";
+                            start => {
+                                LibraryState.download-collection(LibraryState.collection);
+                            }
+                            toggle => {
+                                LibraryState.toggle-collection-download(LibraryState.collection);
+                            }
+                        }
+
+                        Rectangle {
+                            width: Theme.control-h;
+                            height: 36px;
+
+                            more := IconButton {
+                                y: 2px;
+                                icon: Icons.more;
+                                tooltip: root.is-album ? "More album actions" : "More playlist actions";
+                                clicked => {
+                                    detail-menu.show({ x: 0, y: self.y + self.height + 4px });
+                                }
+                            }
+
+                            detail-menu := ContextMenuArea {
+                                Menu {
+                                    MenuItem {
+                                        title: "Fetch lyrics for all songs";
+                                        enabled: !LibraryState.bulk-busy;
+                                        activated => {
+                                            LibraryState.fetch-collection-lyrics(LibraryState.collection);
+                                        }
+                                    }
+                                    if (LibraryState.detail-pinned || LibraryState.detail-downloaded) && LibraryState.detail-dl-status != "downloading" && LibraryState.detail-dl-status != "queued": MenuSeparator { }
+                                    if (LibraryState.detail-pinned || LibraryState.detail-downloaded) && LibraryState.detail-dl-status != "downloading" && LibraryState.detail-dl-status != "queued": MenuItem {
+                                        title: "Remove download…";
+                                        activated => {
+                                            LibraryUi.confirm-kind = "collection";
+                                            LibraryUi.confirm-title = LibraryState.detail-title;
+                                            LibraryUi.confirm-id = LibraryState.collection;
+                                        }
+                                    }
+                                    if LibraryState.detail-is-custom: MenuSeparator { }
+                                    if LibraryState.detail-is-custom: MenuItem {
+                                        title: "Add song…";
+                                        activated => {
+                                            LibraryState.add-item();
+                                        }
+                                    }
+                                    if LibraryState.detail-is-custom: MenuItem {
+                                        title: "Edit details…";
+                                        activated => {
+                                            LibraryState.edit-item(LibraryState.collection);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if LibraryState.bulk-busy: Busy {
+                            y: 9px;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 16px;
+            }
+
+            SongColumns {
+                show-number: root.is-album && !LibraryState.detail-is-custom;
+                reorderable: LibraryState.detail-is-custom;
+            }
+
+            if !LibraryState.loading && LibraryState.tracks.length == 0: EmptyState {
+                vertical-stretch: 1;
+                title: root.is-album ? "No songs in this album yet" : "No songs in this playlist yet";
+                body: LibraryState.detail-is-custom ? "Use ⋯ › Add song… to add one." : "";
+            }
+
+            if LibraryState.loading || LibraryState.tracks.length > 0: SongList {
+                vertical-stretch: 1;
+                model: LibraryState.tracks;
+                skeleton: LibraryState.loading;
+                show-number: root.is-album && !LibraryState.detail-is-custom;
+                reorderable: LibraryState.detail-is-custom;
+            }
+        }
+    }
+}
+
+// ----- Downloads drawer ------------------------------------------------------
+
+/// One download in the drawer (52px row geometry): title, a stage line
+/// ("Downloading, 42%", "Retrying in 12 s…", "Can't download yet: …"), the ring
+/// (pause / resume / retry) and a hover-only remove button.
+component DownloadItem inherits Rectangle {
+    in property <DownloadRow> item;
+    height: Theme.row-h;
+
+    property <bool> hovered: touch.has-hover;
+    property <bool> unavailable: root.item.status == "unavailable";
+    property <bool> live: root.item.status == "downloading" || root.item.status == "queued"
+        || root.item.status == "paused" || root.item.status == "failed";
+
+    touch := TouchArea {
+        Rectangle {
+            border-radius: Theme.radius-sm;
+            background: root.hovered ? Theme.hover : transparent;
+        }
+
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 12px;
+
+            // "Can't download yet" rows are muted (they are not part of the
+            // batch); their optional action button stays fully visible.
+            Artwork {
+                opacity: root.unavailable ? 0.55 : 1;
+                y: (parent.height - self.height) / 2;
+                size: 36px;
+                source: root.item.artwork;
+                has-image: root.item.has-artwork;
+            }
+
+            VerticalLayout {
+                opacity: root.unavailable ? 0.55 : 1;
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 1px;
+                Text {
+                    text: root.item.title;
+                    font-size: Theme.body;
+                    color: Theme.text-primary;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.live || root.unavailable
+                        ? root.item.detail
+                        : root.item.source-name != "" ? root.item.artist + ", " + root.item.source-name : root.item.artist;
+                    font-size: Theme.callout;
+                    color: root.item.status == "failed" ? Theme.error
+                        : root.item.status == "downloading" ? Theme.accent : Theme.text-secondary;
+                    overflow: elide;
+                }
+            }
+
+            if root.unavailable && root.item.alt-action != "": PillButton {
+                y: (parent.height - self.height) / 2;
+                text: root.item.alt-action;
+                chevron: false;
+                tooltip: "Downloads the audio song from the same album. Its edit can differ from the video's.";
+                clicked => {
+                    DownloadsState.download-album-version(root.item.id);
+                }
+            }
+
+            DownloadControl {
+                opacity: root.unavailable ? 0.55 : 1;
+                y: (parent.height - self.height) / 2;
+                ring-size: 22px;
+                status: root.item.status;
+                progress: root.item.progress;
+                reason: root.item.status == "failed" || root.unavailable ? root.item.message : "";
+                toggle => {
+                    if root.item.status == "failed" {
+                        DownloadsState.retry(root.item.id);
+                    } else if root.item.status == "paused" {
+                        DownloadsState.resume(root.item.id);
+                    } else {
+                        DownloadsState.pause(root.item.id);
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 28px;
+                IconButton {
+                    y: (parent.height - self.height) / 2;
+                    visible: root.hovered && root.item.status != "done";
+                    diameter: 28px;
+                    icon-size: 14px;
+                    icon: Icons.close;
+                    tooltip: root.live ? "Cancel download" : "Remove from the list";
+                    clicked => {
+                        DownloadsState.cancel(root.item.id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Thin determinate bar for the batch progress.
+component BatchBar inherits Rectangle {
+    in property <float> progress;
+    height: 4px;
+    border-radius: 2px;
+    background: Theme.bg-fill;
+    clip: true;
+
+    Rectangle {
+        x: 0;
+        width: parent.width * min(max(root.progress, 0), 1);
+        height: parent.height;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+}
+
+/// Downloads drawer. Mounted only while open (`if` in the page), so it never
+/// exists off-screen and resizing the window can't reveal it. It slides in
+/// once when opened; its position never animates with the window width.
+component DownloadsDrawer inherits Rectangle {
+    in property <bool> narrow;
+    property <length> panel-w: root.narrow ? root.width : min(420px, root.width);
+    // 0 → 1 once on open (entrance only).
+    property <float> shown: 0;
+    property <bool> has-paused: DownloadsState.paused-count > 0;
+    property <bool> has-live: DownloadsState.active-count - DownloadsState.paused-count + DownloadsState.queued-count > 0;
+
+    init => {
+        root.shown = 1;
+        keys.focus();
+    }
+
+    Rectangle {
+        background: Theme.scrim;
+        opacity: root.shown;
+        TouchArea {
+            clicked => {
+                LibraryUi.drawer-open = false;
+            }
+        }
+    }
+
+    panel := Rectangle {
+        x: root.width - root.panel-w * root.shown;
+        width: root.panel-w;
+        background: Theme.bg-raised;
+        border-width: 1px;
+        border-color: Theme.raised-border;
+
+        // Swallow clicks so they don't reach the scrim.
+        TouchArea { }
+
+        keys := FocusScope {
+            focus-on-click: false;
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    LibraryUi.drawer-open = false;
+                    return accept;
+                }
+                reject
+            }
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                // Header: title, then the most-used actions, ⋯ and close.
+                HorizontalLayout {
+                    spacing: 4px;
+                    height: Theme.control-h;
+                    Text {
+                        text: "Downloads";
+                        font-size: Theme.headline;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    if DownloadsState.failed-count > 0: IconButton {
+                        icon: Icons.retry;
+                        tooltip: "Retry failed (\{DownloadsState.failed-count})";
+                        clicked => {
+                            DownloadsState.retry-failed();
+                        }
+                    }
+
+                    if root.has-live: IconButton {
+                        icon: Icons.pause;
+                        icon-size: 14px;
+                        tooltip: "Pause all";
+                        clicked => {
+                            DownloadsState.pause-all();
+                        }
+                    }
+
+                    if !root.has-live && root.has-paused: IconButton {
+                        icon: Icons.play;
+                        icon-size: 14px;
+                        tooltip: "Resume all";
+                        clicked => {
+                            DownloadsState.resume-all();
+                        }
+                    }
+
+                    Rectangle {
+                        width: Theme.control-h;
+                        IconButton {
+                            icon: Icons.more;
+                            tooltip: "More download actions";
+                            clicked => {
+                                drawer-menu.show({ x: 0, y: self.height + 4px });
+                            }
+                        }
+
+                        drawer-menu := ContextMenuArea {
+                            Menu {
+                                MenuItem {
+                                    title: "Clear completed";
+                                    enabled: DownloadsState.done-count > 0;
+                                    activated => {
+                                        DownloadsState.clear-finished();
+                                    }
+                                }
+                                if root.has-live && root.has-paused: MenuItem {
+                                    title: "Resume all";
+                                    activated => {
+                                        DownloadsState.resume-all();
+                                    }
+                                }
+                                MenuItem {
+                                    title: "Refresh";
+                                    activated => {
+                                        DownloadsState.refresh();
+                                    }
+                                }
+                                MenuSeparator { }
+                                MenuItem {
+                                    title: "Download all missing audio";
+                                    enabled: !LibraryState.bulk-busy;
+                                    activated => {
+                                        LibraryState.download-missing-audio();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    IconButton {
+                        icon: Icons.close;
+                        tooltip: "Close downloads";
+                        clicked => {
+                            LibraryUi.drawer-open = false;
+                        }
+                    }
+                }
+
+                // Batch overview.
+                if DownloadsState.total > 0: VerticalLayout {
+                    spacing: 6px;
+                    vertical-stretch: 0;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        vertical-stretch: 0;
+                        Text {
+                            text: DownloadsState.summary-line;
+                            font-size: Theme.callout;
+                            color: Theme.text-secondary;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                        }
+
+                        Text {
+                            text: "\{Math.round(DownloadsState.batch-progress * 100)}%";
+                            font-size: Theme.callout;
+                            color: Theme.text-tertiary;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    BatchBar {
+                        vertical-stretch: 0;
+                        progress: DownloadsState.batch-progress;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        placeholder-text: "Apple Music link or ID";
+                        text <=> DownloadsState.url-input;
+                        accepted(text) => {
+                            DownloadsState.enqueue-url(text);
+                        }
+                    }
+
+                    ActionButton {
+                        text: "Add";
+                        kind: "primary";
+                        min-w: 56px;
+                        clicked => {
+                            DownloadsState.enqueue-url(DownloadsState.url-input);
+                        }
+                    }
+                }
+
+                if DownloadsState.message != "": Text {
+                    text: DownloadsState.message;
+                    font-size: Theme.callout;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                if DownloadsState.total == 0: EmptyState {
+                    vertical-stretch: 1;
+                    title: "No downloads";
+                    body: "Paste a link above, or use Download on an album, playlist or song.";
+                }
+
+                if DownloadsState.total > 0: ListView {
+                    vertical-stretch: 1;
+                    for row in DownloadsState.rows: DownloadItem {
+                        item: row;
+                    }
+                }
+            }
+        }
+    }
+
+    animate shown { duration: 180ms; easing: ease-out; }
+}
+
+// ----- Remove confirmation -----------------------------------------------------
+
+component ConfirmRemove inherits Rectangle {
+    init => {
+        keys.focus();
+    }
+
+    function cancel() {
+        LibraryUi.confirm-id = "";
+    }
+
+    Rectangle {
+        background: Theme.scrim;
+        TouchArea {
+            clicked => {
+                root.cancel();
+            }
+        }
+    }
+
+    Rectangle {
+        width: min(400px, root.width - 48px);
+        height: body.preferred-height;
+        border-radius: Theme.radius-md;
+        background: Theme.bg-raised;
+        border-width: 1px;
+        border-color: Theme.raised-border;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: Theme.raised-shadow;
+
+        TouchArea { }
+
+        keys := FocusScope {
+            focus-on-click: false;
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    root.cancel();
+                    return accept;
+                }
+                reject
+            }
+
+            body := VerticalLayout {
+                padding: 20px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Icon {
+                        y: 1px;
+                        source: Icons.delete;
+                        tint: Theme.error;
+                    }
+
+                    Text {
+                        text: LibraryUi.confirm-kind == "delete"
+                            ? "Delete “" + LibraryUi.confirm-title + "”?"
+                            : "Remove the download of “" + LibraryUi.confirm-title + "”?";
+                        font-size: Theme.headline;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                Text {
+                    text: LibraryUi.confirm-kind == "delete"
+                        ? "The custom song, its audio and its lyrics are deleted. This can't be undone."
+                        : LibraryUi.confirm-kind == "collection"
+                        ? "Downloaded songs are deleted from this computer. Songs that another downloaded album or playlist, or a single download, still uses are kept. Lyrics and details stay."
+                        : "The downloaded audio file is deleted from this computer. Lyrics and song details stay, and you can download it again.";
+                    font-size: Theme.callout;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 12px;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    ActionButton {
+                        text: "Cancel";
+                        clicked => {
+                            root.cancel();
+                        }
+                    }
+
+                    ActionButton {
+                        text: LibraryUi.confirm-kind == "delete" ? "Delete" : "Remove download";
+                        kind: "destructive";
+                        clicked => {
+                            if LibraryUi.confirm-kind == "delete" {
+                                LibraryState.remove-track(LibraryUi.confirm-id);
+                            } else if LibraryUi.confirm-kind == "collection" {
+                                LibraryState.remove-collection-download(LibraryUi.confirm-id);
+                            } else {
+                                LibraryState.remove-download(LibraryUi.confirm-id);
+                            }
+                            root.cancel();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ----- Page --------------------------------------------------------------------
+
+/// Unified Library page.
+export component LibraryPage inherits Rectangle {
+    // Page inset: 24px, or 32px from 1100px content width.
+    property <length> pad: root.width >= 1100px ? 32px : 24px;
+    // W: the toolbar's own width.
+    property <length> tool-w: root.width - 2 * root.pad;
+    property <bool> wide-source: root.tool-w >= 860px;
+    property <bool> toggles-inline: root.tool-w >= 680px;
+    property <bool> search-inline: root.tool-w >= 560px;
+    property <length> search-min: root.wide-source ? 220px : root.toggles-inline ? 200px : 180px;
+    property <bool> search-expanded: false;
+    property <bool> searching: LibraryState.search != "";
+    // Search results: false = mixed results, true = every matching collection.
+    property <bool> show-all-collections: false;
+    property <int> downloads-pending: DownloadsState.active-count + DownloadsState.queued-count;
+    property <string> ring-tip: "Downloading \{root.downloads-pending} songs. Click to show downloads.";
+    property <[string]> source-labels: ["Library", "Downloaded", "All", "Custom"];
+
+    // Toast state.
+    property <int> message-seq: LibraryState.message-seq;
+    property <bool> toast-open: false;
+
+    background: Theme.bg-window;
+
+    changed message-seq => {
+        if LibraryState.message == "" {
+            root.toast-open = false;
+            toast-timer.stop();
+        } else {
+            root.toast-open = true;
+            toast-timer.stop();
+            if !LibraryState.message-is-error {
+                toast-timer.start();
+            }
+        }
+    }
+
+    changed searching => {
+        if !self.searching {
+            root.show-all-collections = false;
+        }
+    }
+
+    toast-timer := Timer {
+        interval: 4s;
+        running: false;
+        triggered => {
+            root.toast-open = false;
+            self.stop();
+        }
+    }
+
+    function set-filter(value: int) {
+        LibraryState.filter = value;
+        LibraryState.filter-changed(value);
+        // The missing-audio / -lyrics filters apply to songs.
+        if value != 0 && LibraryState.view == 0 {
+            LibraryState.view = 1;
+            LibraryState.set-view(1);
+        }
+    }
+
+    function set-source(value: int) {
+        LibraryState.source = value;
+        LibraryState.set-source(value);
+    }
+
+    if LibraryState.detail-open: CollectionDetail {
+        pad: root.pad;
+        short: root.height < 640px;
+    }
+
+    if !LibraryState.detail-open: VerticalLayout {
+        padding-left: root.pad;
+        padding-right: root.pad;
+        padding-top: 16px;
+        spacing: 0px;
+
+        // Row 1: title + count, then (ring) + ⋯ — never collapses.
+        HorizontalLayout {
+            height: 56px;
+            spacing: 8px;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Library";
+                    font-size: Theme.large-title;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+
+                Text {
+                    text: LibraryState.count-line;
+                    font-size: Theme.callout;
+                    color: Theme.text-secondary;
+                    overflow: elide;
+                }
+            }
+
+            if root.downloads-pending > 0: Rectangle {
+                width: Theme.control-h;
+                accessible-role: button;
+                accessible-label: root.ring-tip;
+                accessible-action-default => {
+                    LibraryUi.drawer-open = true;
+                }
+                Tooltip {
+                    text: @markdown("\{root.ring-tip}");
+                }
+                CircularProgress {
+                    x: 4px;
+                    y: (parent.height - self.height) / 2;
+                    ring-size: 24px;
+                    stroke-width: 2px;
+                    progress: DownloadsState.done-count / max(1, DownloadsState.total);
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        LibraryUi.drawer-open = true;
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.add;
+                    tooltip: "Add a song, album or playlist";
+                    clicked => {
+                        LibraryState.add-item();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: Theme.control-h;
+                    height: Theme.control-h;
+
+                    IconButton {
+                        icon: Icons.more;
+                        tooltip: "More library actions";
+                        dot: !root.toggles-inline && LibraryState.filter != 0;
+                        clicked => {
+                            library-menu.show({ x: 0, y: self.height + 4px });
+                        }
+                    }
+
+                    library-menu := ContextMenuArea {
+                        Menu {
+                            MenuItem {
+                                title: root.downloads-pending > 0 ? "Downloads (\{root.downloads-pending})" : "Downloads";
+                                activated => {
+                                    LibraryUi.drawer-open = true;
+                                }
+                            }
+                            MenuItem {
+                                title: "Refresh library";
+                                activated => {
+                                    LibraryState.refresh();
+                                }
+                            }
+                            MenuSeparator { }
+                            MenuItem {
+                                title: "Download all missing audio";
+                                enabled: !LibraryState.bulk-busy;
+                                activated => {
+                                    LibraryState.download-missing-audio();
+                                }
+                            }
+                            MenuItem {
+                                title: "Fetch all missing lyrics";
+                                enabled: !LibraryState.bulk-busy;
+                                activated => {
+                                    LibraryState.fetch-missing-lyrics();
+                                }
+                            }
+                            if !root.toggles-inline: MenuSeparator { }
+                            // Re-created when the filter changes, so the
+                            // check mark always follows LibraryState.filter.
+                            if !root.toggles-inline && LibraryState.filter == 1: MenuItem {
+                                title: "Only songs missing audio";
+                                checkable: true;
+                                checked: true;
+                                activated => {
+                                    root.set-filter(0);
+                                }
+                            }
+                            if !root.toggles-inline && LibraryState.filter != 1: MenuItem {
+                                title: "Only songs missing audio";
+                                checkable: true;
+                                checked: false;
+                                activated => {
+                                    root.set-filter(1);
+                                }
+                            }
+                            if !root.toggles-inline && LibraryState.filter == 2: MenuItem {
+                                title: "Only songs missing lyrics";
+                                checkable: true;
+                                checked: true;
+                                activated => {
+                                    root.set-filter(0);
+                                }
+                            }
+                            if !root.toggles-inline && LibraryState.filter != 2: MenuItem {
+                                title: "Only songs missing lyrics";
+                                checkable: true;
+                                checked: false;
+                                activated => {
+                                    root.set-filter(2);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 12px;
+        }
+
+        // Row 2: the adaptive toolbar.
+        HorizontalLayout {
+            height: Theme.control-h;
+            spacing: 8px;
+
+            if root.search-inline || root.search-expanded: SearchField {
+                min-width: root.search-min;
+                horizontal-stretch: 1;
+                placeholder: root.wide-source ? "Search albums, playlists and songs" : "Search";
+                text <=> LibraryState.search;
+                edited(text) => {
+                    LibraryState.search-changed(text);
+                }
+                init => {
+                    if root.search-expanded {
+                        self.focus-input();
+                    }
+                }
+            }
+
+            if root.search-expanded && !root.search-inline: IconButton {
+                icon: Icons.close;
+                tooltip: "Close search";
+                clicked => {
+                    root.search-expanded = false;
+                }
+            }
+
+            if !root.search-inline && !root.search-expanded: IconButton {
+                icon: Icons.search;
+                tooltip: "Search";
+                clicked => {
+                    root.search-expanded = true;
+                }
+            }
+
+            if !root.search-inline && !root.search-expanded: Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            if root.wide-source && !root.search-expanded: Segmented {
+                options: root.source-labels;
+                tooltips: [
+                    "Your Apple Music library",
+                    "Only what is available offline",
+                    "Everything the proxy has seen",
+                    "Songs, albums and playlists you added",
+                ];
+                current <=> LibraryState.source;
+                changed(index) => {
+                    root.set-source(index);
+                }
+            }
+
+            if !root.wide-source && !root.search-expanded: Rectangle {
+                width: pill.width;
+                pill := PillButton {
+                    text: root.source-labels[LibraryState.source];
+                    tooltip: LibraryState.source == 0 ? "Your Apple Music library" : "Library source";
+                    clicked => {
+                        source-menu.show({ x: 0, y: self.height + 4px });
+                    }
+                }
+
+                source-menu := ContextMenuArea {
+                    Menu {
+                        for label[i] in root.source-labels: MenuItem {
+                            title: label;
+                            activated => {
+                                root.set-source(i);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !root.search-expanded: IconSegmented {
+                icons: [Icons.grid, Icons.list];
+                labels: ["Show albums and playlists", "Show songs"];
+                current <=> LibraryState.view;
+                changed(index) => {
+                    LibraryState.set-view(index);
+                }
+            }
+
+            if root.toggles-inline && !root.search-expanded: IconToggle {
+                icon: Icons.missing-audio;
+                tooltip: "Show songs missing audio";
+                on: LibraryState.filter == 1;
+                toggled => {
+                    root.set-filter(LibraryState.filter == 1 ? 0 : 1);
+                }
+            }
+
+            if root.toggles-inline && !root.search-expanded: IconToggle {
+                icon: Icons.missing-lyrics;
+                tooltip: "Show songs missing lyrics";
+                on: LibraryState.filter == 2;
+                toggled => {
+                    root.set-filter(LibraryState.filter == 2 ? 0 : 2);
+                }
+            }
+        }
+
+        Rectangle {
+            height: 16px;
+        }
+
+        // Content.
+        Rectangle {
+            vertical-stretch: 1;
+
+            // Search: every matching collection.
+            if root.searching && root.show-all-collections: VerticalLayout {
+                spacing: 12px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: Theme.control-h;
+                    IconButton {
+                        icon: Icons.back;
+                        tooltip: "Back to all results";
+                        clicked => {
+                            root.show-all-collections = false;
+                        }
+                    }
+
+                    SectionTitle {
+                        y: 4px;
+                        title: "Albums and playlists";
+                        count: LibraryState.collections.length;
+                    }
+                }
+
+                CollectionGrid {
+                    vertical-stretch: 1;
+                    gutter: root.pad;
+                    model: LibraryState.collections;
+                }
+            }
+
+            // Search: mixed results.
+            if root.searching && !root.show-all-collections: results := VerticalLayout {
+                property <int> cols: GridMetrics.columns(self.width);
+                property <length> card-w: GridMetrics.card-width(self.width, self.cols);
+                property <int> shelf: min(self.cols, LibraryState.collections.length);
+                spacing: 0px;
+
+                if LibraryState.collections.length == 0 && LibraryState.tracks.length == 0 && !LibraryState.loading: EmptyState {
+                    vertical-stretch: 1;
+                    title: "No results for “" + LibraryState.search + "”";
+                    body: "Check the spelling or try a different source.";
+                }
+
+                if LibraryState.collections.length > 0: HorizontalLayout {
+                    height: Theme.control-h;
+                    SectionTitle {
+                        y: 4px;
+                        title: "Albums and playlists";
+                        count: LibraryState.collections.length;
+                    }
+
+                    if LibraryState.collections.length > results.shelf: ActionButton {
+                        text: "Show all";
+                        kind: "plain";
+                        clicked => {
+                            root.show-all-collections = true;
+                        }
+                    }
+                }
+
+                if LibraryState.collections.length > 0: Rectangle {
+                    height: results.card-w + GridMetrics.text-h + GridMetrics.gap-y + 8px;
+                    for i in results.shelf: CollectionCard {
+                        x: i * (results.card-w + GridMetrics.gap-x);
+                        y: 8px;
+                        width: results.card-w;
+                        height: results.card-w + GridMetrics.text-h;
+                        item: LibraryState.collections[i];
+                    }
+                }
+
+                if LibraryState.tracks.length > 0: SectionTitle {
+                    title: "Songs";
+                    count: LibraryState.tracks.length;
+                }
+
+                if LibraryState.tracks.length > 0: Rectangle {
+                    height: 8px;
+                }
+
+                if LibraryState.tracks.length > 0: SongColumns { }
+
+                if LibraryState.tracks.length > 0: SongList {
+                    vertical-stretch: 1;
+                    model: LibraryState.tracks;
+                }
+            }
+
+            // Grouped grid.
+            if !root.searching && LibraryState.view == 0: Rectangle {
+                if LibraryState.collections.length == 0 && !LibraryState.loading: EmptyState {
+                    title: LibraryState.source == 3 ? "No custom albums or playlists yet" : "No albums or playlists yet";
+                    body: LibraryState.source == 3
+                        ? "Use + to add one."
+                        : "Play something in Cider while the proxy is Active, or pick another source.";
+                }
+
+                if LibraryState.collections.length > 0 || LibraryState.loading: CollectionGrid {
+                    gutter: root.pad;
+                    model: LibraryState.collections;
+                    skeleton: LibraryState.loading;
+                }
+            }
+
+            // Songs list.
+            if !root.searching && LibraryState.view == 1: VerticalLayout {
+                SongColumns { }
+
+                if LibraryState.tracks.length == 0 && !LibraryState.loading: EmptyState {
+                    vertical-stretch: 1;
+                    title: LibraryState.filter == 1 ? "No songs are missing audio"
+                        : LibraryState.filter == 2 ? "No songs are missing lyrics"
+                        : "No songs yet";
+                    body: LibraryState.filter != 0 ? "" : "Play something in Cider while the proxy is Active.";
+                }
+
+                if LibraryState.tracks.length > 0 || LibraryState.loading: SongList {
+                    vertical-stretch: 1;
+                    model: LibraryState.tracks;
+                    skeleton: LibraryState.loading;
+                }
+            }
+        }
+    }
+
+    // Toast (overlay: never takes layout space).
+    toast := Toast {
+        property <length> max-w: min(480px, root.width - 48px);
+        width: min(self.natural-width, self.max-w);
+        x: (root.width - self.width) / 2;
+        y: root.toast-open ? root.height - self.height - 24px : root.height - self.height - 12px;
+        opacity: root.toast-open ? 1 : 0;
+        visible: self.opacity > 0.01;
+        animate opacity, y { duration: 180ms; easing: ease-out; }
+        text: LibraryState.message;
+        is-error: LibraryState.message-is-error;
+        close => {
+            root.toast-open = false;
+        }
+    }
+
+    if LibraryUi.drawer-open: DownloadsDrawer {
+        narrow: root.tool-w < 560px;
+    }
+
+    if LibraryUi.confirm-id != "": ConfirmRemove { }
+
+    LibraryAddDialog { }
+}

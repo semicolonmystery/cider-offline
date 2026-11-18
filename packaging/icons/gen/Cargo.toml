@@ -1,0 +1,27 @@
+# Dev-only icon generator: rasterises packaging/icons/src/*.svg into the
+# committed PNG / .ico assets. Not a workspace member, so normal builds never
+# compile resvg. Run from the repository root:
+#
+#   cargo run --manifest-path packaging/icons/gen/Cargo.toml
+[package]
+name = "icon-gen"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+image = { version = "0.25.10", default-features = false, features = ["ico"] }
+resvg = { version = "0.50.0", default-features = false }
+
+# Stand-alone: keeps this tool out of the main workspace.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"

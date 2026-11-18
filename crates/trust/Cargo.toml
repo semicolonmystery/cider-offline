@@ -1,0 +1,30 @@
+[package]
+name = "cider-offline-trust"
+description = "Local root CA generation and OS trust-store install/uninstall for Cider Offline"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+keywords = ["certificate", "ca", "trust-store", "tls", "x509"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+rcgen = { version = "0.14.10", features = ["x509-parser"] }
+rustls-pki-types = { version = "1.16.0", features = ["std"] }
+sha1 = "0.11.0"
+thiserror = "2.0.21"
+time = "0.3.55"
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target."cfg(windows)".dependencies]
+schannel = "0.1.30"

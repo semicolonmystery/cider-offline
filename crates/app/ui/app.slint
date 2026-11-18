@@ -1,0 +1,153 @@
+// Main window of Cider Offline.
+
+import { Theme, Icons, NavItem, Dot } from "components.slint";
+import { OverviewPage } from "pages/overview.slint";
+import { LibraryPage } from "pages/library.slint";
+export { LibraryUi } from "pages/library.slint";
+import { SettingsPage } from "pages/settings.slint";
+import { ConfirmDialog } from "dialog.slint";
+
+export {
+    ProxyState, CiderState, LibraryState, LibraryAddState, DownloadsState, SettingsState,
+    DialogState, ActivityRow, CollectionRow, TrackRow, DownloadRow, AddCollectionRow, LyricsProviderRow,
+} from "globals.slint";
+import { ProxyState, DialogState } from "globals.slint";
+
+export component AppWindow inherits Window {
+    title: "Cider Offline";
+    icon: @image-url("../assets/icon-256.png");
+    preferred-width: 1040px;
+    preferred-height: 700px;
+    min-width: 820px;
+    min-height: 560px;
+    background: Theme.bg-window;
+
+    /// Index of the visible page (0 Overview, 1 Library, 2 Settings).
+    in-out property <int> page: 0;
+
+    /// Raised by Rust when the user picks a page (used to lazily load data).
+    callback page-changed(int);
+
+    // Under 1000px the sidebar collapses to an icon rail.
+    property <bool> rail: root.width < 1000px;
+    property <color> status-tone: !ProxyState.running ? Theme.error : ProxyState.online ? Theme.ok : Theme.warn;
+    property <string> status-text: ProxyState.starting ? "Starting…"
+        : !ProxyState.running ? "Proxy stopped"
+        : (ProxyState.active ? "Active, " : "Passthrough, ") + ProxyState.address;
+
+    property <length> sidebar-w: root.rail ? 64px : 220px;
+
+    // Positioned explicitly (not in a layout): the sidebar width depends on
+    // the window width, which a layout would feed back into.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.sidebar-w;
+        height: root.height;
+        Rectangle {
+            background: Theme.bg-sidebar;
+
+            VerticalLayout {
+                padding-top: 16px;
+                padding-bottom: 12px;
+                padding-left: root.rail ? 12px : 8px;
+                padding-right: root.rail ? 12px : 8px;
+                spacing: 2px;
+
+                // Brand.
+                HorizontalLayout {
+                    padding-left: root.rail ? 0px : 10px;
+                    padding-bottom: 20px;
+                    spacing: 10px;
+                    alignment: root.rail ? center : start;
+                    Image {
+                        source: @image-url("../assets/icon-256.png");
+                        width: 28px;
+                        height: 28px;
+                        accessible-role: none;
+                    }
+
+                    if !root.rail: VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Cider Offline";
+                            font-size: Theme.body;
+                            font-weight: 600;
+                            color: Theme.text-primary;
+                        }
+                    }
+                }
+
+                for item[index] in [
+                    { text: "Overview", icon: Icons.overview },
+                    { text: "Library", icon: Icons.library },
+                    { text: "Settings", icon: Icons.settings },
+                ]: NavItem {
+                    text: item.text;
+                    icon: item.icon;
+                    rail: root.rail;
+                    selected: root.page == index;
+                    clicked => {
+                        root.page = index;
+                        root.page-changed(index);
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+
+                // Proxy status.
+                if root.rail: Rectangle {
+                    height: 24px;
+                    accessible-role: text;
+                    accessible-label: root.status-text;
+                    Tooltip {
+                        text: @markdown("\{root.status-text}");
+                    }
+                    Dot {
+                        tone: root.status-tone;
+                    }
+                }
+
+                if !root.rail: HorizontalLayout {
+                    padding-left: 10px;
+                    spacing: 8px;
+                    height: 24px;
+                    Dot {
+                        y: (parent.height - self.height) / 2;
+                        tone: root.status-tone;
+                    }
+
+                    Text {
+                        vertical-alignment: center;
+                        font-size: Theme.caption;
+                        color: Theme.text-secondary;
+                        overflow: elide;
+                        text: root.status-text;
+                    }
+                }
+            }
+        }
+
+    }
+
+    Rectangle {
+        x: root.sidebar-w;
+        y: 0;
+        width: root.width - root.sidebar-w;
+        height: root.height;
+        background: Theme.bg-window;
+        if root.page == 0: OverviewPage { }
+        if root.page == 1: LibraryPage { }
+        if root.page == 2: SettingsPage { }
+    }
+
+    // Modal confirmation, above every page.
+    if DialogState.open: ConfirmDialog {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+    }
+}

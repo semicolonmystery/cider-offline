@@ -1,0 +1,447 @@
+import { SpinBox, Switch, ScrollView, ComboBox, CheckBox } from "std-widgets.slint";
+import {
+    Theme, Icons, Icon, IconButton, ActionButton, Group, GroupHeading, ListRow, RowSeparator,
+    PageTitle,
+} from "../components.slint";
+import { SettingsState } from "../globals.slint";
+
+/// A heading plus its grouped inset list.
+component Section inherits VerticalLayout {
+    in property <string> title;
+    spacing: 8px;
+
+    GroupHeading {
+        text: root.title;
+    }
+
+    Group {
+        @children
+    }
+}
+
+/// Settings page: grouped inset lists.
+export component SettingsPage inherits Rectangle {
+    property <length> pad: root.width >= 1100px ? 32px : 24px;
+
+    VerticalLayout {
+        padding-left: root.pad;
+        padding-right: root.pad;
+        padding-top: 16px;
+        spacing: 8px;
+
+        PageTitle {
+            height: 56px;
+            title: "Settings";
+            subtitle: SettingsState.message;
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                spacing: 24px;
+                padding-bottom: root.pad;
+                // Keep clear of the scrollbar.
+                padding-right: 12px;
+
+                Section {
+                    title: "Proxy";
+                    ListRow {
+                        title: "Port";
+                        description: "Cider must use 127.0.0.1 and this port as its HTTP and HTTPS proxy. Changing it restarts the proxy.";
+                        SpinBox {
+                            width: 120px;
+                            minimum: 1;
+                            maximum: 65535;
+                            value <=> SettingsState.port;
+                        }
+
+                        ActionButton {
+                            text: "Apply";
+                            kind: "primary";
+                            enabled: SettingsState.port != SettingsState.applied-port;
+                            clicked => {
+                                SettingsState.apply-port(SettingsState.port);
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    title: "Startup";
+                    ListRow {
+                        title: "Start with the system";
+                        description: SettingsState.autostart-supported ? "Launch automatically when you sign in." : "Not supported on this system.";
+                        Switch {
+                            enabled: SettingsState.autostart-supported;
+                            checked <=> SettingsState.start-with-os;
+                            toggled => {
+                                SettingsState.set-start-with-os(self.checked);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Start minimized";
+                        description: "Start hidden in the system tray.";
+                        Switch {
+                            checked <=> SettingsState.start-minimized;
+                            toggled => {
+                                SettingsState.set-start-minimized(self.checked);
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    title: "Library";
+                    ListRow {
+                        title: "Download played songs";
+                        description: "Off, right away, or once playback has been idle for 30 seconds.";
+                        ComboBox {
+                            width: 150px;
+                            model: ["Off", "Right away", "When idle"];
+                            current-index <=> SettingsState.auto-cache-mode;
+                            selected => {
+                                SettingsState.set-auto-cache-mode(self.current-index);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Simultaneous downloads";
+                        description: "How many songs download at once. Apple may refuse licenses when too many are requested together, so 2 is the most reliable. Applies right away.";
+                        ComboBox {
+                            width: 150px;
+                            model: ["1", "2", "3", "4", "5", "6"];
+                            current-index: SettingsState.download-concurrency - 1;
+                            selected => {
+                                SettingsState.set-download-concurrency(self.current-index + 1);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Detail level";
+                        description: "Full keeps every song attribute for a rich library, search and lyrics. Minimal keeps only the core fields.";
+                        ComboBox {
+                            width: 150px;
+                            model: ["Full", "Minimal"];
+                            current-index <=> SettingsState.detail-level;
+                            selected => {
+                                SettingsState.set-detail-level(self.current-index);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Overwrite audio";
+                        description: "Replace a song's existing audio when importing or downloading it again.";
+                        Switch {
+                            checked <=> SettingsState.overwrite-audio;
+                            toggled => {
+                                SettingsState.set-overwrite-audio(self.checked);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Songs page";
+                        description: "What Cider's Library > Songs page lists, online and offline: only the songs you added to your library (like Apple Music), or every song in your library, including every song of your playlists.";
+                        ComboBox {
+                            width: 150px;
+                            model: ["Added to library", "Every song"];
+                            current-index <=> SettingsState.songs-page;
+                            selected => {
+                                SettingsState.set-songs-page(self.current-index);
+                            }
+                        }
+                    }
+
+                }
+
+                Section {
+                    title: "Lyrics";
+                    for provider[index] in SettingsState.lyrics-providers: VerticalLayout {
+                        if index > 0: RowSeparator { }
+                        ListRow {
+                            title: provider.name;
+                            description: provider.note;
+                            IconButton {
+                                icon: Icons.chevron-up;
+                                icon-size: 16px;
+                                tooltip: "Ask \{provider.name} earlier";
+                                enabled: index > 0;
+                                clicked => {
+                                    SettingsState.move-lyrics-provider(provider.id, true);
+                                }
+                            }
+
+                            IconButton {
+                                icon: Icons.chevron-down;
+                                icon-size: 16px;
+                                tooltip: "Ask \{provider.name} later";
+                                enabled: index < SettingsState.lyrics-providers.length - 1;
+                                clicked => {
+                                    SettingsState.move-lyrics-provider(provider.id, false);
+                                }
+                            }
+
+                            Switch {
+                                checked: provider.enabled;
+                                toggled => {
+                                    SettingsState.set-lyrics-provider-enabled(provider.id, self.checked);
+                                }
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "When a lookup fails";
+                        description: SettingsState.lyrics-failure-policy == 1
+                            ? "Wait (up to 30 seconds) and ask again before moving on to the next song."
+                            : SettingsState.lyrics-failure-policy == 2
+                            ? "Move on. The song stays without lyrics until you fetch again."
+                            : "Move on at once and ask again for the skipped songs once the rest are done.";
+                        ComboBox {
+                            width: 190px;
+                            model: ["Skip, retry at the end", "Wait and retry", "Skip"];
+                            current-index <=> SettingsState.lyrics-failure-policy;
+                            selected => {
+                                SettingsState.set-lyrics-failure-policy(self.current-index);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Search until";
+                        description: "Providers are asked in order until lyrics this good are found. Otherwise the best ones found are kept.";
+                        ComboBox {
+                            width: 190px;
+                            model: ["Word-synced (best)", "Line-synced", "Any lyrics"];
+                            current-index <=> SettingsState.lyrics-target-quality;
+                            selected => {
+                                SettingsState.set-lyrics-target-quality(self.current-index);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Always use downloaded lyrics";
+                        description: "Online too, show the lyrics saved here instead of asking Apple. Songs without saved lyrics still get Apple's. Imported lyrics files always win.";
+                        Switch {
+                            checked <=> SettingsState.lyrics-always-local;
+                            toggled => {
+                                SettingsState.set-lyrics-always-local(self.checked);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Fetch after downloading";
+                        description: "Look lyrics up for every song once its download finishes.";
+                        Switch {
+                            checked <=> SettingsState.lyrics-after-download;
+                            toggled => {
+                                SettingsState.set-lyrics-after-download(self.checked);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Overwrite lyrics";
+                        description: "Look songs that already have lyrics up again when fetching a collection or after a download. Apple lyrics are always kept.";
+                        Switch {
+                            checked <=> SettingsState.overwrite-lyrics;
+                            toggled => {
+                                SettingsState.set-overwrite-lyrics(self.checked);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    Rectangle {
+                        height: 44px;
+                        accessible-role: button;
+                        accessible-label: "More options";
+                        accessible-expandable: true;
+                        accessible-expanded: SettingsState.lyrics-more-open;
+                        accessible-action-default => {
+                            SettingsState.lyrics-more-open = !SettingsState.lyrics-more-open;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            Text {
+                                text: "More options";
+                                font-size: Theme.body;
+                                color: Theme.text-primary;
+                                vertical-alignment: center;
+                            }
+
+                            Icon {
+                                y: (parent.height - self.height) / 2;
+                                source: Icons.chevron-down;
+                                size: 16px;
+                                tint: Theme.text-secondary;
+                                transform-rotation: SettingsState.lyrics-more-open ? 0deg : -90deg;
+                                animate transform-rotation { duration: 150ms; }
+                            }
+                        }
+
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                SettingsState.lyrics-more-open = !SettingsState.lyrics-more-open;
+                            }
+                        }
+                    }
+
+                    if SettingsState.lyrics-more-open: VerticalLayout {
+                        RowSeparator { }
+                        ListRow {
+                            title: "Apply the failure rule to";
+                            description: "Providers left unticked always wait and retry.";
+                            for provider in SettingsState.lyrics-providers: CheckBox {
+                                text: provider.name;
+                                checked: provider.policy;
+                                toggled => {
+                                    SettingsState.set-lyrics-policy-provider(provider.id, self.checked);
+                                }
+                            }
+                        }
+
+                        RowSeparator { }
+
+                        ListRow {
+                            title: "LRCLIB request spacing";
+                            description: "Milliseconds between two LRCLIB lookups. Higher is gentler on LRCLIB's rate limit.";
+                            SpinBox {
+                                width: 120px;
+                                minimum: 0;
+                                maximum: 10000;
+                                step-size: 50;
+                                value <=> SettingsState.lrclib-spacing;
+                                edited(value) => {
+                                    SettingsState.set-lrclib-spacing(value);
+                                }
+                            }
+                        }
+
+                        RowSeparator { }
+
+                        ListRow {
+                            title: "Retry passes";
+                            description: SettingsState.lyrics-failure-policy == 0
+                                ? "How often skipped songs are asked again at the end, waiting longer each time (10 s, 30 s, 90 s, …)."
+                                : "Used with \"Skip, retry at the end\".";
+                            SpinBox {
+                                width: 120px;
+                                minimum: 1;
+                                maximum: 10;
+                                enabled: SettingsState.lyrics-failure-policy == 0;
+                                value <=> SettingsState.lyrics-retry-passes;
+                                edited(value) => {
+                                    SettingsState.set-lyrics-retry-passes(value);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    title: "Storage";
+                    ListRow {
+                        title: "Data folder";
+                        description: SettingsState.data-dir;
+                        IconButton {
+                            icon: Icons.folder;
+                            tooltip: "Open the data folder";
+                            clicked => {
+                                SettingsState.open-data-dir();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Capture folder";
+                        description: SettingsState.captures-dir;
+                        IconButton {
+                            icon: Icons.folder;
+                            tooltip: "Open the capture folder";
+                            clicked => {
+                                SettingsState.open-captures-dir();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Clear cache";
+                        description: "Delete cached Apple Music responses and artwork. Local audio, links to local files and custom songs are kept.";
+                        ActionButton {
+                            text: "Clear cache";
+                            kind: "plain";
+                            clicked => {
+                                SettingsState.clear-cache();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Uninstall certificate";
+                        description: "Remove the local certificate authority from the system. Cider stops working through the proxy in Active mode.";
+                        ActionButton {
+                            text: "Uninstall";
+                            kind: "plain";
+                            clicked => {
+                                SettingsState.uninstall-ca();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Remove all data";
+                        description: "Delete downloaded music, lyrics, artwork, settings and logs, remove the certificate and the start-at-login entry, and turn off Cider's proxy setting. The app quits afterwards.";
+                        ActionButton {
+                            text: "Remove all data…";
+                            kind: "destructive";
+                            enabled: !SettingsState.removing;
+                            clicked => {
+                                SettingsState.remove-all-data();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

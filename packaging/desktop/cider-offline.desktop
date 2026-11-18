@@ -1,0 +1,13 @@
+# Installed by the rpm (packaging/README.md); deb/AppImage/pacman get a generated entry.
+[Desktop Entry]
+Type=Application
+Name=Cider Offline
+GenericName=Offline proxy for Cider
+Comment=Local HTTPS proxy that keeps the Cider music client working offline from a local cache
+Exec=cider-offline
+Icon=sh.cider-offline.CiderOffline
+Terminal=false
+Categories=Utility;Network;AudioVideo;
+StartupNotify=true
+StartupWMClass=cider-offline
+Keywords=cider;apple music;proxy;offline;cache;
