@@ -19,6 +19,60 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Which parts of the repository changed, so the web job runs only when needed.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Filter paths
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            web:
+              - "web/**"
+              - ".github/workflows/ci.yml"
+
+  web:
+    name: Website
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: lint
+        run: npm run lint
+
+      - name: typecheck
+        run: npm run typecheck
+
+      # The build reads docs/src/SUMMARY.md (sitemap) and packaging/icons (OG image).
+      - name: build
+        run: npm run build
+
   check:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

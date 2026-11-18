@@ -123,4 +123,20 @@ cargo install mdbook --locked
 mdbook serve docs --open
 ```
 
-`mdbook build docs` writes the site to `docs/book/`, which is not committed. Pushing changes under `docs/` to `main` runs `.github/workflows/docs.yml`, which builds the book and publishes it to <https://cider-offline.podik.cz/docs/> with GitHub Pages.
+`mdbook build docs` writes the site to `docs/book/`, which is not committed. Pushing changes under `docs/` to `main` runs `.github/workflows/pages.yml`, which publishes the book to <https://cider-offline.podik.cz/docs/> together with the website. `docs/theme/head.hbs` adds the canonical URL and the Open Graph and Twitter tags to every page.
+
+## Website
+
+The site at <https://cider-offline.podik.cz> is a Next.js static export in `web/` (React, TypeScript, Tailwind and shadcn). For now its root page only redirects to the book. It also holds the 404 page for the whole domain, the sitemap, `robots.txt` and the image for link previews. It needs Node.js 26 (the current LTS). From `web/`:
+
+```sh
+npm ci              # install from package-lock.json
+npm run dev         # dev server on http://localhost:3000
+npm run lint
+npm run typecheck
+npm run build       # static export to web/out
+```
+
+The sitemap lists `/docs/` and every chapter in `docs/src/SUMMARY.md`, so a new chapter appears there on the next build. The site constants (URL, name, description) are in `web/src/lib/site.ts`.
+
+`.github/workflows/pages.yml` runs when `web/`, `docs/` or the workflow changes on `main`. It builds the site into `web/out`, builds the book into `web/out/docs`, points the book's canonical URLs at its `.html` pages and deploys `web/out` to GitHub Pages. CI runs lint, the type check and the build when `web/` changes.

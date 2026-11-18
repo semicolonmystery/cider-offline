@@ -1,0 +1,111 @@
+name: Pages
+
+# Build the website in web/ (Next.js static export) and the mdBook in docs/,
+# and publish them together with GitHub Pages at https://cider-offline.podik.cz/ :
+# the site at the root, the book under /docs/.
+#
+# Repository setup (once): Settings > Pages > Source: "GitHub Actions", and the
+# custom domain cider-offline.podik.cz. With Actions-based Pages the domain set
+# in the settings is the one that counts, so no CNAME file is published.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Only the minimum: read the code, deploy to Pages with an OIDC token.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; let a running deployment finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: 0.5.4
+  NODE_VERSION: 26
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build the site and the book
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The official release binary: no Rust toolchain or compile needed.
+      - name: Install mdBook
+        run: |
+          set -euo pipefail
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$RUNNER_TEMP/mdbook"
+          curl -sSfL "$url" | tar -xz -C "$RUNNER_TEMP/mdbook"
+          echo "$RUNNER_TEMP/mdbook" >> "$GITHUB_PATH"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      # Writes web/out: the root page, 404.html, og.png, sitemap.xml, robots.txt, icons.
+      - name: Build the site
+        working-directory: web
+        run: npm run build
+
+      - name: Build the book
+        run: |
+          set -euo pipefail
+          mdbook --version
+          mdbook build docs --dest-dir "$GITHUB_WORKSPACE/web/out/docs"
+
+      # docs/theme/head.hbs can only write each chapter's source path
+      # (installation.md) into its canonical and og:url; point them at the page.
+      - name: Point the book's canonical URLs at the .html pages
+        run: |
+          set -euo pipefail
+          sed -i -E \
+            -e 's#(<link rel="canonical" href="https://cider-offline\.podik\.cz/docs/[^"]*)\.md"#\1.html"#' \
+            -e 's#(<meta property="og:url" content="https://cider-offline\.podik\.cz/docs/[^"]*)\.md"#\1.html"#' \
+            web/out/docs/*.html
+          if grep -lE '(canonical" href|og:url" content)="[^"]*\.md"' web/out/docs/*.html; then
+            echo "::error::A canonical or og:url still ends in .md"
+            exit 1
+          fi
+          ls -la web/out
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: web/out
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

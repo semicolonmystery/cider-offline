@@ -63,6 +63,7 @@ If you find yourself fighting a convention, stop and ask.
 | `cider-offline-trust` | `crates/trust` | The local root CA and installing/removing it in each OS trust store. |
 | `cider-offline-download` | `crates/download` | Downloading and decrypting Apple Music audio; implements core's `Downloader` trait. |
 | icon generator | `packaging/icons/gen` | Build-time tool that renders the icons. Not part of the app. |
+| website | `web` | The site at cider-offline.podik.cz (Next.js static export, npm); the book is built into it under `/docs/`. Not part of the app; see `web/CLAUDE.md`. |
 
 Dependencies point toward core: app uses core, trust and download; download uses core;
 core uses only trust. Keep it that way. Packaging lives in `packaging/` and

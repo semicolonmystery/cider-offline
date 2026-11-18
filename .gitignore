@@ -4,6 +4,13 @@ target/
 *.pdb
 docs/book/
 
+# Website (web/): dependencies, Next.js build output and generated files
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+web/*.tsbuildinfo
+
 # Local runtime data (databases, captures, user data)
 *.db
 *.sqlite

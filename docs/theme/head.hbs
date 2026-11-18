@@ -1,0 +1,37 @@
+{{!--
+  SEO and social tags for every book page, added to mdBook's own <head>, which
+  already has <title> and the book's description. The site URL and image come
+  from web/src/lib/site.ts; keep them in sync.
+
+  mdBook has no helper to turn `path` (installation.md) into the page URL, so
+  the canonical and og:url end in `.md` here. The Pages workflow rewrites them
+  to `.html` after `mdbook build` (.github/workflows/pages.yml).
+--}}
+{{#if chapter_title}}{{!-- Chapters only: not the print, 404 or toc pages. --}}
+{{#if previous}}
+<link rel="canonical" href="https://cider-offline.podik.cz/docs/{{ path }}">
+<meta property="og:url" content="https://cider-offline.podik.cz/docs/{{ path }}">
+{{else}}{{!-- The first chapter and index.html, the same page: both point at /docs/. --}}
+<link rel="canonical" href="https://cider-offline.podik.cz/docs/">
+<meta property="og:url" content="https://cider-offline.podik.cz/docs/">
+{{/if}}
+{{/if}}
+{{#if base_url}}
+{{!-- Only the 404 page sets base_url. GitHub Pages serves the site's root 404 instead. --}}
+<meta name="robots" content="noindex">
+{{/if}}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Cider Offline">
+<meta property="og:locale" content="en">
+<meta property="og:title" content="{{ title }}">
+<meta property="og:description" content="{{ description }}">
+<meta property="og:image" content="https://cider-offline.podik.cz/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Cider Offline: Use Cider (Apple Music client) offline">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ title }}">
+<meta name="twitter:description" content="{{ description }}">
+<meta name="twitter:image" content="https://cider-offline.podik.cz/og.png">
+<meta name="twitter:image:alt" content="Cider Offline: Use Cider (Apple Music client) offline">
