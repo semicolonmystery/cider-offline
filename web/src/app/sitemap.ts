@@ -1,11 +1,11 @@
 import type { MetadataRoute } from "next";
 
 import { docsChapterUrls } from "@/lib/docs";
-import { DOCS_URL } from "@/lib/site";
+import { DOCS_URL, SITE_URL } from "@/lib/site";
 
 export const dynamic = "force-static";
 
-// The root only redirects to /docs/, so it is left out.
+// The landing page, then the book's pages in SUMMARY.md order.
 export default function sitemap(): MetadataRoute.Sitemap {
-  return [DOCS_URL, ...docsChapterUrls()].map((url) => ({ url }));
+  return [SITE_URL, DOCS_URL, ...docsChapterUrls()].map((url) => ({ url }));
 }

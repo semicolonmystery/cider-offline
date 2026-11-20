@@ -1,0 +1,721 @@
+/* The app window, rebuilt from the Slint UI (crates/app/ui). Every size is written in
+   the app's own pixels times --px, so the window scales as one picture:
+   --px = rendered window width / design width. Colours are the app's `Theme`. */
+
+.window {
+  /* Design size: the book's screenshots are 1200x780 (Library and Overview). */
+  --dw: 1200;
+  --dh: 780;
+  --px: calc(var(--win-w) / var(--dw));
+
+  --bg-window: #ffffff;
+  --bg-sidebar: #f5f5f7;
+  --bg-fill: rgb(0 0 0 / 4%);
+  --hover: rgb(0 0 0 / 4%);
+  --selected: rgb(0 0 0 / 6%);
+  --segment-thumb: #ffffff;
+  --segment-thumb-border: rgb(0 0 0 / 10%);
+  --separator: rgb(0 0 0 / 10%);
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-tertiary: #aeaeb2;
+  --accent: #fa243c;
+  --ok: #34c759;
+  --cover-placeholder: #e5e5ea;
+  --titlebar: #ececee;
+  --frame: rgb(0 0 0 / 14%);
+
+  position: relative;
+  width: var(--win-w);
+  height: calc(var(--px) * var(--dh));
+  overflow: hidden;
+  border-radius: calc(var(--px) * 12);
+  background: var(--bg-window);
+  color: var(--text-primary);
+  font-size: calc(var(--px) * 13);
+  line-height: 1.3;
+  box-shadow:
+    0 0 0 1px var(--frame),
+    0 calc(var(--px) * 24) calc(var(--px) * 64) rgb(0 0 0 / 22%),
+    0 calc(var(--px) * 4) calc(var(--px) * 14) rgb(0 0 0 / 10%);
+  user-select: none;
+  /* The launch grows from the bottom centre, where a Dock would be. */
+  transform-origin: 50% 100%;
+}
+
+@media (prefers-color-scheme: dark) {
+  .window {
+    --bg-window: #1c1c1e;
+    --bg-sidebar: #161618;
+    --bg-fill: rgb(255 255 255 / 8%);
+    --hover: rgb(255 255 255 / 6%);
+    --selected: rgb(255 255 255 / 10%);
+    --segment-thumb: #636366;
+    --segment-thumb-border: transparent;
+    --separator: rgb(255 255 255 / 8%);
+    --text-primary: #f5f5f7;
+    --text-secondary: #98989d;
+    --text-tertiary: #636366;
+    --accent: #fa2d48;
+    --ok: #30d158;
+    --cover-placeholder: #2c2c2e;
+    --titlebar: #2a2a2c;
+    --frame: rgb(255 255 255 / 12%);
+  }
+}
+
+/* Under 768px the window is drawn as the app's narrow layout: the sidebar
+   collapses to its 64px icon rail, as the app does below 1000px. */
+@media (max-width: 767px) {
+  .window {
+    --dw: 640;
+    --dh: 860;
+  }
+}
+
+/* ----- Title bar ----- */
+
+.titlebar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: calc(var(--px) * 32);
+  padding-inline: calc(var(--px) * 12);
+  gap: calc(var(--px) * 8);
+  background: var(--titlebar);
+  border-bottom: 1px solid var(--separator);
+}
+
+.light {
+  width: calc(var(--px) * 12);
+  height: calc(var(--px) * 12);
+  border-radius: 50%;
+  background: #ff5f57;
+}
+.light:nth-child(2) {
+  background: #febc2e;
+}
+.light:nth-child(3) {
+  background: #28c840;
+}
+
+.titleText {
+  position: absolute;
+  inset-inline: 0;
+  text-align: center;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* ----- Body: sidebar + page ----- */
+
+.body {
+  position: absolute;
+  inset: calc(var(--px) * 32) 0 0 0;
+  display: flex;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  width: calc(var(--px) * 220);
+  padding: calc(var(--px) * 16) calc(var(--px) * 8) calc(var(--px) * 12);
+  gap: calc(var(--px) * 2);
+  background: var(--bg-sidebar);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--px) * 10);
+  padding: 0 0 calc(var(--px) * 20) calc(var(--px) * 10);
+  font-weight: 600;
+}
+
+.brandIcon {
+  width: calc(var(--px) * 28);
+  height: calc(var(--px) * 28);
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--px) * 10);
+  height: calc(var(--px) * 32);
+  padding-inline: calc(var(--px) * 10);
+  border-radius: calc(var(--px) * 6);
+  color: var(--text-primary);
+}
+
+.nav svg {
+  width: calc(var(--px) * 20);
+  height: calc(var(--px) * 20);
+  color: var(--text-secondary);
+}
+
+.navSelected {
+  background: var(--selected);
+  font-weight: 600;
+}
+.navSelected svg {
+  color: var(--accent);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--px) * 8);
+  height: calc(var(--px) * 24);
+  margin-top: auto;
+  padding-left: calc(var(--px) * 10);
+  font-size: calc(var(--px) * 11);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.dot {
+  flex: none;
+  width: calc(var(--px) * 8);
+  height: calc(var(--px) * 8);
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+@media (max-width: 767px) {
+  .sidebar {
+    width: calc(var(--px) * 64);
+    padding-inline: calc(var(--px) * 12);
+    align-items: center;
+  }
+  .brand {
+    padding-left: 0;
+  }
+  .nav {
+    justify-content: center;
+    width: 100%;
+    padding-inline: 0;
+  }
+  .label {
+    display: none;
+  }
+  .status {
+    padding-left: 0;
+    justify-content: center;
+  }
+}
+
+.page {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* The Library grid and the album detail are two layers of the page. */
+.layer {
+  position: absolute;
+  inset: 0;
+  padding: calc(var(--px) * 16) calc(var(--px) * 24) 0;
+}
+
+.window[data-view="library"] .detail,
+.window[data-view="album"] .library {
+  visibility: hidden;
+  opacity: 0;
+}
+
+/* ----- Library page ----- */
+
+.libraryHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  height: calc(var(--px) * 56);
+}
+
+.largeTitle {
+  font-size: calc(var(--px) * 26);
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.callout {
+  font-size: calc(var(--px) * 12);
+  color: var(--text-secondary);
+}
+
+.headerActions {
+  display: flex;
+  gap: calc(var(--px) * 8);
+}
+
+.iconButton {
+  display: grid;
+  place-items: center;
+  width: calc(var(--px) * 32);
+  height: calc(var(--px) * 32);
+  border-radius: 50%;
+  color: var(--text-secondary);
+}
+
+.iconButton svg {
+  width: calc(var(--px) * 20);
+  height: calc(var(--px) * 20);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--px) * 8);
+  height: calc(var(--px) * 32);
+  margin-top: calc(var(--px) * 12);
+}
+
+.search {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: calc(var(--px) * 8);
+  height: 100%;
+  padding-inline: calc(var(--px) * 10);
+  border-radius: calc(var(--px) * 6);
+  background: var(--bg-fill);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.search svg {
+  flex: none;
+  width: calc(var(--px) * 16);
+  height: calc(var(--px) * 16);
+}
+
+.segmented {
+  display: flex;
+  height: 100%;
+  padding: calc(var(--px) * 2);
+  border-radius: calc(var(--px) * 6);
+  background: var(--bg-fill);
+}
+
+.segment {
+  display: grid;
+  place-items: center;
+  padding-inline: calc(var(--px) * 12);
+  border-radius: calc(var(--px) * 4);
+  color: var(--text-secondary);
+}
+
+.segmentOn {
+  background: var(--segment-thumb);
+  box-shadow: 0 0 0 1px var(--segment-thumb-border);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.toggles {
+  display: flex;
+  gap: calc(var(--px) * 2);
+}
+
+.toggle {
+  display: grid;
+  place-items: center;
+  width: calc(var(--px) * 32);
+  height: calc(var(--px) * 32);
+  border-radius: calc(var(--px) * 6);
+  color: var(--text-secondary);
+}
+
+.toggle svg {
+  width: calc(var(--px) * 20);
+  height: calc(var(--px) * 20);
+}
+
+.toggleOn {
+  background: var(--selected);
+  color: var(--text-primary);
+}
+
+@media (max-width: 767px) {
+  .segmented,
+  .filters {
+    display: none;
+  }
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  column-gap: calc(var(--px) * 20);
+  row-gap: calc(var(--px) * 24);
+  margin-top: calc(var(--px) * 16);
+}
+
+@media (max-width: 767px) {
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.card {
+  min-width: 0;
+}
+
+.cover {
+  position: relative;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border-radius: calc(var(--px) * 6);
+  background: var(--cover-placeholder);
+}
+
+.cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Hover dims the cover slightly (#0000001A in the app). */
+.coverDim {
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / 10%);
+  opacity: 0;
+}
+
+.moreChip {
+  position: absolute;
+  right: calc(var(--px) * 8);
+  bottom: calc(var(--px) * 8);
+  display: grid;
+  place-items: center;
+  width: calc(var(--px) * 28);
+  height: calc(var(--px) * 28);
+  border-radius: 50%;
+  background: rgb(0 0 0 / 50%);
+  color: #fff;
+  opacity: 0;
+}
+
+.moreChip svg {
+  width: calc(var(--px) * 16);
+  height: calc(var(--px) * 16);
+}
+
+.cardTitle,
+.cardSubtitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cardTitle {
+  margin-top: calc(var(--px) * 8);
+  font-weight: 600;
+  line-height: calc(var(--px) * 18);
+}
+
+.cardSubtitle {
+  font-size: calc(var(--px) * 12);
+  line-height: calc(var(--px) * 16);
+  color: var(--text-secondary);
+}
+
+/* ----- Album detail ----- */
+
+.hero {
+  display: flex;
+  gap: calc(var(--px) * 24);
+  height: calc(var(--px) * 220);
+  margin-top: calc(var(--px) * 12);
+}
+
+.heroCover {
+  flex: none;
+  width: calc(var(--px) * 220);
+  height: calc(var(--px) * 220);
+  overflow: hidden;
+  border-radius: calc(var(--px) * 10);
+}
+
+.heroCover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.heroText {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--px) * 4);
+  min-width: 0;
+}
+
+.title {
+  font-size: calc(var(--px) * 24);
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.headline {
+  font-size: calc(var(--px) * 15);
+  color: var(--text-secondary);
+}
+
+.meta {
+  font-size: calc(var(--px) * 12);
+  color: var(--text-tertiary);
+}
+
+.heroActions {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--px) * 12);
+  margin-top: auto;
+}
+
+@media (max-width: 767px) {
+  .hero {
+    height: calc(var(--px) * 160);
+  }
+  .heroCover {
+    width: calc(var(--px) * 160);
+    height: calc(var(--px) * 160);
+  }
+}
+
+/* The download control (DownloadControl in components.slint): an idle
+   download icon, a progress ring with a centre glyph, or a done check. */
+.control {
+  position: relative;
+  flex: none;
+  width: calc(var(--px) * var(--ring));
+  height: calc(var(--px) * var(--ring));
+  --p: 0;
+}
+
+.control > * {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.control[data-state="idle"] .ctlIdle,
+.control[data-state="queued"] .ctlRing,
+.control[data-state="downloading"] .ctlRing,
+.control[data-state="done"] .ctlDone {
+  opacity: 1;
+}
+
+.ctlIdle {
+  color: var(--text-secondary);
+}
+
+.ctlDone {
+  color: var(--text-tertiary);
+}
+
+.ringTrack {
+  stroke: color-mix(in srgb, var(--text-tertiary) 35%, transparent);
+}
+
+.ringBar {
+  stroke: var(--accent);
+  stroke-dasharray: 100;
+  stroke-dashoffset: calc(100 - var(--p) * 100);
+}
+
+.control[data-state="queued"] .ringBar {
+  opacity: 0;
+}
+
+.ringGlyph {
+  color: var(--text-secondary);
+}
+
+.control[data-state="downloading"] .ringGlyph {
+  color: var(--accent);
+}
+
+/* ----- Song list ----- */
+
+.columns,
+.row {
+  display: grid;
+  grid-template-columns:
+    calc(var(--px) * 28) minmax(0, 3fr) minmax(0, 2fr) calc(var(--px) * 24)
+    calc(var(--px) * 28) calc(var(--px) * 48) calc(var(--px) * 32);
+  align-items: center;
+  column-gap: 0;
+  padding-inline: calc(var(--px) * 8);
+}
+
+.columns {
+  height: calc(var(--px) * 28);
+  margin-top: calc(var(--px) * 16);
+  border-bottom: 1px solid var(--separator);
+  font-size: calc(var(--px) * 11);
+  color: var(--text-tertiary);
+}
+
+.colTitle {
+  padding-left: calc(var(--px) * 12);
+}
+
+.colAlbum {
+  padding-left: calc(var(--px) * 16);
+}
+
+.colTime {
+  grid-column: 6;
+  text-align: right;
+}
+
+.row {
+  position: relative;
+  height: calc(var(--px) * 52);
+}
+
+.row + .row::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--px) * 48);
+  right: calc(var(--px) * 8);
+  top: 0;
+  border-top: 1px solid var(--separator);
+}
+
+.number {
+  font-size: calc(var(--px) * 12);
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.trackText {
+  min-width: 0;
+  padding-left: calc(var(--px) * 12);
+}
+
+.trackTitle,
+.trackArtist,
+.trackAlbum {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trackTitle {
+  line-height: calc(var(--px) * 18);
+}
+
+.trackArtist,
+.trackAlbum {
+  font-size: calc(var(--px) * 12);
+  line-height: calc(var(--px) * 16);
+  color: var(--text-secondary);
+}
+
+.trackAlbum {
+  padding-left: calc(var(--px) * 16);
+}
+
+.lyricsMark {
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+}
+
+.lyricsMark svg {
+  width: calc(var(--px) * 16);
+  height: calc(var(--px) * 16);
+}
+
+.statusCell {
+  display: grid;
+  place-items: center;
+}
+
+.duration {
+  font-size: calc(var(--px) * 12);
+  color: var(--text-tertiary);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Below 720px of row width the app drops the album column. */
+@media (max-width: 767px) {
+  .columns,
+  .row {
+    grid-template-columns:
+      calc(var(--px) * 28) minmax(0, 1fr) 0 calc(var(--px) * 24)
+      calc(var(--px) * 28) calc(var(--px) * 48) calc(var(--px) * 32);
+  }
+  .colAlbum,
+  .trackAlbum {
+    visibility: hidden;
+  }
+}
+
+/* ----- Pointer used in the tour ----- */
+
+.cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: calc(var(--px) * 20);
+  height: calc(var(--px) * 20);
+  opacity: 0;
+  pointer-events: none;
+  filter: drop-shadow(0 1px 1px rgb(0 0 0 / 35%));
+}
+
+.cursor svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ----- App launch and library fill (no script needed) ----- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .launch {
+    animation: launch 700ms cubic-bezier(0.22, 1, 0.36, 1) 150ms backwards;
+  }
+
+  .launch .card {
+    animation: fill 400ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+    animation-delay: calc(650ms + var(--i) * 50ms);
+  }
+}
+
+@keyframes launch {
+  from {
+    opacity: 0;
+    transform: translateY(18%) scale(0.12);
+  }
+  35% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fill {
+  from {
+    opacity: 0;
+    transform: translateY(calc(var(--px) * 8));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

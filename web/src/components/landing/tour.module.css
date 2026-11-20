@@ -1,0 +1,199 @@
+/* The scroll tour. Two renderings of the same scenes:
+   - .animated: one sticky stage whose window and captions a scrubbed GSAP timeline
+     drives (scripts on, motion allowed);
+   - .static: each scene as a caption beside a still window (reduced motion, or no
+     script). `html.js` is set by an inline script in the layout before first paint. */
+
+.tour {
+  --gutter: 1rem;
+  position: relative;
+}
+
+@media (min-width: 640px) {
+  .tour {
+    --gutter: 2rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .tour {
+    --gutter: 3rem;
+  }
+}
+
+.animated {
+  display: none;
+}
+
+:global(html.js) .animated {
+  display: block;
+}
+
+:global(html.js) .static {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :global(html.js) .animated {
+    display: none;
+  }
+  :global(html.js) .static {
+    display: block;
+  }
+}
+
+/* ----- Animated tour ----- */
+
+.animated {
+  /* Scroll length of the whole story; the stage sticks for all of it. */
+  height: 520svh;
+}
+
+.stage {
+  /* The window: as wide as fits, never taller than the stage allows. */
+  --win-w: min(100cqw, 1200px, (100svh - 22rem) * 1200 / 780);
+
+  container-type: inline-size;
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.5rem;
+  height: 100svh;
+  padding-inline: var(--gutter);
+  overflow: clip;
+}
+
+@media (max-width: 767px) {
+  .stage {
+    /* The phone window is 640 x 860 design pixels. */
+    --win-w: min(100cqw, (100svh - 17rem) * 640 / 860);
+  }
+}
+
+.windowSlot {
+  width: var(--win-w);
+  will-change: transform;
+}
+
+.captions {
+  position: relative;
+  width: min(100%, 36rem);
+  height: 11rem;
+}
+
+.caption {
+  position: absolute;
+  inset: 0 0 auto;
+  visibility: hidden;
+  opacity: 0;
+}
+
+/* Wide screens: the window steps aside and the caption takes the free side. */
+@media (min-width: 1200px) {
+  .stage {
+    --win-w: min(66cqw, 1200px, (100svh - 6rem) * 1200 / 780);
+  }
+
+  .captions {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    height: auto;
+    pointer-events: none;
+  }
+
+  .caption {
+    inset: 0 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    width: calc(100cqw - var(--win-w) - var(--gutter));
+    max-width: 28rem;
+  }
+
+  .caption[data-side="left"] {
+    left: var(--gutter);
+  }
+
+  .caption[data-side="right"] {
+    right: var(--gutter);
+  }
+}
+
+/* ----- Captions (shared) ----- */
+
+.captionTitle {
+  font-size: clamp(1.5rem, 1.6vw + 1rem, 2.25rem);
+  font-weight: 650;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+.captionBody {
+  margin-top: 0.75rem;
+  max-width: 38ch;
+  color: var(--muted-foreground);
+  font-size: 1rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+@media (min-width: 640px) {
+  .captionBody {
+    font-size: 1.0625rem;
+  }
+}
+
+/* ----- Static tour ----- */
+
+.static {
+  container-type: inline-size;
+  padding: 2rem var(--gutter) 4rem;
+}
+
+.scene {
+  --win-w: min(100cqw, 1200px);
+
+  display: grid;
+  justify-items: center;
+  gap: 1.5rem;
+  margin-inline: auto;
+  max-width: 1200px;
+}
+
+.scene + .scene {
+  margin-top: 5rem;
+}
+
+.scene .caption {
+  position: static;
+  visibility: visible;
+  opacity: 1;
+  width: min(100%, 36rem);
+}
+
+@media (min-width: 1200px) {
+  .scene {
+    --win-w: 760px;
+    grid-template-columns: minmax(0, 1fr) var(--win-w);
+    align-items: center;
+    justify-items: start;
+    gap: var(--gutter);
+  }
+
+  .scene:nth-child(even) {
+    grid-template-columns: var(--win-w) minmax(0, 1fr);
+  }
+
+  .scene:nth-child(even) .caption {
+    order: 2;
+  }
+
+  .scene .caption {
+    width: auto;
+  }
+}

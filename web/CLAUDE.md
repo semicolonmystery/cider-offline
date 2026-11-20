@@ -1,9 +1,10 @@
 # CLAUDE.md (web/)
 
 The website at <https://cider-offline.podik.cz>: a Next.js 16 static export
-(React 19, TypeScript, Tailwind 4, shadcn on base-ui). For now it has no
-content of its own. The root redirects to the mdBook, which the Pages workflow
-builds into `out/docs`. The repository rules in `../CLAUDE.md` apply too.
+(React 19, TypeScript, Tailwind 4, shadcn on base-ui, GSAP). The root is a
+one-page landing site, a scroll-driven tour of the app; the mdBook lives under
+`/docs/`, built into `out/docs` by the Pages workflow. The design direction is
+[`DESIGN.md`](DESIGN.md). The repository rules in `../CLAUDE.md` apply too.
 
 ## 1. Rules
 
@@ -50,6 +51,7 @@ book, so keep the two in sync.
 | `src/app/` | Routes only, thin: layout, page, not-found, sitemap, robots, `og.png/` and the icon files. |
 | `src/components/ui/` | shadcn primitives, CLI-managed. Never edit. |
 | `src/components/` | Shared components. |
+| `src/components/landing/` | The landing page. Server components except `animated-tour.tsx` (the GSAP timeline) and `download-button.tsx`. `app-window.tsx` rebuilds the app UI in HTML/CSS from `../crates/app/ui`; keep it in step with the Slint sources. |
 | `src/lib/` | Site constants, shared metadata and helpers. |
 
 A component starts next to its only consumer. It is promoted to
@@ -67,6 +69,15 @@ A component starts next to its only consumer. It is promoted to
 - Light and dark follow `prefers-color-scheme`; there is no theme switcher.
   The colours in `src/app/globals.css` are the app's palette.
 - `out/404.html` is the 404 page for the whole domain, `/docs/*` included.
+- The tour has two renderings in the HTML: the scrubbed animation and static
+  scenes. CSS picks one from `html.js` (set by an inline script in the layout)
+  and `prefers-reduced-motion`. Change both when a scene changes.
+- The rebuilt window sizes everything in app pixels times `--px` (window width
+  over design width), so `--win-w` must be an absolute length (`cqw`, `svh`,
+  `px`), never a percentage.
+- `public/app-icon.svg` is a copy of `../packaging/icons/src/app.svg`, and
+  `public/covers/` holds the demo albums' covers (400px WebP) from the book's
+  demo library.
 
 ## 4. Commands
 

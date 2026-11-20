@@ -9,6 +9,11 @@ export const SITE_DESCRIPTION =
   "A local proxy that caches your Apple Music library, downloads songs and lyrics, and serves them to Cider when you're offline.";
 export const SITE_HOST = new URL(SITE_URL).host;
 export const REPO_URL = "https://github.com/semicolonmystery/cider-offline";
+export const SPONSOR_URL = "https://github.com/sponsors/semicolonmystery";
+/** Every system's installers and portable builds are on the latest release. */
+export const RELEASES_URL = `${REPO_URL}/releases/latest`;
+/** The one-line promise under the name on the landing page. */
+export const SITE_PROMISE = "Keeps Cider playing your Apple Music library when you're offline.";
 
 /** The Open Graph / Twitter image, rendered by `app/og.png/route.tsx`. */
 export const OG_IMAGE = {
