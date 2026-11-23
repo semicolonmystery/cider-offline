@@ -120,7 +120,11 @@ async fn library(dir: &tempfile::TempDir, downloaded: &[u32]) -> Storage {
         let file = dir.path().join(format!("{n}.m4a"));
         std::fs::write(&file, b"audio").unwrap();
         storage
-            .set_audio_by_any_id(&n.to_string(), Some(file))
+            .set_audio_by_any_id(
+                &n.to_string(),
+                crate::storage::AudioVariant::Stereo,
+                Some(file),
+            )
             .await
             .unwrap();
     }
@@ -675,7 +679,10 @@ async fn downloaded_song_without_play_params_should_become_playable() {
         .unwrap();
     let file = dir.path().join("7.m4a");
     std::fs::write(&file, b"audio").unwrap();
-    storage.set_audio_by_any_id("7", Some(file)).await.unwrap();
+    storage
+        .set_audio_by_any_id("7", crate::storage::AudioVariant::Stereo, Some(file))
+        .await
+        .unwrap();
     let body = get(
         &dir,
         &storage,

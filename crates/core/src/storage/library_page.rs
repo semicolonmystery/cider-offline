@@ -17,7 +17,7 @@
 //! Search is case- and accent-insensitive on both sides (the `fold_text` SQL
 //! function, the same folding as the Apple Music grid ordering).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::functions::FunctionFlags;
@@ -26,8 +26,10 @@ use rusqlite::{Connection, ToSql};
 use super::library::{self, LibraryCollection, LibraryFilter, sort_fold};
 use super::models::{CollectionKind, Track};
 use super::paths::PathCodec;
-use super::repo::{TRACK_COLUMNS, track_from_row};
+use super::repo::{TRACK_COLUMN_COUNT, TRACK_COLUMNS, track_from_row};
 use super::{Storage, StorageError};
+use crate::DownloadFormat;
+use crate::download_needs::CollectionDownload;
 
 /// Track-list filter of the songs view and collection detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -73,6 +75,18 @@ pub struct LibraryTrack {
     pub track: Track,
     /// A user track-id → local file mapping exists.
     pub has_mapping: bool,
+    /// Whether the song has a spatial mix, as the download queue learned it
+    /// (`None`: not looked up; see [`crate::download_needs`]).
+    pub spatial_known: Option<bool>,
+}
+
+impl LibraryTrack {
+    /// Whether the song lacks a mix `format` wants (see
+    /// [`crate::download_needs`]).
+    #[must_use]
+    pub fn needs_download(&self, format: crate::DownloadFormat) -> bool {
+        crate::download_needs::track_needs_download(&self.track, format, self.spatial_known)
+    }
 }
 
 /// Cached grouped collection view of one filter.
@@ -196,10 +210,104 @@ fn members(
         .map(|entry| entry.track_ids.clone()))
 }
 
+/// The download summary of each of `ids` in the grouped view of `filter`,
+/// counted over the same members the view lists (see
+/// [`Storage::collection_downloads`]).
+fn collection_downloads(
+    conn: &Connection,
+    codec: &PathCodec,
+    cache: &ViewCache,
+    filter: LibraryFilter,
+    ids: &[String],
+    format: DownloadFormat,
+) -> Result<HashMap<String, CollectionDownload>, StorageError> {
+    let view = cached_collections(conn, codec, cache, filter)?;
+    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let entries: Vec<&LibraryCollection> = view
+        .iter()
+        .filter(|entry| wanted.contains(entry.collection.id.as_str()))
+        .collect();
+    let mut songs: Vec<&str> = entries
+        .iter()
+        .flat_map(|entry| entry.track_ids.iter().map(String::as_str))
+        .collect();
+    songs.sort_unstable();
+    songs.dedup();
+    let facts = member_facts(conn, codec, &songs)?;
+    let owners: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.collection.id.as_str())
+        .collect();
+    let pins = owner_pins(conn, &owners)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let owner = entry.collection.id.as_str();
+            let mut summary = CollectionDownload::default();
+            let mut seen = HashSet::new();
+            for id in &entry.track_ids {
+                // A song listed twice counts once; a member with no stored
+                // song can't be downloaded from here and is left out.
+                if seen.insert(id.as_str())
+                    && let Some((track, known)) = facts.get(id.as_str())
+                {
+                    let linked = pins
+                        .get(owner)
+                        .is_some_and(|songs| songs.contains(track.id.as_str()));
+                    summary.add(track, format, *known, linked);
+                }
+            }
+            (entry.collection.id.clone(), summary)
+        })
+        .collect())
+}
+
+/// The songs each of the collections `owners` pins, by owner.
+fn owner_pins<'a>(
+    conn: &Connection,
+    owners: &[&'a str],
+) -> Result<HashMap<&'a str, HashSet<String>>, StorageError> {
+    let mut stmt = conn.prepare("SELECT track_id FROM download_pins WHERE owner = ?1")?;
+    let mut pins = HashMap::with_capacity(owners.len());
+    for &owner in owners {
+        let songs = stmt
+            .query_map([owner], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        pins.insert(owner, songs);
+    }
+    Ok(pins)
+}
+
+/// The stored songs `ids` with what the queue learned about their spatial
+/// mix, by song id.
+fn member_facts(
+    conn: &Connection,
+    codec: &PathCodec,
+    ids: &[&str],
+) -> Result<HashMap<String, (Track, Option<bool>)>, StorageError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let json = serde_json::to_string(ids)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TRACK_COLUMNS},
+                (SELECT s.has_spatial FROM song_spatial s WHERE s.track_id = t.id)
+         FROM json_each(:ids) j JOIN tracks t ON t.id = j.value"
+    ))?;
+    let rows = stmt.query_map(&[(":ids", &json)], |row| {
+        let track = track_from_row(codec)(row)?;
+        let known: Option<bool> = row.get(TRACK_COLUMN_COUNT)?;
+        Ok((track.id.clone(), (track, known)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 fn track_filter_predicate(filter: TrackFilter) -> &'static str {
     match filter {
         TrackFilter::All => "1",
-        TrackFilter::MissingAudio => "t.audio_path IS NULL",
+        TrackFilter::MissingAudio => {
+            "NOT EXISTS (SELECT 1 FROM track_audio a WHERE a.track_id = t.id)"
+        }
         TrackFilter::MissingLyrics => "t.lyrics_source = 'none'",
     }
 }
@@ -263,15 +371,12 @@ fn tracks_page(
     let offset_param = i64::try_from(offset).unwrap_or(i64::MAX);
     params.push((":limit", &limit_param));
     params.push((":offset", &offset_param));
-    let columns = TRACK_COLUMNS
-        .split(", ")
-        .map(|column| format!("t.{column}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mapping_column = TRACK_COLUMNS.split(", ").count();
+    let mapping_column = TRACK_COLUMN_COUNT;
     let mut stmt = conn.prepare(&format!(
-        "SELECT {columns},
-                EXISTS (SELECT 1 FROM track_mappings m WHERE m.track_id = t.id)
+        "SELECT {TRACK_COLUMNS},
+                EXISTS (SELECT 1 FROM track_mappings m WHERE m.track_id = t.id),
+                (SELECT s.has_spatial FROM song_spatial s
+                 WHERE s.track_id = t.id)
          FROM {from} WHERE {condition}
          ORDER BY {order} LIMIT :limit OFFSET :offset"
     ))?;
@@ -280,6 +385,7 @@ fn tracks_page(
             Ok(LibraryTrack {
                 track: track_from_row(codec)(row)?,
                 has_mapping: row.get(mapping_column)?,
+                spatial_known: row.get(mapping_column + 1)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -326,6 +432,28 @@ impl Storage {
         let cache = Arc::clone(&self.views);
         let codec = self.codec.clone();
         self.call(move |c| tracks_page(c, &codec, &cache, &query, offset, limit))
+            .await
+    }
+
+    /// How much of each collection `ids` of the grid of `filter` is
+    /// downloaded under `format`, counted from the audio files of the songs
+    /// the view lists for it (the same members its detail shows). The
+    /// collection's own pins only tell "downloaded" from "saved through
+    /// other downloads"; queue rows and lyrics are not consulted.
+    /// Collections not in the view are left out of the map.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn collection_downloads(
+        &self,
+        filter: LibraryFilter,
+        ids: Vec<String>,
+        format: DownloadFormat,
+    ) -> Result<HashMap<String, CollectionDownload>, StorageError> {
+        let cache = Arc::clone(&self.views);
+        let codec = self.codec.clone();
+        self.call(move |c| collection_downloads(c, &codec, &cache, filter, &ids, format))
             .await
     }
 
@@ -400,6 +528,56 @@ mod tests {
         page.items.iter().map(|t| t.track.id.as_str()).collect()
     }
 
+    /// One song in the synced library under two library ids: `i.x` in a
+    /// saved album and `a.5` in a playlist, both with catalog id `5`.
+    async fn twin_library() -> Storage {
+        let storage = Storage::open_in_memory().unwrap();
+        let twin = |id: &str| TrackMetadata {
+            catalog_id: Some("5".to_owned()),
+            ..song(id, "Song", "Artist", "Album")
+        };
+        storage
+            .replace_library(LibrarySnapshot {
+                collections: vec![
+                    SyncedCollection {
+                        collection: Playlist::minimal("l.1", CollectionKind::Album, "Album"),
+                        track_ids: vec!["i.x".to_owned()],
+                        reported_total: Some(1),
+                    },
+                    SyncedCollection {
+                        collection: Playlist::minimal("p.1", CollectionKind::Playlist, "Mix"),
+                        track_ids: vec!["a.5".to_owned()],
+                        reported_total: Some(1),
+                    },
+                ],
+                tracks: vec![twin("i.x"), twin("a.5")],
+                songs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    async fn songs_list_should_show_a_song_listed_under_two_library_ids_once() {
+        let page = twin_library()
+            .await
+            .tracks_page(query(), 0, 10)
+            .await
+            .unwrap();
+        assert_eq!((page.total, ids(&page)), (1, vec!["5"]));
+    }
+
+    #[tokio::test]
+    async fn collection_members_should_be_song_ids() {
+        let storage = twin_library().await;
+        let members = storage
+            .collection_members(LibraryFilter::AppleMusic, "p.1")
+            .await
+            .unwrap();
+        assert_eq!(members, Some(vec!["5".to_owned()]));
+    }
+
     #[tokio::test]
     async fn tracks_page_should_report_total_independent_of_window() {
         let page = store().await.tracks_page(query(), 0, 3).await.unwrap();
@@ -467,7 +645,11 @@ mod tests {
     async fn missing_audio_filter_should_count_only_tracks_without_audio() {
         let storage = store().await;
         storage
-            .set_track_audio("i.3", Some(PathBuf::from("a.m4a")))
+            .set_track_audio(
+                "i.3",
+                crate::storage::AudioVariant::Stereo,
+                Some(PathBuf::from("a.m4a")),
+            )
             .await
             .unwrap();
         let q = LibraryQuery {
@@ -613,5 +795,385 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(members.first().map(String::as_str), Some("i.9"));
+    }
+
+    /// `p.1` of [`store`] with songs `i.0` … `i.{with_audio - 1}` downloaded
+    /// (stereo). `p.1` pins the first `linked` of those, another playlist
+    /// (`p.other`) the rest.
+    async fn mix_with(with_audio: usize, linked: usize) -> Storage {
+        let storage = store().await;
+        for n in 0..with_audio {
+            storage
+                .set_track_audio(
+                    &format!("i.{n}"),
+                    crate::storage::AudioVariant::Stereo,
+                    Some(PathBuf::from(format!("media/{n}.m4a"))),
+                )
+                .await
+                .unwrap();
+            let owner = if n < linked { "p.1" } else { "p.other" };
+            storage
+                .pin_downloads(Some(owner), vec![format!("i.{n}")])
+                .await
+                .unwrap();
+        }
+        storage
+    }
+
+    /// The Stereo summary of `p.1` in `storage`.
+    async fn mix_summary(storage: &Storage) -> CollectionDownload {
+        let mut found = storage
+            .collection_downloads(
+                LibraryFilter::AppleMusic,
+                vec!["p.1".to_owned()],
+                DownloadFormat::Stereo,
+            )
+            .await
+            .unwrap();
+        found.remove("p.1").unwrap()
+    }
+
+    /// [`mix_with`] with every downloaded song pinned by `p.1`, summarized.
+    async fn mix_with_audio(with_audio: usize) -> CollectionDownload {
+        mix_summary(&mix_with(with_audio, with_audio).await).await
+    }
+
+    /// A [`super::super::DownloadCollection`] for `owner` in the Apple Music
+    /// view.
+    fn playlist(owner: &str) -> crate::storage::DownloadCollection {
+        crate::storage::DownloadCollection {
+            owner: owner.to_owned(),
+            filter: LibraryFilter::AppleMusic,
+            kind: crate::storage::DownloadSourceKind::Playlist,
+            name: "Mix".to_owned(),
+            keep: false,
+        }
+    }
+
+    fn mix_keys() -> Vec<String> {
+        (0..10).map(|n| format!("i.{n}")).collect()
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_count_songs_with_files() {
+        let summary = mix_with_audio(3).await;
+        assert_eq!(
+            (summary.state(), summary.complete, summary.songs),
+            (crate::CollectionDownloadState::Partial, 3, 10)
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_report_a_collection_without_files() {
+        assert_eq!(
+            mix_with_audio(0).await.state(),
+            crate::CollectionDownloadState::NotDownloaded
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_report_a_complete_collection() {
+        assert_eq!(
+            mix_with_audio(10).await.state(),
+            crate::CollectionDownloadState::Downloaded
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_report_files_saved_through_other_downloads() {
+        let summary = mix_summary(&mix_with(10, 0).await).await;
+        assert_eq!(
+            (summary.state(), summary.complete, summary.linked),
+            (crate::CollectionDownloadState::SavedElsewhere, 10, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_report_a_partly_linked_complete_collection_as_saved_elsewhere()
+     {
+        let summary = mix_summary(&mix_with(10, 4).await).await;
+        assert_eq!(
+            (summary.state(), summary.linked),
+            (crate::CollectionDownloadState::SavedElsewhere, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_count_a_partial_collection_from_files_whoever_pins_it() {
+        let summary = mix_summary(&mix_with(3, 0).await).await;
+        assert_eq!(
+            (summary.state(), summary.complete),
+            (crate::CollectionDownloadState::Partial, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_should_make_a_collection_saved_elsewhere_downloaded() {
+        let storage = mix_with(10, 0).await;
+        storage
+            .link_download_collection(playlist("p.1"), None, mix_keys())
+            .await
+            .unwrap();
+        assert_eq!(
+            mix_summary(&storage).await.state(),
+            crate::CollectionDownloadState::Downloaded
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_should_pin_every_song_and_report_the_new_pins() {
+        let storage = mix_with(10, 4).await;
+        let added = storage
+            .link_download_collection(playlist("p.1"), None, mix_keys())
+            .await
+            .unwrap();
+        let mut owners = Vec::new();
+        for key in mix_keys() {
+            owners.push(storage.download_owners(&key).await.unwrap());
+        }
+        assert_eq!(
+            (
+                added,
+                owners
+                    .iter()
+                    .filter(|o| o.contains(&"p.1".to_owned()))
+                    .count()
+            ),
+            (6, 10)
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_should_leave_other_pins_alone() {
+        let storage = mix_with(10, 4).await;
+        storage
+            .pin_downloads(None, vec!["i.9".to_owned()])
+            .await
+            .unwrap();
+        storage
+            .link_download_collection(playlist("p.1"), None, mix_keys())
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.download_owners("i.9").await.unwrap(),
+            ["", "p.1", "p.other"]
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_should_register_the_collection() {
+        let storage = mix_with(10, 0).await;
+        storage
+            .link_download_collection(playlist("p.1"), Some(true), mix_keys())
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.download_collections().await.unwrap(),
+            [crate::storage::DownloadCollection {
+                keep: true,
+                ..playlist("p.1")
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_should_change_no_file() {
+        let storage = mix_with(10, 0).await;
+        let before = storage.get_track("i.3").await.unwrap().unwrap().audio;
+        storage
+            .link_download_collection(playlist("p.1"), None, mix_keys())
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_track("i.3").await.unwrap().unwrap().audio,
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_through_another_id_of_a_song_should_count_as_linked() {
+        // `p.1` lists the song as `a.5`; its pin is keyed on the song id `5`.
+        let storage = twin_library().await;
+        storage
+            .set_track_audio(
+                "5",
+                crate::storage::AudioVariant::Stereo,
+                Some(PathBuf::from("media/5.m4a")),
+            )
+            .await
+            .unwrap();
+        storage
+            .link_download_collection(playlist("p.1"), None, vec!["a.5".to_owned()])
+            .await
+            .unwrap();
+        let state = storage
+            .collection_downloads(
+                LibraryFilter::AppleMusic,
+                vec!["p.1".to_owned(), "l.1".to_owned()],
+                DownloadFormat::Stereo,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, summary)| (id, summary.state()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            state.into_iter().collect::<Vec<_>>(),
+            [
+                (
+                    "l.1".to_owned(),
+                    crate::CollectionDownloadState::SavedElsewhere
+                ),
+                ("p.1".to_owned(), crate::CollectionDownloadState::Downloaded),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_ignore_pins_and_finished_queue_rows() {
+        // The owner's "Mix 2026": every song pinned by the playlist and its
+        // queue rows "done", but no file on disk (cancelled or removed).
+        let storage = store().await;
+        let keys: Vec<String> = (0..10).map(|n| format!("i.{n}")).collect();
+        storage
+            .pin_downloads(Some("p.1"), keys.clone())
+            .await
+            .unwrap();
+        for key in &keys {
+            storage
+                .upsert_download(crate::storage::DownloadRecord {
+                    id: key.clone(),
+                    track_id: key.clone(),
+                    title: "Song".to_owned(),
+                    artist: "Artist".to_owned(),
+                    album: None,
+                    duration_ms: 0,
+                    artwork_url: None,
+                    source_kind: crate::storage::DownloadSourceKind::Playlist,
+                    source_id: Some("p.1".to_owned()),
+                    source_name: Some("Mix".to_owned()),
+                    status: crate::storage::DownloadStatus::Done,
+                    progress: 1.0,
+                    message: None,
+                    deferred: false,
+                    replace: false,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let summary = storage
+            .collection_downloads(
+                LibraryFilter::AppleMusic,
+                vec!["p.1".to_owned()],
+                DownloadFormat::Stereo,
+            )
+            .await
+            .unwrap()
+            .remove("p.1")
+            .unwrap();
+        let downloaded = storage
+            .tracks_page(
+                LibraryQuery {
+                    filter: LibraryFilter::Downloaded,
+                    ..LibraryQuery::default()
+                },
+                0,
+                100,
+            )
+            .await
+            .unwrap()
+            .total;
+        assert_eq!(
+            (summary.state(), downloaded),
+            (crate::CollectionDownloadState::NotDownloaded, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_downloads_should_leave_out_unknown_collections() {
+        let found = store()
+            .await
+            .collection_downloads(
+                LibraryFilter::AppleMusic,
+                vec!["p.nope".to_owned()],
+                DownloadFormat::Stereo,
+            )
+            .await
+            .unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// The owner's "Mix 2026" on a copy of their database (`CIDER_DB_COPY`,
+    /// collection `CIDER_COLLECTION`): its state under each format as
+    /// stored, then after its files are cleared down to three songs (a
+    /// cancelled download: pins and "done" queue rows stay), then with no
+    /// file at all. Modifies the copy.
+    #[tokio::test]
+    #[ignore = "needs a copy of a real database in CIDER_DB_COPY"]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a manual check that reports what it saw"
+    )]
+    async fn real_db_copy_collection_downloads() {
+        let path = PathBuf::from(std::env::var_os("CIDER_DB_COPY").expect("CIDER_DB_COPY"));
+        let owner = std::env::var("CIDER_COLLECTION").expect("CIDER_COLLECTION");
+        let storage = Storage::open_async(path).await.unwrap();
+        let filter = LibraryFilter::AppleMusic;
+        let report = |label: &'static str| {
+            let storage = storage.clone();
+            let owner = owner.clone();
+            async move {
+                for format in [
+                    DownloadFormat::Stereo,
+                    DownloadFormat::SpatialWhereAvailable,
+                    DownloadFormat::Both,
+                ] {
+                    let summary = storage
+                        .collection_downloads(filter, vec![owner.clone()], format)
+                        .await
+                        .unwrap()
+                        .remove(&owner)
+                        .unwrap();
+                    println!(
+                        "{label}: {format:?}: {:?}, {} of {} complete, {} with audio",
+                        summary.state(),
+                        summary.complete,
+                        summary.songs,
+                        summary.with_audio
+                    );
+                }
+                let pinned = storage.pinned_collections().await.unwrap().contains(&owner);
+                println!("{label}: pinned {pinned}");
+            }
+        };
+        report("as stored").await;
+        let members = storage
+            .collection_members(filter, &owner)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        for member in members.iter().skip(3) {
+            storage.clear_audio_by_any_id(member).await.unwrap();
+        }
+        report("three songs left").await;
+        for member in members.iter().take(3) {
+            storage.clear_audio_by_any_id(member).await.unwrap();
+        }
+        report("no files").await;
+        let downloaded = storage
+            .tracks_page(
+                LibraryQuery {
+                    filter: LibraryFilter::Downloaded,
+                    ..LibraryQuery::default()
+                },
+                0,
+                0,
+            )
+            .await
+            .unwrap()
+            .total;
+        println!("no files: Downloaded songs list {downloaded}");
     }
 }

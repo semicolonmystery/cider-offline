@@ -237,7 +237,7 @@ pub(super) async fn lyrics_checks(
     );
 
     offline_served_checks(client, &store, &indexed, report).await?;
-    let tracks = handle.storage().list_tracks().await?;
+    let tracks = handle.storage().list_resources().await?;
     let flagged = flags_candidate(&store, &tracks).await?;
     if let Some(candidate) = &flagged {
         offline_flags_checks(client, &store, candidate, report).await?;

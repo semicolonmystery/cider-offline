@@ -47,7 +47,7 @@ xattr -dr com.apple.quarantine "/Applications/Cider Offline.app"
 
 ### Portable build on macOS
 
-macOS runs a quarantined app that came from a downloaded zip from a hidden, read-only copy (App Translocation). From there the app can't see the `data` folder next to it and falls back to your normal user folders. The Overview page shows a warning when this happens. Before the first start, remove the quarantine from the unzipped folder:
+macOS runs a quarantined app that came from a downloaded zip from a hidden, read-only copy (App Translocation). From there the app can't see the `data` folder next to it and falls back to your normal user folders. The bottom of the Overview page shows a warning when this happens. Before the first start, remove the quarantine from the unzipped folder:
 
 ```sh
 xattr -dr com.apple.quarantine "/path/to/unzipped folder"
@@ -88,13 +88,13 @@ To use the system tray on GNOME, install the "AppIndicator and KStatusNotifierIt
 
 ## First run and the local certificate
 
-When the app starts for the first time, the Overview page shows two steps: trust the local certificate, then connect Cider. Connecting Cider has [its own page](connecting-cider.md). This section is about the certificate.
+When the app starts for the first time, there are two steps: trust the local certificate, then connect Cider. Until both are done, the bottom of the Overview page says which is missing, with a link to the right part of Settings. Connecting Cider has [its own page](connecting-cider.md). This section is about the certificate.
 
 ### Why it's needed
 
 Cider talks to Apple Music over HTTPS. To keep a copy of your library and answer Cider while you are offline, the proxy has to read those connections, and Cider only accepts that if the proxy can present a certificate it trusts. So on the first start the app creates its own certificate authority, called **Cider Offline CA**, on your computer. It is valid for about ten years. The certificate and its private key stay in the `ca` folder of the app's data folder; on macOS and Linux the key file is readable only by you.
 
-Click **Install** on the **Certificate** row of the Overview page. Your system then asks you to confirm:
+Click **Install** on the **Certificate** row in Settings > Certificate. Your system then asks you to confirm:
 
 - Windows adds the certificate to your user's Root store and shows its own security warning. No administrator rights are needed.
 - macOS adds it to your login keychain and asks for your password to change the trust settings.
@@ -106,6 +106,6 @@ Click **Install** on the **Certificate** row of the Overview page. Your system t
 
 The proxy listens on `127.0.0.1` (your own computer only) on port 8000 by default. Only programs you point at it use it, which normally means just Cider.
 
-In Active mode it decrypts and reads Cider's traffic to Apple Music: hosts under `music.apple.com`, `itunes.apple.com` and `mzstatic.com` (artwork), and while offline also `blobstore.apple.com` (custom playlist covers). This is where it caches responses, captures the Apple Music session tokens it needs for syncing and downloading, and serves your local files. Connections to any other host pass through as encrypted tunnels that the proxy does not open. In Passthrough mode nothing is decrypted at all.
+In Active mode it opens and reads Cider's HTTPS traffic to Apple Music: hosts under `music.apple.com`, `itunes.apple.com` and `mzstatic.com` (artwork), and while offline also `blobstore.apple.com` (custom playlist covers). This is where it caches responses, captures the Apple Music session tokens it needs for syncing and downloading, and serves your local files. Connections to any other host pass through as tunnels that the proxy does not open. In Passthrough mode it opens nothing at all.
 
-A trusted root certificate comes with a risk: whoever has its private key could make your computer accept a fake certificate for any website. The key is created on your computer and never leaves it. If you stop using the app, remove the certificate with **Settings > Uninstall certificate**, or use **Remove all data**, which also removes it (see [Uninstalling](uninstalling.md)).
+A trusted root certificate comes with a risk: whoever has its private key could make your computer accept a fake certificate for any website. The key is created on your computer and never leaves it. If you stop using the app, remove the certificate with **Settings > Certificate > Uninstall certificate**, or use **Remove all data**, which also removes it (see [Uninstalling](uninstalling.md)).

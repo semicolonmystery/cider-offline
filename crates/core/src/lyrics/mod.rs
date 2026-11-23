@@ -282,6 +282,61 @@ impl LyricsStore {
             .remove(id);
     }
 
+    /// Whether `id` has lyrics from Apple or a provider (not custom ones).
+    pub async fn has_provider(&self, id: &str) -> bool {
+        let paths = [
+            self.path(id, LyricsKind::Line),
+            self.path(id, LyricsKind::Syllable),
+        ];
+        for path in paths.into_iter().flatten() {
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Deletes the lyrics files Apple answers and providers left for `id`
+    /// (`<id>.ttml`, `<id>.syllable.ttml`), keeping the user's custom lyrics
+    /// (missing files are fine).
+    pub async fn remove_provider(&self, id: &str) {
+        let paths = [
+            self.path(id, LyricsKind::Line),
+            self.path(id, LyricsKind::Syllable),
+        ];
+        for path in paths.into_iter().flatten() {
+            remove_quietly(&path).await;
+        }
+        self.refresh(id).await;
+    }
+
+    /// Moves the lyrics files of `from` to `into` (a song that took another
+    /// id) without replacing any of `into`'s: the custom file when `into` has
+    /// none, the Apple and provider files (both kinds together) when `into`
+    /// has neither. Files that stay are left under `from`. Refreshes the
+    /// index of both ids; returns whether anything moved.
+    pub async fn move_to(&self, from: &str, into: &str) -> bool {
+        let mut moved = false;
+        if !self.has_custom(into).await
+            && let (Some(src), Some(dst)) = (self.custom_path(from), self.custom_path(into))
+        {
+            moved |= move_without_replacing(&src, &dst).await;
+        }
+        if !self.has_provider(into).await {
+            for kind in [LyricsKind::Line, LyricsKind::Syllable] {
+                if let (Some(src), Some(dst)) = (self.path(from, kind), self.path(into, kind)) {
+                    moved |= move_without_replacing(&src, &dst).await;
+                }
+            }
+        }
+        if moved {
+            self.refresh(from).await;
+            self.refresh(into).await;
+            tracing::debug!(%from, %into, "lyrics moved to the song's new id");
+        }
+        moved
+    }
+
     /// The store directory.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -296,6 +351,43 @@ fn id_of_file(name: &str) -> Option<&str> {
         .or_else(|| name.strip_suffix(".syllable.ttml"))
         .or_else(|| name.strip_suffix(".ttml"))?;
     is_valid_media_id(id).then_some(id)
+}
+
+/// Moves file `from` to `to` unless `to` exists; returns whether it moved.
+/// A hard link claims `to` atomically (it fails when `to` exists); where the
+/// file system has no hard links, an existence check and a rename do. A
+/// missing `from` moves nothing.
+async fn move_without_replacing(from: &Path, to: &Path) -> bool {
+    match tokio::fs::hard_link(from, to).await {
+        Ok(()) => {
+            if let Err(error) = tokio::fs::remove_file(from).await {
+                tracing::warn!(file = %from.display(), %error, "could not remove moved lyrics");
+            }
+            true
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            false
+        }
+        Err(_) => {
+            if tokio::fs::try_exists(to).await.unwrap_or(true)
+                || !tokio::fs::try_exists(from).await.unwrap_or(false)
+            {
+                return false;
+            }
+            match tokio::fs::rename(from, to).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(file = %from.display(), %error, "could not move lyrics");
+                    false
+                }
+            }
+        }
+    }
 }
 
 /// Writes `text` to `path` through a temp file + rename, creating `dir`.

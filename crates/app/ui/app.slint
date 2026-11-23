@@ -9,9 +9,9 @@ import { ConfirmDialog } from "dialog.slint";
 
 export {
     ProxyState, CiderState, LibraryState, LibraryAddState, DownloadsState, SettingsState,
-    DialogState, ActivityRow, CollectionRow, TrackRow, DownloadRow, AddCollectionRow, LyricsProviderRow,
+    DialogState, OverviewAnim, NoteSeed, CollectionRow, TrackRow, DownloadRow, AddCollectionRow, LyricsProviderRow,
 } from "globals.slint";
-import { ProxyState, DialogState } from "globals.slint";
+import { ProxyState, DialogState, SettingsState } from "globals.slint";
 
 export component AppWindow inherits Window {
     title: "Cider Offline";
@@ -138,7 +138,13 @@ export component AppWindow inherits Window {
         width: root.width - root.sidebar-w;
         height: root.height;
         background: Theme.bg-window;
-        if root.page == 0: OverviewPage { }
+        if root.page == 0: OverviewPage {
+            open-settings(section) => {
+                SettingsState.focus-section = section;
+                root.page = 2;
+                root.page-changed(2);
+            }
+        }
         if root.page == 1: LibraryPage { }
         if root.page == 2: SettingsPage { }
     }

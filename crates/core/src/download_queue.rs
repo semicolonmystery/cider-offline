@@ -40,32 +40,50 @@
 //! [`DownloadError`] to retry / no retry / re-sign-in. The downloader never
 //! retries or sleeps itself. The full contract is on
 //! [`crate::download::Downloader`].
+//!
+//! # Download format
+//!
+//! [`DownloadQueue::set_download_format`] picks which versions a download
+//! fetches ([`DownloadFormat`]). For anything but `Normal` the queue asks the
+//! catalog for the song with `extend=extendedAssetUrls` (using the captured
+//! developer token, in the storefront the proxy saw) and reads
+//! `attributes.extendedAssetUrls.enhancedHls`: the spatial stream is the
+//! binaural variant of that master playlist. A fresh lookup is used instead
+//! of the response cache because the cache only holds the exact URLs Cider
+//! happened to request, and songs queued from a collection were usually
+//! never requested that way. Songs whose `audioTraits` lack `atmos` have no
+//! spatial version and skip the master playlist. Each version is its own
+//! fetch (with its own license requests), so every fetch start, including
+//! the second version of a song, goes through the same start spacing.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher as _;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::DownloadFormat;
 use crate::catalog::CatalogClient;
 use crate::catalog::{CatalogItem, Song};
 use crate::download::{
-    DownloadError, DownloadProgress, DownloadRequest, DownloadStage, DownloaderCapabilities,
-    DownloaderRegistry, MediaKind, ProgressReport, TrackInfo,
+    DownloadError, DownloadProgress, DownloadRequest, DownloadStage, Downloaded,
+    DownloaderCapabilities, DownloaderRegistry, MediaKind, ProgressReport, TrackInfo,
 };
-use crate::download_target::{self, MUSIC_VIDEO_REASON, Target, TwinSearch};
+use crate::download_cleanup::UnlinkedReport;
+use crate::download_target::{self, MUSIC_VIDEO_REASON, SpatialLookup, Target, TwinSearch};
 use crate::library::{Library, LibraryError};
 use crate::media::{AUDIO_EXTENSIONS, CUSTOM_SONG_PREFIX, MediaResolver};
 use crate::storage::{
-    CustomAudioMode, DownloadRecord, DownloadSourceKind, DownloadStatus, LyricsSource, Storage,
-    StorageError,
+    AudioFile, AudioVariant, CustomAudioMode, DownloadRecord, DownloadSourceKind, DownloadStatus,
+    LyricsSource, Storage, StorageError,
 };
 
 /// Default number of simultaneous downloads.
@@ -108,6 +126,13 @@ const DOWNLOADER_ID: &str = "drm";
 pub const AUTO_CACHE_IDLE_SECS: u64 = 30;
 /// How often the actor wakes up to re-check the deferred backlog.
 const DEFERRED_POLL: Duration = Duration::from_secs(5);
+/// How long a paused or cancelled fetch may take to stop (the downloader
+/// checks its cancel token between chunks and before decrypting and saving)
+/// before the queue drops it anyway.
+const CANCEL_GRACE: Duration = Duration::from_secs(30);
+/// Temporary files a crashed download left in the media folder are deleted
+/// at startup once they are at least this old.
+const STALE_TEMP_AGE: Duration = Duration::from_mins(10);
 
 /// Fetches lyrics for a track once its audio download has completed.
 ///
@@ -237,8 +262,14 @@ pub enum Command {
     ResumeAll,
     /// Remove a row, aborting an in-flight fetch first.
     Cancel(String),
+    /// Cancel every row that is not finished.
+    CancelAll,
     /// Delete every `Done` row.
     ClearFinished,
+    /// Delete the unlinked downloads (see [`crate::download_cleanup`]).
+    CleanUpUnlinked(oneshot::Sender<UnlinkedReport>),
+    /// Count the unlinked downloads without deleting anything.
+    UnlinkedSummary(oneshot::Sender<UnlinkedReport>),
     /// Queue the album version of a music video (see
     /// [`DownloadQueue::download_album_version`]).
     DownloadAlbumVersion {
@@ -257,6 +288,13 @@ pub enum Command {
         /// Receives the keys whose audio was deleted.
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// Stop every worker and the actor (see [`DownloadQueue::shutdown`]).
+    Shutdown {
+        /// How long to wait for the workers to stop before aborting them.
+        grace: Duration,
+        /// Answered once the workers are gone.
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// Pacing of fetch starts and retries (shortened in tests).
@@ -265,6 +303,7 @@ struct Timing {
     spacing: Duration,
     cooldown: Duration,
     backoff_base: Duration,
+    cancel_grace: Duration,
 }
 
 impl Default for Timing {
@@ -273,6 +312,7 @@ impl Default for Timing {
             spacing: START_SPACING,
             cooldown: FAILURE_COOLDOWN,
             backoff_base: BACKOFF_BASE,
+            cancel_grace: CANCEL_GRACE,
         }
     }
 }
@@ -355,6 +395,36 @@ pub fn clamp_concurrency(limit: usize) -> usize {
     limit.clamp(1, MAX_CONCURRENCY)
 }
 
+/// Per-worker switches the actor can flip while the worker runs.
+#[derive(Debug, Clone)]
+struct WorkerFlags {
+    /// Re-download: fetch every wanted mix again, even ones already on disk.
+    replace: Arc<AtomicBool>,
+    /// A re-download was merged into this worker after it planned its mixes;
+    /// it fetches the skipped ones once it is done.
+    upgraded: Arc<AtomicBool>,
+}
+
+impl WorkerFlags {
+    fn new(replace: bool) -> Self {
+        Self {
+            replace: Arc::new(AtomicBool::new(replace)),
+            upgraded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// The worker of one row.
+struct Worker {
+    /// Generation handed out when it was spawned.
+    epoch: u64,
+    /// Cancels its fetch (pause / cancel / replacement).
+    token: CancellationToken,
+    /// Its task, awaited by the next worker for the same row.
+    handle: Option<JoinHandle<()>>,
+    flags: WorkerFlags,
+}
+
 /// Shared state between the actor and its worker tasks.
 struct Inner {
     storage: Storage,
@@ -362,6 +432,10 @@ struct Inner {
     media_dir: PathBuf,
     /// Catalog search used to find the twin of a library-only item.
     search: Arc<dyn TwinSearch>,
+    /// Catalog lookup of a song's spatial stream.
+    spatial: Arc<dyn SpatialLookup>,
+    /// [`DownloadFormat::as_u8`] of the current download format.
+    format: Arc<AtomicU8>,
     /// Post-download lyrics step; `None` disables it.
     lyrics: Option<Arc<dyn LyricsFetcher>>,
     gate: Arc<Gate>,
@@ -372,12 +446,13 @@ struct Inner {
     fetch_estimate_ms: AtomicU64,
     events: broadcast::Sender<DownloadEvent>,
     progress_events: broadcast::Sender<DownloadProgressUpdate>,
-    /// Live workers by row id, each with the generation (`epoch`) that spawned
-    /// it and the token that cancels its fetch. Pausing or cancelling a running
-    /// row cancels its token; a worker only removes its own entry when the
-    /// stored epoch still matches, so a re-dispatch under the same id is never
-    /// clobbered.
-    active: Mutex<HashMap<String, (u64, CancellationToken)>>,
+    /// Live workers by row id (at most one per song: the row id is the
+    /// download key). Pausing or cancelling a row cancels its worker's token;
+    /// the entry stays until the worker has exited, so the next worker for
+    /// the same id can wait for it. A worker only removes its own entry (the
+    /// stored epoch still matches), and its row writes only land while it is
+    /// current (see [`write_guard`]).
+    active: Arc<Mutex<HashMap<String, Worker>>>,
     /// Monotonic generation counter handed to each spawned worker.
     epoch: AtomicU64,
     /// Deferred row ids waiting for the idle window before a worker starts.
@@ -431,6 +506,10 @@ impl Inner {
             .unwrap_or_default()
     }
 
+    fn download_format(&self) -> DownloadFormat {
+        DownloadFormat::from_u8(self.format.load(Ordering::Relaxed))
+    }
+
     fn fetch_estimate(&self) -> Duration {
         Duration::from_millis(self.fetch_estimate_ms.load(Ordering::Relaxed))
     }
@@ -451,19 +530,23 @@ pub struct DownloadQueue {
     events: broadcast::Sender<DownloadEvent>,
     progress_events: broadcast::Sender<DownloadProgressUpdate>,
     gate: Arc<Gate>,
+    format: Arc<AtomicU8>,
 }
 
 impl std::fmt::Debug for DownloadQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DownloadQueue")
             .field("concurrency", &self.gate.limit())
+            .field("format", &self.download_format())
             .finish_non_exhaustive()
     }
 }
 
 impl DownloadQueue {
     /// Spawns the queue actor on the current tokio runtime with
-    /// [`DEFAULT_CONCURRENCY`] (change it with [`Self::set_concurrency`]).
+    /// [`DEFAULT_CONCURRENCY`] (change it with [`Self::set_concurrency`]) and
+    /// the [`DownloadFormat::Stereo`] format (change it with
+    /// [`Self::set_download_format`]).
     ///
     /// Any non-deferred rows that were `Queued`, `Downloading` or `Paused` at
     /// startup are reset to `Queued` and re-dispatched immediately; deferred
@@ -480,7 +563,7 @@ impl DownloadQueue {
         last_played_ts: Arc<AtomicU64>,
         lyrics: Option<Arc<dyn LyricsFetcher>>,
     ) -> Self {
-        let search = Arc::new(CatalogClient::new(storage.clone()));
+        let catalog = Arc::new(CatalogClient::new(storage.clone()));
         Self::spawn_with(
             storage,
             downloaders,
@@ -488,27 +571,31 @@ impl DownloadQueue {
             last_played_ts,
             lyrics,
             Timing::default(),
-            search,
+            catalog,
         )
     }
 
-    fn spawn_with(
+    fn spawn_with<C: TwinSearch + SpatialLookup + 'static>(
         storage: Storage,
         downloaders: Arc<DownloaderRegistry>,
         media_dir: PathBuf,
         last_played_ts: Arc<AtomicU64>,
         lyrics: Option<Arc<dyn LyricsFetcher>>,
         timing: Timing,
-        search: Arc<dyn TwinSearch>,
+        catalog: Arc<C>,
     ) -> Self {
         let (events, _rx) = broadcast::channel(EVENTS_CAPACITY);
         let (progress_events, _prx) = broadcast::channel(PROGRESS_CAPACITY);
         let gate = Arc::new(Gate::new(DEFAULT_CONCURRENCY));
+        let format = Arc::new(AtomicU8::new(DownloadFormat::Stereo.as_u8()));
+        let search: Arc<dyn TwinSearch> = Arc::clone(&catalog) as Arc<dyn TwinSearch>;
         let inner = Arc::new(Inner {
             storage,
             downloaders,
             media_dir,
             search,
+            spatial: catalog,
+            format: Arc::clone(&format),
             lyrics,
             gate: Arc::clone(&gate),
             timing,
@@ -516,7 +603,7 @@ impl DownloadQueue {
             fetch_estimate_ms: AtomicU64::new(INITIAL_FETCH_ESTIMATE_MS),
             events: events.clone(),
             progress_events: progress_events.clone(),
-            active: Mutex::new(HashMap::new()),
+            active: Arc::new(Mutex::new(HashMap::new())),
             epoch: AtomicU64::new(0),
             pending_deferred: Mutex::new(HashSet::new()),
             last_played_ts,
@@ -528,7 +615,21 @@ impl DownloadQueue {
             events,
             progress_events,
             gate,
+            format,
         }
+    }
+
+    /// Sets which versions of a song downloads fetch. Applies to every fetch
+    /// that starts afterwards.
+    pub fn set_download_format(&self, format: DownloadFormat) {
+        self.format.store(format.as_u8(), Ordering::Relaxed);
+        tracing::info!(?format, "download format set");
+    }
+
+    /// The current download format.
+    #[must_use]
+    pub fn download_format(&self) -> DownloadFormat {
+        DownloadFormat::from_u8(self.format.load(Ordering::Relaxed))
     }
 
     /// Sets how many downloads run at once (clamped to
@@ -642,6 +743,43 @@ impl DownloadQueue {
         self.send(Command::Cancel(id.to_owned()))
     }
 
+    /// Cancels every unfinished row (queued, running, paused, failed or
+    /// "can't download yet"), as [`Self::cancel`] does for one.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Closed`] if the actor has stopped.
+    pub fn cancel_all(&self) -> Result<(), QueueError> {
+        self.send(Command::CancelAll)
+    }
+
+    /// Deletes the unlinked downloads: files no download pin needs any more
+    /// (see [`crate::download_cleanup`]). Stale pins of downloaded
+    /// collections are dropped first. Custom audio, files a custom song plays
+    /// by reference, links to local files and unfinished downloads are never
+    /// touched. Returns what was deleted.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Closed`] if the actor has stopped.
+    pub async fn clean_up_unlinked(&self) -> Result<UnlinkedReport, QueueError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Command::CleanUpUnlinked(reply))?;
+        wait.await.map_err(|_| QueueError::Closed)
+    }
+
+    /// Counts the unlinked downloads (and their size) without deleting
+    /// anything; see [`Self::clean_up_unlinked`].
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Closed`] if the actor has stopped.
+    pub async fn unlinked_downloads(&self) -> Result<UnlinkedReport, QueueError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(Command::UnlinkedSummary(reply))?;
+        wait.await.map_err(|_| QueueError::Closed)
+    }
+
     /// Deletes every row with status `Done`.
     ///
     /// # Errors
@@ -696,12 +834,24 @@ impl DownloadQueue {
         wait.await.map_err(|_| QueueError::Closed)
     }
 
+    /// Stops the queue: cancels every running download, waits up to `grace`
+    /// for the workers to exit (aborting the rest), and ends the actor. Rows
+    /// keep their stored state, so the next queue over the same store
+    /// resumes them. Later commands fail with [`QueueError::Closed`].
+    pub async fn shutdown(&self, grace: Duration) {
+        let (reply, done) = oneshot::channel();
+        if self.send(Command::Shutdown { grace, reply }).is_ok() {
+            let _ = done.await;
+        }
+    }
+
     fn send(&self, cmd: Command) -> Result<(), QueueError> {
         self.cmd_tx.send(cmd).map_err(|_| QueueError::Closed)
     }
 }
 
 async fn run_actor(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Command>) {
+    delete_stale_temp_files(&inner.media_dir).await;
     crate::media::link_existing_media(&inner.storage, &inner.media_dir).await;
     // Resume any rows left over from a previous run.
     match inner.storage.list_downloads().await {
@@ -743,6 +893,11 @@ async fn run_actor(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Command>) 
         tokio::select! {
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
+                if let Command::Shutdown { grace, reply } = cmd {
+                    stop_workers(&inner, grace).await;
+                    let _ = reply.send(());
+                    break;
+                }
                 handle_command(&inner, cmd).await;
                 emit_summary(&inner).await;
             }
@@ -754,8 +909,43 @@ async fn run_actor(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Command>) 
     tracing::debug!("download queue actor stopped");
 }
 
+/// Cancels every worker and waits up to `grace` for them to exit (then
+/// aborts the rest). The workers' entries are removed first, so none of them
+/// writes its row again: rows that were running stay as they are in the
+/// store and are queued again when the next queue starts.
+async fn stop_workers(inner: &Arc<Inner>, grace: Duration) {
+    if let Ok(mut set) = inner.pending_deferred.lock() {
+        set.clear();
+    }
+    let handles: Vec<JoinHandle<()>> = match inner.active.lock() {
+        Ok(mut map) => map
+            .drain()
+            .filter_map(|(_, worker)| {
+                worker.token.cancel();
+                worker.handle
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let count = handles.len();
+    let deadline = Instant::now() + grace;
+    for mut handle in handles {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if tokio::time::timeout(left, &mut handle).await.is_err() {
+            tracing::warn!("download worker did not stop in time; aborting it");
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+    tracing::info!(workers = count, "download queue stopped");
+}
+
 async fn handle_command(inner: &Arc<Inner>, cmd: Command) {
     match cmd {
+        // Handled by the actor loop, which stops afterwards.
+        Command::Shutdown { reply, .. } => {
+            let _ = reply.send(());
+        }
         Command::EnqueueResolved(records) => {
             for record in records {
                 handle_enqueue(inner, record).await;
@@ -790,6 +980,39 @@ async fn handle_command(inner: &Arc<Inner>, cmd: Command) {
             drain_deferred_if_idle(inner).await;
         }
         Command::Cancel(id) => handle_cancel(inner, &id).await,
+        Command::CancelAll => {
+            let unfinished = [
+                DownloadStatus::Queued,
+                DownloadStatus::Downloading,
+                DownloadStatus::Paused,
+                DownloadStatus::Failed,
+                DownloadStatus::Unavailable,
+            ];
+            let ids = ids_with_status(inner, &unfinished).await;
+            // Stop every worker first, so they wind down together.
+            for id in &ids {
+                cancel_active(inner, id);
+            }
+            for id in ids {
+                handle_cancel(inner, &id).await;
+            }
+        }
+        Command::CleanUpUnlinked(reply) => {
+            let _ = reply.send(handle_clean_up_unlinked(inner).await);
+        }
+        Command::UnlinkedSummary(reply) => {
+            let report =
+                match crate::download_cleanup::unlinked_downloads(&inner.storage, &inner.media_dir)
+                    .await
+                {
+                    Ok((_, report)) => report,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not look for unlinked downloads");
+                        UnlinkedReport::default()
+                    }
+                };
+            let _ = reply.send(report);
+        }
         Command::ClearFinished => handle_clear_finished(inner).await,
         Command::DownloadAlbumVersion { id, reply } => {
             let queued = handle_album_version(inner, &id).await;
@@ -834,35 +1057,169 @@ fn dispatch(inner: &Arc<Inner>, record: DownloadRecord) {
     }
 }
 
-/// Registers a cancellation token for `record.id` (cancelling and replacing any
-/// prior worker on the same id) and spawns its worker.
+/// Spawns the worker of `record`. A previous worker of the same row is
+/// cancelled and replaced; the new one waits until it has fully stopped
+/// before it fetches anything, so two downloads of one song never overlap.
 fn spawn_worker(inner: &Arc<Inner>, record: DownloadRecord) {
+    let Ok(mut map) = inner.active.lock() else {
+        return;
+    };
+    let previous = map.remove(&record.id).and_then(|worker| {
+        worker.token.cancel();
+        worker.handle
+    });
     let token = CancellationToken::new();
     let epoch = inner.epoch.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = inner.active.lock()
-        && let Some((_, previous)) = map.insert(record.id.clone(), (epoch, token.clone()))
-    {
-        previous.cancel();
-    }
-    tokio::spawn(run_worker(Arc::clone(inner), record, token, epoch));
+    let flags = WorkerFlags::new(record.replace);
+    let id = record.id.clone();
+    // Spawned while the map is locked: the worker removes its own entry when
+    // it ends, which can then only happen after the entry exists.
+    let handle = tokio::spawn(run_worker(
+        Arc::clone(inner),
+        record,
+        token.clone(),
+        epoch,
+        previous,
+        flags.clone(),
+    ));
+    map.insert(
+        id,
+        Worker {
+            epoch,
+            token,
+            handle: Some(handle),
+            flags,
+        },
+    );
 }
 
 /// Removes `id` from the active map only when the stored generation still
 /// matches `epoch`, so a worker never evicts a newer re-dispatch of the same id.
 fn clear_active(inner: &Arc<Inner>, id: &str, epoch: u64) {
     if let Ok(mut map) = inner.active.lock()
-        && map.get(id).is_some_and(|(stored, _)| *stored == epoch)
+        && map.get(id).is_some_and(|worker| worker.epoch == epoch)
     {
         map.remove(id);
     }
 }
 
-/// Cancels and removes the active worker token for `id`, if any.
+/// Cancels the worker of `id`, if any. Its entry stays until it has exited,
+/// so a later worker for the row waits for it.
 fn cancel_active(inner: &Arc<Inner>, id: &str) {
-    if let Ok(mut map) = inner.active.lock()
-        && let Some((_, token)) = map.remove(id)
+    if let Ok(map) = inner.active.lock()
+        && let Some(worker) = map.get(id)
     {
-        token.cancel();
+        worker.token.cancel();
+    }
+}
+
+/// Waits until the worker of `id` (already cancelled) has exited and removed
+/// its entry, for at most the cancel grace plus a second.
+async fn wait_for_worker_exit(inner: &Arc<Inner>, id: &str) {
+    let deadline = Instant::now() + inner.timing.cancel_grace + Duration::from_secs(1);
+    loop {
+        let running = inner.active.lock().is_ok_and(|map| map.contains_key(id));
+        if !running {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(%id, "cancelled download worker is still running");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The switches of the live (not cancelled) worker of `id`, if one runs.
+fn live_worker(inner: &Inner, id: &str) -> Option<WorkerFlags> {
+    let map = inner.active.lock().ok()?;
+    map.get(id)
+        .filter(|worker| !worker.token.is_cancelled())
+        .map(|worker| worker.flags.clone())
+}
+
+/// Whether the worker spawned as `epoch` is still the current, uncancelled
+/// worker of `id`.
+fn is_current(active: &Mutex<HashMap<String, Worker>>, id: &str, epoch: u64) -> bool {
+    active.lock().is_ok_and(|map| {
+        map.get(id)
+            .is_some_and(|worker| worker.epoch == epoch && !worker.token.is_cancelled())
+    })
+}
+
+/// The check a worker's row write runs with the database locked: the write
+/// lands only while the worker is current. The actor cancels a worker
+/// (under the map lock) before it writes the row itself, so a late worker
+/// write can never overwrite "Paused" or resurrect a cancelled row.
+fn write_guard(inner: &Inner, id: &str, epoch: u64) -> impl FnOnce() -> bool + Send + 'static {
+    let active = Arc::clone(&inner.active);
+    let id = id.to_owned();
+    move || is_current(&active, &id, epoch)
+}
+
+/// Publishes a worker's status change if the worker is still current. The
+/// map stays locked while publishing, so the event can't overtake the
+/// actor's own event of a pause or cancel (the actor cancels under the same
+/// lock before it publishes). Returns whether it was published.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the event fields plus the worker identity it is guarded by"
+)]
+fn emit_if_current(
+    inner: &Arc<Inner>,
+    id: &str,
+    epoch: u64,
+    status: DownloadStatus,
+    progress: f32,
+    stage: Option<DownloadStage>,
+    attempt: u32,
+    message: Option<String>,
+) -> bool {
+    let Ok(map) = inner.active.lock() else {
+        return false;
+    };
+    let current = map
+        .get(id)
+        .is_some_and(|worker| worker.epoch == epoch && !worker.token.is_cancelled());
+    if current {
+        emit_live(inner, id, status, progress, stage, attempt, message);
+    }
+    current
+}
+
+/// Persists and publishes a worker's status change, only while the worker
+/// is current. Returns whether it was written.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the row update plus the worker identity it is guarded by"
+)]
+async fn worker_status(
+    inner: &Arc<Inner>,
+    id: &str,
+    epoch: u64,
+    status: DownloadStatus,
+    progress: f32,
+    stage: Option<DownloadStage>,
+    attempt: u32,
+    message: Option<String>,
+) -> bool {
+    match inner
+        .storage
+        .update_download_status_if(
+            id,
+            status,
+            progress,
+            message.clone(),
+            write_guard(inner, id, epoch),
+        )
+        .await
+    {
+        Ok(true) => emit_if_current(inner, id, epoch, status, progress, stage, attempt, message),
+        Ok(false) => false,
+        Err(error) => {
+            tracing::warn!(%id, %error, ?status, "could not record download status");
+            false
+        }
     }
 }
 
@@ -946,6 +1303,7 @@ async fn handle_album_version(inner: &Arc<Inner>, id: &str) -> Option<String> {
         progress: 0.0,
         message: None,
         deferred: false,
+        replace: false,
         created_at: 0,
         updated_at: 0,
     };
@@ -953,6 +1311,15 @@ async fn handle_album_version(inner: &Arc<Inner>, id: &str) -> Option<String> {
     Some(version.catalog_id)
 }
 
+/// Queues `record`, merging it into the row the song already has: the
+/// queue holds one row per download key (song), covering every mix the
+/// download format wants, so it never runs two downloads of one song.
+///
+/// - Queued or running: kept running. A re-download upgrades it to
+///   replace existing files; a manual download of a deferred auto-cache row
+///   starts it now.
+/// - Paused: resumed (with the merged flags).
+/// - Finished, failed, unavailable or new: queued afresh.
 async fn handle_enqueue(inner: &Arc<Inner>, mut record: DownloadRecord) {
     let existing = match inner.storage.get_download(&record.id).await {
         Ok(existing) => existing,
@@ -980,24 +1347,82 @@ async fn handle_enqueue(inner: &Arc<Inner>, mut record: DownloadRecord) {
     {
         tracing::warn!(id = %record.id, %error, "could not pin download");
     }
-    // Already waiting or running: keep that attempt instead of restarting it.
-    if let Some(existing) = existing
-        && matches!(
-            existing.status,
-            DownloadStatus::Queued | DownloadStatus::Downloading
-        )
+    let next = match existing {
+        Some(existing)
+            if matches!(
+                existing.status,
+                DownloadStatus::Queued | DownloadStatus::Downloading
+            ) =>
+        {
+            merge_into_live(inner, existing, &record).await;
+            return;
+        }
+        // Resume the paused row; it keeps its place and source.
+        Some(mut existing) if existing.status == DownloadStatus::Paused => {
+            existing.replace |= record.replace;
+            existing.deferred &= record.deferred;
+            existing
+        }
+        _ => record,
+    };
+    let mut next = next;
+    next.status = DownloadStatus::Queued;
+    next.progress = 0.0;
+    next.message = None;
+    tracing::debug!(id = %next.id, replace = next.replace, "download queued");
+    if let Err(error) = inner.storage.upsert_download(next.clone()).await {
+        tracing::warn!(id = %next.id, %error, "could not insert download row");
+        return;
+    }
+    emit(&inner.events, DownloadEvent::Added(next.clone()));
+    dispatch(inner, next);
+}
+
+/// Merges a new request into a queued or running row (see
+/// [`handle_enqueue`]).
+async fn merge_into_live(inner: &Arc<Inner>, existing: DownloadRecord, incoming: &DownloadRecord) {
+    let id = existing.id.clone();
+    let replace = existing.replace || incoming.replace;
+    let deferred = existing.deferred && incoming.deferred;
+    if (replace != existing.replace || deferred != existing.deferred)
+        && let Err(error) = inner
+            .storage
+            .set_download_flags(&id, replace, deferred)
+            .await
     {
-        return;
+        tracing::warn!(%id, %error, "could not update download flags");
     }
-    record.status = DownloadStatus::Queued;
-    record.progress = 0.0;
-    record.message = None;
-    if let Err(error) = inner.storage.upsert_download(record.clone()).await {
-        tracing::warn!(id = %record.id, %error, "could not insert download row");
-        return;
+    let worker = live_worker(inner, &id);
+    // Re-inserted below when it stays parked.
+    if let Ok(mut set) = inner.pending_deferred.lock() {
+        set.remove(&id);
     }
-    emit(&inner.events, DownloadEvent::Added(record.clone()));
-    dispatch(inner, record);
+    let undeferred = existing.deferred && !deferred;
+    let running = existing.status == DownloadStatus::Downloading;
+    let mut next = existing;
+    next.replace = replace;
+    next.deferred = deferred;
+    match worker {
+        // Started already: it checked `deferred` before it began.
+        Some(flags) if running || !undeferred => {
+            if replace && !flags.replace.swap(true, Ordering::SeqCst) {
+                flags.upgraded.store(true, Ordering::SeqCst);
+                tracing::info!(%id, "re-download merged into the running download");
+            }
+        }
+        // A deferred row the user now wants at once, or a row nobody works
+        // on (left over by a crash): start a worker now.
+        _ if undeferred || !next.deferred => {
+            tracing::debug!(%id, undeferred, "starting a worker for the merged download");
+            spawn_worker(inner, next);
+        }
+        // Still deferred and parked: leave it for the idle window.
+        _ => {
+            if let Ok(mut set) = inner.pending_deferred.lock() {
+                set.insert(id);
+            }
+        }
+    }
 }
 
 async fn handle_retry(inner: &Arc<Inner>, id: &str) {
@@ -1031,6 +1456,11 @@ async fn handle_retry(inner: &Arc<Inner>, id: &str) {
     dispatch(inner, next);
 }
 
+/// Cancels a row: stops its worker (a fetch in progress is abandoned and
+/// its temporary file deleted by the downloader), removes the row, and,
+/// when the song has no downloaded mix, drops the pins that only asked for
+/// it (a kept collection's pin stays). Files that were already complete are
+/// never deleted.
 async fn handle_cancel(inner: &Arc<Inner>, id: &str) {
     // Abort an in-flight (or slot-waiting) worker, and drop a deferred row
     // that has not been dispatched yet so the next drain cannot resurrect it.
@@ -1038,11 +1468,219 @@ async fn handle_cancel(inner: &Arc<Inner>, id: &str) {
     if let Ok(mut set) = inner.pending_deferred.lock() {
         set.remove(id);
     }
+    // A fetch that completes while it winds down still records its file.
+    // Wait for that first, so the pins below (and a "Remove downloads"
+    // deleting files after this) see the final state instead of having the
+    // file recorded again behind their back.
+    wait_for_worker_exit(inner, id).await;
+    let row = inner.storage.get_download(id).await.ok().flatten();
     match inner.storage.delete_download(id).await {
         Ok(true) => emit(&inner.events, DownloadEvent::Removed(id.to_owned())),
         Ok(false) => {}
         Err(error) => {
             tracing::warn!(%id, %error, "could not delete download");
+        }
+    }
+    if let Some(row) = row {
+        release_unfetched_pins(inner, &row.track_id).await;
+    }
+}
+
+/// Drops the pins of a song that has no downloaded mix, except the pins of
+/// collections set to "Keep downloaded", and forgets collections left with
+/// no pin at all.
+async fn release_unfetched_pins(inner: &Arc<Inner>, key: &str) {
+    let has_audio = inner
+        .storage
+        .local_variants(vec![key.to_owned()])
+        .await
+        .map_or(true, |found| found.contains_key(key));
+    if has_audio {
+        return;
+    }
+    let (Ok(collections), Ok(pins)) = (
+        inner.storage.download_collections().await,
+        inner.storage.download_pins().await,
+    ) else {
+        return;
+    };
+    let kept: HashSet<&str> = collections
+        .iter()
+        .filter(|c| c.keep)
+        .map(|c| c.owner.as_str())
+        .collect();
+    let drop: Vec<(String, String)> = pins
+        .iter()
+        .filter(|(track, owner)| track == key && !kept.contains(owner.as_str()))
+        .cloned()
+        .collect();
+    if drop.is_empty() {
+        return;
+    }
+    if let Err(error) = inner.storage.delete_download_pins(drop.clone()).await {
+        tracing::warn!(%key, %error, "could not release the pins of a cancelled download");
+        return;
+    }
+    let left: HashSet<&str> = pins
+        .iter()
+        .filter(|pin| !drop.contains(pin))
+        .map(|(_, owner)| owner.as_str())
+        .collect();
+    forget_unpinned_collections(inner, &collections, &left).await;
+}
+
+/// Forgets every registered collection that is not kept and has no pin in
+/// `owners_with_pins` any more.
+async fn forget_unpinned_collections(
+    inner: &Inner,
+    collections: &[crate::storage::DownloadCollection],
+    owners_with_pins: &HashSet<&str>,
+) {
+    for collection in collections {
+        if !collection.keep
+            && !owners_with_pins.contains(collection.owner.as_str())
+            && let Err(error) = inner
+                .storage
+                .unregister_download_collection(&collection.owner)
+                .await
+        {
+            tracing::warn!(owner = %collection.owner, %error, "could not forget the collection");
+        }
+    }
+}
+
+/// See [`DownloadQueue::clean_up_unlinked`].
+async fn handle_clean_up_unlinked(inner: &Arc<Inner>) -> UnlinkedReport {
+    let scan = match crate::download_cleanup::scan(&inner.storage, &inner.media_dir).await {
+        Ok(scan) => scan,
+        Err(error) => {
+            tracing::warn!(%error, "could not look for unlinked downloads");
+            return UnlinkedReport::default();
+        }
+    };
+    if !scan.stale_pins.is_empty() {
+        tracing::info!(
+            count = scan.stale_pins.len(),
+            "dropping stale download pins"
+        );
+        if let Err(error) = inner
+            .storage
+            .delete_download_pins(scan.stale_pins.clone())
+            .await
+        {
+            tracing::warn!(%error, "could not drop stale download pins");
+            return UnlinkedReport::default();
+        }
+        if let (Ok(collections), Ok(pins)) = (
+            inner.storage.download_collections().await,
+            inner.storage.download_pins().await,
+        ) {
+            let owners: HashSet<&str> = pins.iter().map(|(_, owner)| owner.as_str()).collect();
+            forget_unpinned_collections(inner, &collections, &owners).await;
+        }
+    }
+    let mut report = UnlinkedReport::default();
+    let mut removed: Vec<String> = Vec::new();
+    for file in scan.files {
+        match tokio::fs::remove_file(&file.path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %file.path.display(), %error, "could not delete an unlinked download");
+                continue;
+            }
+        }
+        if let Err(error) = inner.storage.delete_audio_path(&file.stored).await {
+            tracing::warn!(path = %file.path.display(), %error, "could not forget an unlinked download");
+            continue;
+        }
+        report.files += 1;
+        report.bytes += file.size;
+        for key in file.keys {
+            if !removed.contains(&key) {
+                removed.push(key);
+            }
+        }
+    }
+    if report.files > 0 {
+        tracing::info!(
+            files = report.files,
+            bytes = report.bytes,
+            "unlinked downloads cleaned up"
+        );
+        forget_finished_rows(inner, &removed).await;
+        emit(&inner.events, DownloadEvent::AudioRemoved(removed));
+    }
+    report
+}
+
+/// Ids of the queue rows in `rows` that download song `key` under another
+/// row id (a row keyed on the song itself is `key`).
+fn rows_of_song<'a>(rows: &'a [DownloadRecord], key: &'a str) -> impl Iterator<Item = &'a str> {
+    rows.iter()
+        .filter(move |row| row.track_id == key && row.id != key)
+        .map(|row| row.id.as_str())
+}
+
+/// Deletes the finished queue rows of the songs `keys` that have no
+/// downloaded mix left, so songs whose files were deleted do not linger in
+/// the Downloads panel as "Downloaded".
+async fn forget_finished_rows(inner: &Arc<Inner>, keys: &[String]) {
+    let rows = match inner.storage.list_downloads().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not list the download rows");
+            return;
+        }
+    };
+    let left = inner
+        .storage
+        .local_variants(keys.to_vec())
+        .await
+        .unwrap_or_default();
+    for row in rows {
+        let song = keys
+            .iter()
+            .any(|key| *key == row.id || *key == row.track_id);
+        let has_audio = left.contains_key(&row.track_id) || left.contains_key(&row.id);
+        if !song || row.status != DownloadStatus::Done || has_audio {
+            continue;
+        }
+        match inner.storage.delete_download(&row.id).await {
+            Ok(true) => emit(&inner.events, DownloadEvent::Removed(row.id)),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(id = %row.id, %error, "could not delete download"),
+        }
+    }
+}
+
+/// Deletes temporary files a crashed download left in the media folder
+/// (the `.tmp…` names of the `tempfile` crate), once they are old enough
+/// that no running download can own them.
+async fn delete_stale_temp_files(media_dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(media_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_name().to_string_lossy().starts_with(".tmp") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .await
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_TEMP_AGE);
+        if old {
+            let path = entry.path();
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => tracing::info!(file = %path.display(), "deleted a partial download"),
+                Err(error) => {
+                    tracing::warn!(file = %path.display(), %error, "could not delete a partial download");
+                }
+            }
         }
     }
 }
@@ -1135,7 +1773,16 @@ async fn handle_remove_downloads(
     track_ids: Vec<String>,
 ) -> Vec<String> {
     let orphans = if let Some(owner) = owner {
-        match inner.storage.unpin_downloads(Some(owner), track_ids).await {
+        if let Err(error) = inner.storage.unregister_download_collection(owner).await {
+            tracing::warn!(%owner, %error, "could not forget the collection");
+        }
+        // Every pin of the collection goes, also those its current songs no
+        // longer name (a song that left it upstream).
+        match inner
+            .storage
+            .release_download_collection(owner, track_ids)
+            .await
+        {
             Ok(orphans) => orphans,
             Err(error) => {
                 tracing::warn!(%owner, %error, "could not unpin collection download");
@@ -1150,9 +1797,27 @@ async fn handle_remove_downloads(
         }
         track_ids
     };
+    let rows = inner
+        .storage
+        .list_downloads()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not list the download rows");
+            Vec::new()
+        });
     let mut removed = Vec::with_capacity(orphans.len());
     for id in orphans {
+        // Custom songs have no pins, so they always come back as orphans:
+        // their audio, and songs they play by reference, are never removed.
+        if removal_exempt(inner, &id).await {
+            continue;
+        }
+        // Every queue row of the song goes, finished ones included, so no
+        // removed song lingers in the Downloads panel.
         handle_cancel(inner, &id).await;
+        for row in rows_of_song(&rows, &id) {
+            handle_cancel(inner, row).await;
+        }
         if delete_local_audio(inner, &id).await {
             removed.push(id);
         }
@@ -1172,17 +1837,28 @@ async fn handle_remove_downloads(
 /// directory only) and clears it from the track rows. Returns whether any
 /// audio was recorded or found.
 async fn delete_local_audio(inner: &Arc<Inner>, id: &str) -> bool {
+    if removal_exempt(inner, id).await {
+        return false;
+    }
     let mut files: Vec<PathBuf> = Vec::new();
-    // A library item linked to a catalog twin shares the twin's file.
-    let mut linked_catalog = None;
     if let Ok(Some(record)) = inner.storage.find_track(id).await {
-        linked_catalog = record.catalog_id.filter(|catalog| catalog != id);
-        files.extend(record.track.audio_path);
+        files.extend(
+            record
+                .track
+                .audio
+                .iter()
+                .map(|(_, path)| path.to_path_buf()),
+        );
     }
     if crate::media::is_valid_media_id(id) {
         for ext in AUDIO_EXTENSIONS {
             files.push(inner.media_dir.join(format!("{id}.{ext}")));
         }
+        files.push(
+            inner
+                .media_dir
+                .join(crate::download::media_file_name(id, AudioVariant::Spatial)),
+        );
     }
     let mut found = false;
     for path in files {
@@ -1197,12 +1873,9 @@ async fn delete_local_audio(inner: &Arc<Inner>, id: &str) -> bool {
             }
         }
     }
-    if let Some(catalog) = &linked_catalog
-        && let Err(error) = inner.storage.set_audio_by_any_id(catalog, None).await
-    {
-        tracing::warn!(%catalog, %error, "could not clear the linked audio path");
-    }
-    match inner.storage.set_audio_by_any_id(id, None).await {
+    // `changed` counts audio rows actually deleted, so a song without
+    // downloaded audio is not reported as removed.
+    match inner.storage.clear_audio_by_any_id(id).await {
         Ok(changed) => found || changed > 0,
         Err(error) => {
             tracing::warn!(%id, %error, "could not clear audio path");
@@ -1211,12 +1884,31 @@ async fn delete_local_audio(inner: &Arc<Inner>, id: &str) -> bool {
     }
 }
 
+/// Whether removing downloads must leave `id`'s audio alone (a custom song,
+/// or a song a custom song plays by reference). A lookup error counts as
+/// exempt: keeping a file is the safe side.
+async fn removal_exempt(inner: &Arc<Inner>, id: &str) -> bool {
+    match inner.storage.audio_removal_exempt(id).await {
+        Ok(exempt) => exempt,
+        Err(error) => {
+            tracing::warn!(%id, %error, "could not check whether audio may be removed");
+            true
+        }
+    }
+}
+
 /// How one fetch attempt ended.
 enum FetchOutcome {
     /// The worker's token fired (pause / cancel); the actor owns the row state.
     Cancelled,
-    /// The file is on disk at `path`, fetched for `target`.
-    Done { path: PathBuf, target: Target },
+    /// Every planned version is on disk and recorded (`files` holds the ones
+    /// this attempt wrote), fetched for `target`. `skipped`: some mix was
+    /// not fetched because it was already on disk.
+    Done {
+        files: Vec<Downloaded>,
+        target: Target,
+        skipped: bool,
+    },
     /// The track can never be downloaded.
     Unavailable(String),
     /// The attempt failed; `retryable` says whether trying again may help and
@@ -1262,6 +1954,10 @@ fn classify(error: DownloadError) -> FetchOutcome {
             FetchOutcome::failed(format!("{AUTH_EXPIRED_HINT} ({message})"), false)
         }
         DownloadError::Cancelled => FetchOutcome::Cancelled,
+        // The queue handles a missing variant before classifying; reaching
+        // here means a downloader returned it for a variant it was not asked
+        // to fall back from.
+        DownloadError::VariantUnavailable { .. } => FetchOutcome::Unavailable(error.to_string()),
         DownloadError::SourceRequired
         | DownloadError::UnsupportedFormat(_)
         | DownloadError::InvalidTrackId(_) => FetchOutcome::failed(error.to_string(), false),
@@ -1286,16 +1982,48 @@ fn backoff_delay(base: Duration, attempt: u32, id: &str) -> Duration {
     Duration::from_millis(millis.saturating_mul(750 + noise / 2) / 1_000)
 }
 
+/// Waits until the previous worker of the same row has exited (aborting it
+/// if it ignores its cancellation for too long).
+async fn wait_for_previous(inner: &Inner, id: &str, previous: Option<JoinHandle<()>>) {
+    let Some(mut previous) = previous else {
+        return;
+    };
+    let grace = inner.timing.cancel_grace.saturating_mul(2);
+    if tokio::time::timeout(grace, &mut previous).await.is_err() {
+        tracing::warn!(%id, "previous download worker did not stop; aborting it");
+        previous.abort();
+        let _ = previous.await;
+    }
+}
+
+/// The task behind one row: waits for the row's previous worker, then runs
+/// attempts (with retries) until the row is finished, paused or cancelled.
 async fn run_worker(
     inner: Arc<Inner>,
     record: DownloadRecord,
     token: CancellationToken,
     epoch: u64,
+    previous: Option<JoinHandle<()>>,
+    flags: WorkerFlags,
 ) {
+    wait_for_previous(&inner, &record.id, previous).await;
+    let worker = WorkerRef {
+        record: &record,
+        token: &token,
+        epoch,
+        flags: &flags,
+    };
     let mut attempt = 1u32;
-    loop {
-        match run_attempt(&inner, &record, &token, attempt).await {
+    // Versions already written by an earlier attempt of this worker, so a
+    // retry after the second version failed does not fetch the first again.
+    let mut done: Vec<AudioVariant> = Vec::new();
+    while !token.is_cancelled() {
+        match run_attempt(&inner, &worker, attempt, &mut done).await {
             AttemptEnd::Finished => break,
+            AttemptEnd::Again => {
+                tracing::info!(id = %record.id, "re-download merged in; fetching the skipped mixes");
+                attempt = 1;
+            }
             AttemptEnd::Retry {
                 message,
                 retry_after,
@@ -1308,27 +2036,17 @@ async fn run_worker(
                     delay.as_secs().max(1)
                 );
                 tracing::info!(id = %record.id, attempt, delay_ms = delay.as_millis(), "download retry scheduled");
-                if let Err(error) = inner
-                    .storage
-                    .update_download_status(
-                        &record.id,
-                        DownloadStatus::Queued,
-                        0.0,
-                        Some(note.clone()),
-                    )
-                    .await
-                {
-                    tracing::warn!(id = %record.id, %error, "could not record retry");
-                }
-                emit_live(
+                worker_status(
                     &inner,
                     &record.id,
+                    epoch,
                     DownloadStatus::Queued,
                     0.0,
                     None,
                     attempt,
                     Some(note),
-                );
+                )
+                .await;
                 emit_summary(&inner).await;
                 tokio::select! {
                     biased;
@@ -1342,10 +2060,38 @@ async fn run_worker(
     emit_summary(&inner).await;
 }
 
+/// Whether a re-download merged into this worker still has to replace the
+/// mixes it skipped as already on disk (consumes the request).
+fn take_merged_redownload(skipped: bool, flags: &WorkerFlags) -> bool {
+    skipped && flags.upgraded.swap(false, Ordering::SeqCst)
+}
+
+/// How an attempt ends once its row is `Done`: again when a re-download
+/// merged in meanwhile, so the skipped mixes are replaced after all.
+fn after_finish(skipped: bool, flags: &WorkerFlags) -> AttemptEnd {
+    if take_merged_redownload(skipped, flags) {
+        AttemptEnd::Again
+    } else {
+        AttemptEnd::Finished
+    }
+}
+
+/// What a worker's steps need to know about it.
+struct WorkerRef<'a> {
+    record: &'a DownloadRecord,
+    token: &'a CancellationToken,
+    /// Generation its row writes are guarded by.
+    epoch: u64,
+    flags: &'a WorkerFlags,
+}
+
 /// How one attempt of a worker ended.
 enum AttemptEnd {
     /// Nothing more to do (done, failed for good, unavailable, cancelled).
     Finished,
+    /// A re-download was merged in after mixes were skipped as already on
+    /// disk: run again, replacing them.
+    Again,
     /// A temporary failure; retry after a backoff of at least `retry_after`.
     Retry {
         message: String,
@@ -1355,10 +2101,12 @@ enum AttemptEnd {
 
 async fn run_attempt(
     inner: &Arc<Inner>,
-    record: &DownloadRecord,
-    token: &CancellationToken,
+    worker: &WorkerRef<'_>,
     attempt: u32,
+    done: &mut Vec<AudioVariant>,
 ) -> AttemptEnd {
+    let record = worker.record;
+    let token = worker.token;
     // Wait for a slot — but abort at once if a pause/cancel arrives.
     let permit = tokio::select! {
         biased;
@@ -1386,22 +2134,21 @@ async fn run_attempt(
     }
 
     let (start, _) = DownloadStage::Requesting.band();
-    if let Err(error) = inner
-        .storage
-        .update_download_status(&record.id, DownloadStatus::Downloading, start, None)
-        .await
-    {
-        tracing::warn!(id = %record.id, %error, "could not mark download as running");
-    }
-    emit_live(
+    if !worker_status(
         inner,
         &record.id,
+        worker.epoch,
         DownloadStatus::Downloading,
         start,
         Some(DownloadStage::Requesting),
         attempt,
         None,
-    );
+    )
+    .await
+    {
+        // Paused or cancelled meanwhile.
+        return AttemptEnd::Finished;
+    }
     emit_summary(inner).await;
 
     let Some(downloader) = inner.downloaders.get(DOWNLOADER_ID) else {
@@ -1409,26 +2156,38 @@ async fn run_attempt(
             "No {DOWNLOADER_ID:?} downloader is registered; drop a device.wvd file in the data \
              folder and restart."
         ));
-        finish_failed(inner, &record.id, message).await;
+        finish_with(inner, worker, DownloadStatus::Failed, message).await;
         return AttemptEnd::Finished;
     };
 
     let started = Instant::now();
-    let outcome = run_fetch(inner, record, token, attempt, downloader.as_ref()).await;
+    let outcome = run_fetch(inner, worker, attempt, downloader.as_ref(), done).await;
     drop(permit);
     match outcome {
         FetchOutcome::Cancelled => {
             tracing::debug!(id = %record.id, "download worker stopped by pause/cancel");
             AttemptEnd::Finished
         }
-        FetchOutcome::Done { path, target } => {
-            inner.record_fetch_time(started.elapsed());
-            finish_done(inner, record, &path, &target).await;
-            AttemptEnd::Finished
+        FetchOutcome::Done {
+            files,
+            target,
+            skipped,
+        } => {
+            if !files.is_empty() {
+                let per_file = u32::try_from(files.len()).unwrap_or(1);
+                inner.record_fetch_time(started.elapsed() / per_file);
+            }
+            if take_merged_redownload(skipped, worker.flags) {
+                return AttemptEnd::Again;
+            }
+            finish_done(inner, worker, &files, &target).await;
+            // A re-download can merge in while the row is being finished;
+            // it still has to replace the mixes this attempt skipped.
+            after_finish(skipped, worker.flags)
         }
         FetchOutcome::Unavailable(reason) => {
             tracing::info!(id = %record.id, %reason, "download not supported yet");
-            finish_with(inner, &record.id, DownloadStatus::Unavailable, Some(reason)).await;
+            finish_with(inner, worker, DownloadStatus::Unavailable, Some(reason)).await;
             AttemptEnd::Finished
         }
         FetchOutcome::Failed {
@@ -1446,7 +2205,7 @@ async fn run_attempt(
                     retry_after,
                 }
             } else {
-                finish_failed(inner, &record.id, Some(message)).await;
+                finish_with(inner, worker, DownloadStatus::Failed, Some(message)).await;
                 AttemptEnd::Finished
             }
         }
@@ -1457,6 +2216,9 @@ async fn run_attempt(
 struct ProgressState {
     started: Instant,
     estimate: Duration,
+    /// Part of the row's ring this fetch fills (`(0.0, 1.0)` unless the row
+    /// fetches several versions one after the other).
+    span: (f32, f32),
     /// Stage reported by the downloader, if it reports any.
     reported: Option<DownloadStage>,
     /// Byte fraction of the fetch stage, when the downloader reports bytes.
@@ -1468,11 +2230,19 @@ struct ProgressState {
 }
 
 impl ProgressState {
+    #[cfg(test)]
     fn new(estimate: Duration) -> Self {
+        Self::with_span(estimate, (0.0, 1.0))
+    }
+
+    /// A fetch that fills `span` of the ring.
+    fn with_span(estimate: Duration, span: (f32, f32)) -> Self {
         let (start, _) = DownloadStage::Requesting.band();
+        let start = span.0 + (span.1 - span.0) * start;
         Self {
             started: Instant::now(),
             estimate,
+            span,
             reported: None,
             bytes: None,
             shown: start,
@@ -1518,73 +2288,413 @@ impl ProgressState {
             _ => 1.0 - (-2.0 * elapsed / estimate).exp(),
         };
         let fraction = from + (to - from) * within.clamp(0.0, 0.97);
-        (stage, fraction.max(self.shown))
+        let (lo, hi) = self.span;
+        (stage, (lo + (hi - lo) * fraction).max(self.shown))
     }
 }
 
-/// Resolves what to fetch, builds the request, drives
-/// [`crate::download::Downloader::fetch`] while publishing staged progress and
-/// watching `token`, and returns the outcome.
-async fn run_fetch(
-    inner: &Arc<Inner>,
-    record: &DownloadRecord,
-    token: &CancellationToken,
-    attempt: u32,
+/// One version a row fetches, and what to do when the song lacks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Step {
+    variant: AudioVariant,
+    /// When the song has no such version: fetch the normal one instead
+    /// (`true`), or skip it (`false`).
+    fall_back_to_stereo: bool,
+}
+
+impl Step {
+    const STEREO: Self = Self {
+        variant: AudioVariant::Stereo,
+        fall_back_to_stereo: false,
+    };
+}
+
+/// The versions to fetch for `format`, given whether the downloader
+/// supports spatial and whether the song has a spatial master playlist.
+fn plan_steps(format: DownloadFormat, spatial_master: bool) -> Vec<Step> {
+    let spatial = |fall_back_to_stereo| Step {
+        variant: AudioVariant::Spatial,
+        fall_back_to_stereo,
+    };
+    match (format, spatial_master) {
+        (DownloadFormat::Stereo, _) | (_, false) => vec![Step::STEREO],
+        (DownloadFormat::SpatialWhereAvailable, true) => vec![spatial(true)],
+        (DownloadFormat::Both, true) => vec![Step::STEREO, spatial(false)],
+    }
+}
+
+/// The part of a row's ring one fetch fills: the next of `total` versions
+/// after `finished` written ones. `total` counts the versions still to go
+/// as planned now, so a fallback (spatial missing, stereo instead) takes the
+/// skipped version's place instead of running past the end of the ring.
+fn step_span(finished: usize, total: usize) -> (f32, f32) {
+    let total = total.max(finished + 1);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "at most two versions per row; display-only fraction"
+    )]
+    let fraction = |n: usize| n as f32 / total as f32;
+    (fraction(finished), fraction(finished + 1))
+}
+
+/// Where the queue looks up a song's spatial stream: only for a song, a
+/// format that wants it and a downloader that supports it.
+async fn spatial_master_for(
+    inner: &Inner,
     downloader: &dyn crate::download::Downloader,
-) -> FetchOutcome {
+    target: &Target,
+) -> Result<Option<String>, DownloadError> {
+    let format = inner.download_format();
+    if format == DownloadFormat::Stereo
+        || target.kind != MediaKind::Song
+        || !downloader.capabilities().spatial
+    {
+        return Ok(None);
+    }
+    download_target::spatial_master(inner.spatial.as_ref(), &target.catalog_id).await
+}
+
+/// The mixes of `target` (or of the queued id) already recorded with a file
+/// that exists on disk.
+async fn present_variants(
+    inner: &Inner,
+    record: &DownloadRecord,
+    target: &Target,
+) -> Vec<AudioVariant> {
+    let mut present = Vec::new();
+    for id in [target.catalog_id.as_str(), record.track_id.as_str()] {
+        let files = match inner.storage.track_audio_files(id).await {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::warn!(%id, %error, "could not read the recorded audio files");
+                continue;
+            }
+        };
+        for file in files {
+            if !present.contains(&file.variant)
+                && tokio::fs::try_exists(&file.path).await.unwrap_or(false)
+            {
+                present.push(file.variant);
+            }
+        }
+    }
+    present
+}
+
+/// Resolves what the row fetches (the catalog id, request shape, media
+/// kind and library twin); a music video the downloader cannot handle is
+/// unavailable.
+async fn resolve_target(
+    inner: &Inner,
+    worker: &WorkerRef<'_>,
+    downloader: &dyn crate::download::Downloader,
+) -> Result<Target, Box<FetchOutcome>> {
+    let record = worker.record;
     let resolved = tokio::select! {
         biased;
-        () = token.cancelled() => return FetchOutcome::Cancelled,
+        () = worker.token.cancelled() => return Err(Box::new(FetchOutcome::Cancelled)),
         resolved = download_target::resolve(&inner.storage, inner.search.as_ref(), &record.track_id) => resolved,
     };
-    let target = match resolved {
-        Ok(target) => target,
-        Err(error) => return classify(error),
-    };
+    let target = resolved.map_err(|error| Box::new(classify(error)))?;
     if target.kind == MediaKind::MusicVideo && !downloader.capabilities().music_videos {
-        return FetchOutcome::Unavailable(MUSIC_VIDEO_REASON.to_owned());
+        return Err(Box::new(FetchOutcome::Unavailable(
+            MUSIC_VIDEO_REASON.to_owned(),
+        )));
     }
     tracing::debug!(id = %record.id, ?target, "download target resolved");
+    Ok(target)
+}
 
+/// Whether `present` already holds every mix `format` could want, so a
+/// plain download has nothing to ask Apple for (not even whether the song
+/// has a spatial mix).
+/// `known` is whether the song has a spatial mix, when that was learned
+/// before; a downloader without spatial support only ever needs stereo.
+fn all_wanted_present(
+    format: DownloadFormat,
+    spatial: bool,
+    present: &[AudioVariant],
+    known: Option<bool>,
+) -> bool {
+    if present.is_empty() {
+        return false;
+    }
+    let format = if spatial {
+        format
+    } else {
+        DownloadFormat::Stereo
+    };
+    !crate::download_needs::needs_download(format, present, known)
+}
+
+/// Whether the song was looked up for its spatial mix before.
+async fn known_spatial(inner: &Inner, key: &str) -> Option<bool> {
+    match inner.storage.song_spatial().await {
+        Ok(known) => known.get(key).copied(),
+        Err(error) => {
+            tracing::warn!(%key, %error, "could not read the known spatial mixes");
+            None
+        }
+    }
+}
+
+/// Whether [`spatial_master_for`] asked the catalog (and its answer says
+/// whether the song has a spatial mix).
+fn spatial_looked_up(
+    format: DownloadFormat,
+    downloader: &dyn crate::download::Downloader,
+    target: &Target,
+) -> bool {
+    format != DownloadFormat::Stereo
+        && target.kind == MediaKind::Song
+        && downloader.capabilities().spatial
+}
+
+/// Remembers whether the song has a spatial mix, so "Download missing songs"
+/// knows whether a stereo-only song is complete.
+async fn learn_spatial(inner: &Inner, key: &str, has_spatial: bool) {
+    if let Err(error) = inner.storage.set_song_spatial(key, has_spatial).await {
+        tracing::warn!(%key, %error, "could not record whether the song has a spatial mix");
+    }
+}
+
+/// Resolves what to fetch, plans the versions per the download format,
+/// fetches each one (recording every finished file at once) and returns the
+/// outcome. Versions in `done` were written by an earlier attempt and are
+/// skipped; versions written now are added to it. Unless the row is a
+/// re-download, mixes already on disk are skipped too (and `skipped` says
+/// so).
+async fn run_fetch(
+    inner: &Arc<Inner>,
+    worker: &WorkerRef<'_>,
+    attempt: u32,
+    downloader: &dyn crate::download::Downloader,
+    done: &mut Vec<AudioVariant>,
+) -> FetchOutcome {
+    let record = worker.record;
+    let token = worker.token;
+    let target = match resolve_target(inner, worker, downloader).await {
+        Ok(target) => target,
+        Err(outcome) => return *outcome,
+    };
+    let format = inner.download_format();
+    let replace = worker.flags.replace.load(Ordering::SeqCst);
+    let present = if replace {
+        Vec::new()
+    } else {
+        present_variants(inner, record, &target).await
+    };
+    let known = known_spatial(inner, &target.catalog_id).await;
+    if all_wanted_present(format, downloader.capabilities().spatial, &present, known) {
+        tracing::debug!(id = %record.id, ?present, "every wanted mix is already downloaded");
+        return FetchOutcome::Done {
+            files: Vec::new(),
+            target,
+            skipped: true,
+        };
+    }
+
+    let master = tokio::select! {
+        biased;
+        () = token.cancelled() => return FetchOutcome::Cancelled,
+        master = spatial_master_for(inner, downloader, &target) => master,
+    };
+    let master = match master {
+        Ok(master) => master,
+        Err(error) => return classify(error),
+    };
+    if spatial_looked_up(format, downloader, &target) {
+        learn_spatial(inner, &target.catalog_id, master.is_some()).await;
+    }
+    let mut steps = plan_steps(format, master.is_some());
+    let planned = steps.len();
+    steps.retain(|step| !done.contains(&step.variant));
+    // Versions an earlier attempt already wrote keep their share of the ring.
+    let written_before = planned - steps.len();
+    let before_present = steps.len();
+    steps.retain(|step| !present.contains(&step.variant));
+    let mut skipped = steps.len() < before_present;
+    tracing::debug!(id = %record.id, ?steps, replace, "download versions planned");
+
+    let mut files = Vec::with_capacity(steps.len());
+    let mut index = 0usize;
+    while index < steps.len() {
+        let step = steps[index];
+        if index > 0 {
+            // A further version is a fetch of its own: space its license
+            // requests like any other fetch start.
+            let start_at = inner.reserve_start();
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return FetchOutcome::Cancelled,
+                () = tokio::time::sleep_until(start_at) => {}
+            }
+        }
+        let finished = written_before + files.len();
+        let span = step_span(finished, finished + steps.len() - index);
+        let request = DownloadRequest::new(target.catalog_id.clone(), inner.media_dir.clone())
+            .with_variant(step.variant)
+            .with_playback(target.playback.clone())
+            .with_kind(target.kind)
+            .with_enhanced_hls(master.clone())
+            .with_info(record_info(record));
+        match fetch_one(inner, worker, attempt, downloader, request, span).await {
+            Ok(file) => {
+                // A file that completed is kept and recorded, even when the
+                // row was paused or cancelled while it was being saved.
+                record_file(inner, record, &target, &file).await;
+                done.push(step.variant);
+                if file.variant != step.variant {
+                    done.push(file.variant);
+                }
+                files.push(file);
+                if token.is_cancelled() {
+                    return FetchOutcome::Cancelled;
+                }
+            }
+            Err(outcome) => match *outcome {
+                FetchOutcome::Unavailable(reason) if step.variant == AudioVariant::Spatial => {
+                    tracing::info!(id = %record.id, %reason, "no spatial version");
+                    learn_spatial(inner, &target.catalog_id, false).await;
+                    if step.fall_back_to_stereo && !done.contains(&AudioVariant::Stereo) {
+                        if present.contains(&AudioVariant::Stereo) {
+                            skipped = true;
+                        } else {
+                            steps.push(Step::STEREO);
+                        }
+                    }
+                }
+                outcome => return outcome,
+            },
+        }
+        index += 1;
+    }
+    FetchOutcome::Done {
+        files,
+        target,
+        skipped,
+    }
+}
+
+/// Drives one [`crate::download::Downloader::fetch`] while publishing staged
+/// progress (filling `span` of the ring) and watching the worker's token.
+/// When the token fires, the fetch gets [`Timing::cancel_grace`] to notice
+/// (the downloader checks its own child token) and stop, so a new fetch of
+/// the same song can never start while this one still runs. A fetch that
+/// still completes is returned as a success: its file is whole.
+async fn fetch_one(
+    inner: &Arc<Inner>,
+    worker: &WorkerRef<'_>,
+    attempt: u32,
+    downloader: &dyn crate::download::Downloader,
+    request: DownloadRequest,
+    span: (f32, f32),
+) -> Result<Downloaded, Box<FetchOutcome>> {
+    let record = worker.record;
+    let token = worker.token;
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressReport>();
-    let request = DownloadRequest::new(target.catalog_id.clone(), inner.media_dir.clone())
-        .with_playback(target.playback.clone())
-        .with_kind(target.kind)
-        .with_info(record_info(record))
+    let request = request
         .with_progress(DownloadProgress::new(progress_tx))
         .with_cancel(token.child_token());
+    let variant = request.variant;
 
     let fetch = downloader.fetch(&request);
     tokio::pin!(fetch);
-    let mut state = ProgressState::new(inner.fetch_estimate());
+    let mut state = ProgressState::with_span(inner.fetch_estimate(), span);
     let mut tick = tokio::time::interval(PROGRESS_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
+    let result = loop {
         tokio::select! {
             biased;
-            () = token.cancelled() => break FetchOutcome::Cancelled,
+            () = token.cancelled() => {
+                match tokio::time::timeout(inner.timing.cancel_grace, &mut fetch).await {
+                    Ok(Ok(file)) => break Ok(file),
+                    Ok(Err(_)) => {}
+                    Err(_) => {
+                        tracing::warn!(id = %record.id, "the downloader did not stop after cancel; dropping it");
+                    }
+                }
+                return Err(Box::new(FetchOutcome::Cancelled));
+            }
             Some(report) = progress_rx.recv() => {
                 tracing::debug!(id = %record.id, ?report, "downloader progress report");
                 state.apply(report);
-                publish_progress(inner, &record.id, attempt, &mut state).await;
+                publish_progress(inner, worker, attempt, &mut state).await;
             }
-            _ = tick.tick() => publish_progress(inner, &record.id, attempt, &mut state).await,
-            result = &mut fetch => break match result {
-                Ok(path) => FetchOutcome::Done { path, target },
-                // Only our token may cancel a fetch; anything else is a
-                // downloader bug, so retry instead of leaving the row running.
-                Err(DownloadError::Cancelled) if !token.is_cancelled() => FetchOutcome::failed(
-                    "the downloader stopped without being cancelled".to_owned(),
-                    true,
-                ),
-                Err(error) => classify(error),
-            },
+            _ = tick.tick() => publish_progress(inner, worker, attempt, &mut state).await,
+            result = &mut fetch => break result,
+        }
+    };
+    match result {
+        Ok(file) => Ok(file),
+        // Only our token may cancel a fetch; anything else is a
+        // downloader bug, so retry instead of leaving the row running.
+        Err(DownloadError::Cancelled) if !token.is_cancelled() => {
+            Err(Box::new(FetchOutcome::failed(
+                "the downloader stopped without being cancelled".to_owned(),
+                true,
+            )))
+        }
+        Err(DownloadError::Cancelled) => Err(Box::new(FetchOutcome::Cancelled)),
+        Err(error @ DownloadError::VariantUnavailable { .. }) => Err(Box::new(
+            FetchOutcome::Unavailable(format!("{error} ({variant})")),
+        )),
+        Err(error) => Err(Box::new(classify(error))),
+    }
+}
+
+/// Records a written file (with its size and duration) as the audio of its
+/// variant on every track row with the fetched catalog id, and of the queued
+/// id when that differs.
+async fn record_file(
+    inner: &Inner,
+    record: &DownloadRecord,
+    target: &Target,
+    downloaded: &Downloaded,
+) {
+    let size = match tokio::fs::metadata(&downloaded.path).await {
+        Ok(meta) => Some(meta.len()),
+        Err(error) => {
+            tracing::warn!(path = %downloaded.path.display(), %error, "could not read the file size");
+            None
+        }
+    };
+    let file = AudioFile {
+        variant: downloaded.variant,
+        path: downloaded.path.clone(),
+        size,
+        duration_ms: downloaded.duration_ms,
+    };
+    tracing::info!(
+        id = %record.id,
+        variant = %downloaded.variant,
+        path = %downloaded.path.display(),
+        size = ?size,
+        duration_ms = ?downloaded.duration_ms,
+        "download version written"
+    );
+    for any_id in [target.catalog_id.as_str(), record.track_id.as_str()] {
+        if let Err(error) = inner
+            .storage
+            .put_audio_file_by_any_id(any_id, file.clone())
+            .await
+        {
+            tracing::warn!(id = %record.id, %error, "could not record the audio file");
+        }
+        if record.track_id == target.catalog_id {
+            break;
         }
     }
 }
 
 /// Publishes (and occasionally persists) the current staged progress.
-async fn publish_progress(inner: &Arc<Inner>, id: &str, attempt: u32, state: &mut ProgressState) {
+async fn publish_progress(
+    inner: &Arc<Inner>,
+    worker: &WorkerRef<'_>,
+    attempt: u32,
+    state: &mut ProgressState,
+) {
+    let id = worker.record.id.as_str();
     let (phase, fraction) = state.current();
     let phase_changed = state.shown_stage != Some(phase);
     if !phase_changed && fraction < state.shown + PROGRESS_STEP {
@@ -1595,23 +2705,29 @@ async fn publish_progress(inner: &Arc<Inner>, id: &str, attempt: u32, state: &mu
     tracing::debug!(%id, phase = phase.label(), progress = fraction, "download progress");
     if phase_changed || fraction >= state.persisted + PERSIST_STEP {
         state.persisted = fraction;
-        if let Err(error) = inner
-            .storage
-            .update_download_status(id, DownloadStatus::Downloading, fraction, None)
-            .await
-        {
-            tracing::warn!(%id, %error, "could not persist progress");
-        }
+        worker_status(
+            inner,
+            id,
+            worker.epoch,
+            DownloadStatus::Downloading,
+            fraction,
+            Some(phase),
+            attempt,
+            None,
+        )
+        .await;
+    } else {
+        emit_if_current(
+            inner,
+            id,
+            worker.epoch,
+            DownloadStatus::Downloading,
+            fraction,
+            Some(phase),
+            attempt,
+            None,
+        );
     }
-    emit_live(
-        inner,
-        id,
-        DownloadStatus::Downloading,
-        fraction,
-        Some(phase),
-        attempt,
-        None,
-    );
 }
 
 fn record_info(record: &DownloadRecord) -> TrackInfo {
@@ -1623,16 +2739,23 @@ fn record_info(record: &DownloadRecord) -> TrackInfo {
     }
 }
 
-/// Records a finished download: the file becomes the audio of every track row
-/// with the fetched catalog id (and of the queued id, when that differs), a
+/// Finishes a download whose files [`record_file`] already recorded: a
 /// library-only item is linked to the twin it was fetched as, the row turns
 /// `Done`, and lyrics are fetched.
-async fn finish_done(inner: &Arc<Inner>, record: &DownloadRecord, path: &Path, target: &Target) {
+async fn finish_done(
+    inner: &Arc<Inner>,
+    worker: &WorkerRef<'_>,
+    files: &[Downloaded],
+    target: &Target,
+) {
+    let record = worker.record;
     let id = record.id.as_str();
-    tracing::info!(%id, path = %path.display(), "download finished");
-    emit_live(
+    let variants: Vec<AudioVariant> = files.iter().map(|file| file.variant).collect();
+    tracing::info!(%id, ?variants, "download finished");
+    emit_if_current(
         inner,
         id,
+        worker.epoch,
         DownloadStatus::Downloading,
         DownloadStage::Saving.band().0,
         Some(DownloadStage::Saving),
@@ -1660,19 +2783,8 @@ async fn finish_done(inner: &Arc<Inner>, record: &DownloadRecord, path: &Path, t
             tracing::warn!(%id, %error, "could not pin the twin download");
         }
     }
-    for any_id in [target.catalog_id.as_str(), record.track_id.as_str()] {
-        if let Err(error) = inner
-            .storage
-            .set_audio_by_any_id(any_id, Some(path.to_path_buf()))
-            .await
-        {
-            tracing::warn!(%id, %error, "could not record the audio file");
-        }
-        if record.track_id == target.catalog_id {
-            break;
-        }
-    }
-    finish_with(inner, id, DownloadStatus::Done, None).await;
+    finish_with(inner, worker, DownloadStatus::Done, None).await;
+
     spawn_lyrics_fetch(inner, record, &target.catalog_id);
 }
 
@@ -1712,14 +2824,11 @@ fn progress_fraction(done: u64, total: u64) -> f32 {
     (done as f32 / total as f32).clamp(0.0, 1.0)
 }
 
-async fn finish_failed(inner: &Arc<Inner>, id: &str, message: Option<String>) {
-    finish_with(inner, id, DownloadStatus::Failed, message).await;
-}
-
-/// Persists and publishes a terminal status (`Done`, `Failed`, `Unavailable`).
+/// Persists and publishes a worker's terminal status (`Done`, `Failed`,
+/// `Unavailable`), unless the row was paused or cancelled meanwhile.
 async fn finish_with(
     inner: &Arc<Inner>,
-    id: &str,
+    worker: &WorkerRef<'_>,
     status: DownloadStatus,
     message: Option<String>,
 ) {
@@ -1728,14 +2837,17 @@ async fn finish_with(
     } else {
         0.0
     };
-    if let Err(error) = inner
-        .storage
-        .update_download_status(id, status, progress, message.clone())
-        .await
-    {
-        tracing::warn!(%id, %error, ?status, "could not record final status");
-    }
-    emit_status(inner, id, status, progress, message);
+    worker_status(
+        inner,
+        &worker.record.id,
+        worker.epoch,
+        status,
+        progress,
+        None,
+        1,
+        message,
+    )
+    .await;
 }
 
 fn emit_status(
@@ -1881,10 +2993,117 @@ fn record_from_song(
         progress: 0.0,
         message: None,
         deferred: false,
+        replace: false,
         // `0` lets storage fill both timestamps on insert.
         created_at: 0,
         updated_at: 0,
     }
+}
+
+/// A queued [`DownloadRecord`] for a stored track, keyed on its download key
+/// (the catalog id, which the DRM downloader needs, else the track id) and
+/// tagged with `source` (`None` for a single song).
+#[must_use]
+pub fn record_from_track(
+    track: &crate::storage::Track,
+    source: Option<(DownloadSourceKind, &str, &str)>,
+) -> DownloadRecord {
+    let key = track.catalog_id.clone().unwrap_or_else(|| track.id.clone());
+    let (source_kind, source_id, source_name) = match source {
+        Some((kind, id, name)) => (
+            kind,
+            Some(id.to_owned()),
+            (!name.is_empty()).then(|| name.to_owned()),
+        ),
+        None => (DownloadSourceKind::Song, None, None),
+    };
+    DownloadRecord {
+        id: key.clone(),
+        track_id: key,
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        duration_ms: track.duration_ms.unwrap_or(0),
+        artwork_url: track.artwork_url.clone(),
+        source_kind,
+        source_id,
+        source_name,
+        status: DownloadStatus::Queued,
+        progress: 0.0,
+        message: None,
+        deferred: false,
+        replace: false,
+        // `0` lets storage fill both timestamps on insert.
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+/// "Keep downloaded": queues the songs added to kept collections since they
+/// were downloaded. Run after a library sync.
+///
+/// A member counts as new when the collection has no pin on it yet. Each new
+/// member is pinned, and queued when it has no downloaded audio (custom
+/// songs are skipped). Songs the user cancelled keep their pin and are not
+/// queued again. Returns how many songs were queued.
+///
+/// # Errors
+///
+/// Returns storage errors from the lookups it performs.
+pub async fn queue_kept_collections(
+    storage: &Storage,
+    queue: &DownloadQueue,
+) -> Result<usize, StorageError> {
+    let kept: Vec<_> = storage
+        .download_collections()
+        .await?
+        .into_iter()
+        .filter(|collection| collection.keep)
+        .collect();
+    if kept.is_empty() {
+        return Ok(0);
+    }
+    let pins: HashSet<(String, String)> = storage.download_pins().await?.into_iter().collect();
+    let mut records = Vec::new();
+    for collection in kept {
+        let Some(members) = storage
+            .collection_members(collection.filter, &collection.owner)
+            .await?
+        else {
+            continue;
+        };
+        let mut new_keys = Vec::new();
+        for member in members {
+            let Some(track) = storage.get_track(&member).await? else {
+                continue;
+            };
+            if track.is_custom {
+                continue;
+            }
+            let key = track.catalog_id.clone().unwrap_or_else(|| track.id.clone());
+            if pins.contains(&(key.clone(), collection.owner.clone())) || new_keys.contains(&key) {
+                continue;
+            }
+            new_keys.push(key);
+            if !track.has_audio() {
+                records.push(record_from_track(
+                    &track,
+                    Some((collection.kind, &collection.owner, &collection.name)),
+                ));
+            }
+        }
+        if !new_keys.is_empty() {
+            tracing::info!(collection = %collection.owner, songs = new_keys.len(), "kept collection has new songs");
+            storage
+                .pin_downloads(Some(&collection.owner), new_keys)
+                .await?;
+        }
+    }
+    let count = records.len();
+    if count > 0 && queue.enqueue(records).is_err() {
+        return Ok(0);
+    }
+    Ok(count)
 }
 
 /// On-demand prefetch for a reference-audio custom song.
@@ -1948,6 +3167,7 @@ pub async fn enqueue_missing_reference(
         progress: 0.0,
         message: None,
         deferred: false,
+        replace: false,
         created_at: 0,
         updated_at: 0,
     };
@@ -1992,6 +3212,7 @@ mod tests {
             progress: 0.0,
             message: None,
             deferred: false,
+            replace: false,
             created_at: 0,
             updated_at: 0,
         };
@@ -2048,6 +3269,7 @@ mod tests {
             progress: 1.0,
             message: None,
             deferred: false,
+            replace: false,
             created_at: 1,
             updated_at: 1,
         };
@@ -2090,20 +3312,27 @@ mod tests {
             DOWNLOADER_ID
         }
 
-        async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+        async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
             let _ = self.started.send(());
-            self.gate.notified().await;
+            // Honours the cancel token like a real downloader.
+            tokio::select! {
+                () = request.cancel.cancelled() => return Err(DownloadError::Cancelled),
+                () = self.gate.notified() => {}
+            }
             write_output(request).await
         }
     }
 
     /// Writes a placeholder file at the request's output path.
-    async fn write_output(request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+    async fn write_output(request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
         if let Some(dir) = request.output_path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         tokio::fs::write(&request.output_path, b"x").await?;
-        Ok(request.output_path.clone())
+        Ok(Downloaded::new(
+            request.output_path.clone(),
+            request.variant,
+        ))
     }
 
     /// A downloader that reports two progress samples and then succeeds.
@@ -2117,7 +3346,7 @@ mod tests {
             DOWNLOADER_ID
         }
 
-        async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+        async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
             if let Some(progress) = &request.progress {
                 progress.report(50, Some(100));
                 progress.report(100, Some(100));
@@ -2143,6 +3372,7 @@ mod tests {
             progress: 0.0,
             message: None,
             deferred: false,
+            replace: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -2564,7 +3794,7 @@ mod tests {
             let path = media.join(format!("{id}.m4a"));
             std::fs::write(&path, b"x").unwrap();
             let mut track = crate::storage::Track::minimal(*id, "Song", "Artist");
-            track.audio_path = Some(path);
+            track.audio = crate::storage::TrackAudio::normal(path);
             storage.upsert_track(track).await.unwrap();
         }
         let queue = DownloadQueue::spawn(
@@ -2603,8 +3833,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .audio_path
-                .is_none()
+                .audio
+                .is_empty()
         );
     }
 
@@ -2664,6 +3894,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_a_custom_playlist_should_keep_custom_and_referenced_audio() {
+        let (storage, queue, dir) = queue_with_files(&["1", "3"]).await;
+        let own = storage
+            .create_custom_track(NewCustomTrack {
+                title: "Mine".into(),
+                artist: "Me".into(),
+                ..NewCustomTrack::default()
+            })
+            .await
+            .unwrap();
+        let own_file = dir.path().join(format!("{own}.flac"));
+        std::fs::write(&own_file, b"mine").unwrap();
+        storage
+            .set_custom_track_audio(&own, CustomAudio::LocalCopy(own_file.clone()))
+            .await
+            .unwrap();
+        storage
+            .create_custom_track(NewCustomTrack {
+                title: "Ref".into(),
+                artist: "Me".into(),
+                audio: CustomAudio::Reference("3".into()),
+                ..NewCustomTrack::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .pin_downloads(Some("pl.custom"), ids(&["1", "3"]))
+            .await
+            .unwrap();
+        let keys = ids(&[own.as_str(), "1", "3"]);
+        let preview = storage
+            .download_removal_preview("pl.custom", keys.clone())
+            .await
+            .unwrap();
+
+        let removed = queue
+            .remove_downloads(Some("pl.custom"), keys)
+            .await
+            .unwrap();
+
+        assert_eq!(removed, ids(&["1"]));
+        assert_eq!(
+            (preview.deleted.len(), preview.kept.len()),
+            (1, 1),
+            "the dialog counts what really happens"
+        );
+        assert!(
+            own_file.exists(),
+            "a custom song's own audio is never removed"
+        );
+        assert!(
+            !storage
+                .get_track(&own)
+                .await
+                .unwrap()
+                .unwrap()
+                .audio
+                .is_empty()
+        );
+        assert!(dir.path().join("3.m4a").exists(), "a custom song plays it");
+        assert!(!dir.path().join("1.m4a").exists());
+    }
+
+    /// Removes the downloads of collection `CIDER_REMOVE_OWNER` from a COPY of
+    /// a real database (never the live file; opening it migrates it), the
+    /// way the library's "Remove downloads" does, twice, and reports what
+    /// happened. Files are looked for in the copy's `media` folder. Run with
+    /// `cargo test -p cider-offline-core real_db_copy_remove -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "needs CIDER_DB_COPY (a copy of a real store.sqlite) and CIDER_REMOVE_OWNER"]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a manual check that reports what it saw"
+    )]
+    async fn real_db_copy_remove_collection() {
+        let path =
+            std::path::PathBuf::from(std::env::var_os("CIDER_DB_COPY").expect("CIDER_DB_COPY"));
+        let owner = std::env::var("CIDER_REMOVE_OWNER").expect("CIDER_REMOVE_OWNER");
+        let storage = Storage::open_async(path.clone()).await.unwrap();
+        let media = path.parent().unwrap().join("media");
+        let queue = DownloadQueue::spawn(
+            storage.clone(),
+            Arc::new(DownloaderRegistry::new()),
+            media.clone(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+        let filter = crate::storage::LibraryFilter::AppleMusic;
+        let members = storage
+            .collection_members(filter, &owner)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let mut keys: Vec<String> = Vec::new();
+        for member in &members {
+            if let Some(track) = storage.get_track(member).await.unwrap()
+                && !track.is_custom
+            {
+                let key = track.catalog_id.unwrap_or(track.id);
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        let pinned_before = storage.pinned_collections().await.unwrap().contains(&owner);
+        let preview = storage
+            .download_removal_preview(&owner, keys.clone())
+            .await
+            .unwrap();
+        println!(
+            "members {} keys {} preview (deleted, kept) {preview:?} pinned before {pinned_before}",
+            members.len(),
+            keys.len(),
+        );
+        let first = queue
+            .remove_downloads(Some(&owner), keys.clone())
+            .await
+            .unwrap();
+        let second = queue.remove_downloads(Some(&owner), keys).await.unwrap();
+        let (_, report) = crate::download_cleanup::unlinked_downloads(&storage, &media)
+            .await
+            .unwrap();
+        let pinned_after = storage.pinned_collections().await.unwrap().contains(&owner);
+        println!(
+            "removed first {} second {} pinned after {pinned_after} unlinked files {}",
+            first.len(),
+            second.len(),
+            report.files
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_collection_should_drop_every_pin_it_holds() {
+        let (storage, queue, _dir) = queue_with_files(&["1", "2"]).await;
+        // `2` left the playlist upstream but is still pinned by it, like the
+        // owner's 0.1.0 pin keyed on a library id.
+        storage
+            .pin_downloads(Some("p.mix"), ids(&["1", "2"]))
+            .await
+            .unwrap();
+        let removed = queue
+            .remove_downloads(Some("p.mix"), ids(&["1"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (removed, storage.pinned_collections().await.unwrap()),
+            (ids(&["1", "2"]), Vec::<String>::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_downloads_twice_should_report_nothing_the_second_time() {
+        let (storage, queue, _dir) = queue_with_files(&["1"]).await;
+        storage
+            .pin_downloads(Some("p.mix"), ids(&["1"]))
+            .await
+            .unwrap();
+        queue
+            .remove_downloads(Some("p.mix"), ids(&["1"]))
+            .await
+            .unwrap();
+        let again = queue
+            .remove_downloads(Some("p.mix"), ids(&["1"]))
+            .await
+            .unwrap();
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_song_by_its_library_id_should_remove_the_one_file() {
+        let (storage, queue, dir) = queue_with_files(&["1"]).await;
+        let mut library = crate::storage::Track::minimal("i.one", "Song", "Artist");
+        library.catalog_id = Some("1".into());
+        library.audio = crate::storage::TrackAudio::normal(dir.path().join("1.m4a"));
+        storage.upsert_track(library).await.unwrap();
+        let removed = queue.remove_downloads(None, ids(&["i.one"])).await.unwrap();
+        let song = storage.get_track("1").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                removed.len(),
+                song.has_audio(),
+                dir.path().join("1.m4a").exists()
+            ),
+            (1, false, false)
+        );
+    }
+
+    #[tokio::test]
     async fn existing_media_files_should_be_linked_at_startup() {
         let storage = Storage::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -2680,8 +4098,16 @@ mod tests {
         );
         for _ in 0..100 {
             let track = storage.get_track("i.lib").await.unwrap().unwrap();
-            if track.audio_path.is_some() {
-                return;
+            if track.has_audio() {
+                // A linked file gets an individual pin, so it never counts
+                // as an unlinked download (e.g. after a database reset).
+                for _ in 0..100 {
+                    if storage.download_owners("42").await.unwrap() == [String::new()] {
+                        return;
+                    }
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                }
+                panic!("the linked file was not pinned");
             }
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
@@ -2814,6 +4240,16 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SpatialLookup for NoSearch {
+        async fn spatial_master(
+            &self,
+            _catalog_id: &str,
+        ) -> Result<Option<String>, crate::catalog::CatalogError> {
+            Ok(None)
+        }
+    }
+
     /// Records every request and writes `<output_path>`; declares
     /// `music_videos` as configured.
     struct RecordingDownloader {
@@ -2831,7 +4267,7 @@ mod tests {
             DownloaderCapabilities::new().with_music_videos(self.music_videos)
         }
 
-        async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+        async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
             let _ = self.requests.send(request.clone());
             write_output(request).await
         }
@@ -2954,10 +4390,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            (
-                original.catalog_id.as_deref(),
-                original.audio_path.is_some()
-            ),
+            (original.catalog_id.as_deref(), original.has_audio()),
             (Some("6814096109"), true)
         );
     }
@@ -3075,7 +4508,7 @@ mod tests {
             DOWNLOADER_ID
         }
 
-        async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+        async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let left = self.failures.load(Ordering::SeqCst);
             if left > 0 {
@@ -3093,6 +4526,7 @@ mod tests {
             spacing: StdDuration::from_millis(5),
             cooldown: StdDuration::from_millis(5),
             backoff_base: StdDuration::from_millis(20),
+            cancel_grace: StdDuration::from_secs(2),
         }
     }
 
@@ -3166,5 +4600,1053 @@ mod tests {
             .await
             .expect("waiter woken")
             .unwrap();
+    }
+
+    // ----- Download format (normal / spatial) -----
+
+    const MASTER: &str = "https://aod.itunes.apple.com/itunes-assets/x/P1_default.m3u8";
+
+    /// Catalog stand-in whose songs have (or lack) a spatial master.
+    struct FakeCatalog {
+        master: Option<&'static str>,
+        lookups: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TwinSearch for FakeCatalog {
+        async fn search_songs(
+            &self,
+            _term: &str,
+        ) -> Result<Vec<crate::catalog::SongCandidate>, crate::catalog::CatalogError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl SpatialLookup for FakeCatalog {
+        async fn spatial_master(
+            &self,
+            _catalog_id: &str,
+        ) -> Result<Option<String>, crate::catalog::CatalogError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            Ok(self.master.map(str::to_owned))
+        }
+    }
+
+    /// Records `(variant, enhanced_hls)` of every request; a spatial request
+    /// fails with `VariantUnavailable` unless `has_binaural`.
+    /// `(variant, enhanced_hls)` of every request a downloader saw.
+    type Seen = Arc<Mutex<Vec<(AudioVariant, Option<String>)>>>;
+
+    struct VariantDownloader {
+        seen: Seen,
+        spatial: bool,
+        has_binaural: bool,
+    }
+
+    #[async_trait]
+    impl Downloader for VariantDownloader {
+        fn id(&self) -> &'static str {
+            DOWNLOADER_ID
+        }
+
+        fn capabilities(&self) -> DownloaderCapabilities {
+            DownloaderCapabilities::new().with_spatial(self.spatial)
+        }
+
+        async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((request.variant, request.enhanced_hls.clone()));
+            }
+            if request.variant == AudioVariant::Spatial && !self.has_binaural {
+                return Err(DownloadError::variant_unavailable(AudioVariant::Spatial));
+            }
+            write_output(request)
+                .await
+                .map(|d| d.with_duration_ms(Some(221_564)))
+        }
+    }
+
+    struct FormatRun {
+        status: DownloadStatus,
+        requests: Vec<(AudioVariant, Option<String>)>,
+        files: Vec<crate::storage::AudioFile>,
+        lookups: usize,
+        /// Whether the song has a spatial mix, as the queue recorded it.
+        learned: Option<bool>,
+    }
+
+    async fn run_format(
+        format: DownloadFormat,
+        master: Option<&'static str>,
+        spatial: bool,
+        has_binaural: bool,
+    ) -> FormatRun {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_track(crate::storage::Track::minimal("31", "Song", "Artist"))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = DownloaderRegistry::new();
+        registry.register(VariantDownloader {
+            seen: Arc::clone(&seen),
+            spatial,
+            has_binaural,
+        });
+        let catalog = Arc::new(FakeCatalog {
+            master,
+            lookups: AtomicUsize::new(0),
+        });
+        let queue = DownloadQueue::spawn_with(
+            storage.clone(),
+            Arc::new(registry),
+            dir.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            fast_timing(),
+            Arc::clone(&catalog),
+        );
+        queue.set_download_format(format);
+        let mut events = queue.events();
+        queue.enqueue(vec![queued_record("31")]).unwrap();
+        let status = wait_final(&mut events, "31").await;
+        let requests = seen.lock().unwrap().clone();
+        FormatRun {
+            status,
+            requests,
+            files: storage.track_audio_files("31").await.unwrap(),
+            lookups: catalog.lookups.load(Ordering::SeqCst),
+            learned: storage.song_spatial().await.unwrap().get("31").copied(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_song_without_a_master_should_be_learned_as_having_no_spatial_mix() {
+        let run = run_format(DownloadFormat::Both, None, true, true).await;
+        assert_eq!(run.learned, Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_spatial_mix_should_be_learned() {
+        let run = run_format(DownloadFormat::Both, Some(MASTER), true, true).await;
+        assert_eq!(run.learned, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_master_without_binaural_should_be_learned_as_no_spatial_mix() {
+        let run = run_format(DownloadFormat::Both, Some(MASTER), true, false).await;
+        assert_eq!(run.learned, Some(false));
+    }
+
+    #[tokio::test]
+    async fn stereo_only_song_known_without_spatial_should_need_no_lookup() {
+        let storage = Storage::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("31.m4a");
+        std::fs::write(&path, b"x").unwrap();
+        let mut track = crate::storage::Track::minimal("31", "Song", "Artist");
+        track.audio = crate::storage::TrackAudio::normal(path);
+        storage.upsert_track(track).await.unwrap();
+        storage.set_song_spatial("31", false).await.unwrap();
+        let mut registry = DownloaderRegistry::new();
+        registry.register(VariantDownloader {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            spatial: true,
+            has_binaural: true,
+        });
+        let catalog = Arc::new(FakeCatalog {
+            master: Some(MASTER),
+            lookups: AtomicUsize::new(0),
+        });
+        let queue = DownloadQueue::spawn_with(
+            storage.clone(),
+            Arc::new(registry),
+            dir.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            fast_timing(),
+            Arc::clone(&catalog),
+        );
+        queue.set_download_format(DownloadFormat::Both);
+        let mut events = queue.events();
+        queue.enqueue(vec![queued_record("31")]).unwrap();
+        wait_final(&mut events, "31").await;
+        assert_eq!(catalog.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    /// The first terminal status of `want_id`.
+    async fn wait_final(
+        events: &mut broadcast::Receiver<DownloadEvent>,
+        want_id: &str,
+    ) -> DownloadStatus {
+        for _ in 0..400 {
+            if let DownloadEvent::StatusChanged { id, status, .. } = next_event(events).await
+                && id == want_id
+                && matches!(
+                    status,
+                    DownloadStatus::Done | DownloadStatus::Failed | DownloadStatus::Unavailable
+                )
+            {
+                return status;
+            }
+        }
+        panic!("no final status for {want_id}");
+    }
+
+    fn variants(files: &[crate::storage::AudioFile]) -> Vec<AudioVariant> {
+        files.iter().map(|f| f.variant).collect()
+    }
+
+    #[tokio::test]
+    async fn normal_format_should_fetch_only_normal_without_a_lookup() {
+        let run = run_format(DownloadFormat::Stereo, Some(MASTER), true, true).await;
+        assert_eq!(
+            (run.requests, run.lookups),
+            (vec![(AudioVariant::Stereo, None)], 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn spatial_where_available_should_fetch_only_spatial() {
+        let run = run_format(
+            DownloadFormat::SpatialWhereAvailable,
+            Some(MASTER),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(
+            (run.status, run.requests, variants(&run.files)),
+            (
+                DownloadStatus::Done,
+                vec![(AudioVariant::Spatial, Some(MASTER.to_owned()))],
+                vec![AudioVariant::Spatial]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn spatial_where_available_should_fall_back_to_stereo_without_binaural() {
+        let run = run_format(
+            DownloadFormat::SpatialWhereAvailable,
+            Some(MASTER),
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(
+            (run.status, variants(&run.files)),
+            (DownloadStatus::Done, vec![AudioVariant::Stereo])
+        );
+    }
+
+    #[tokio::test]
+    async fn spatial_where_available_should_fetch_normal_when_the_song_has_no_master() {
+        let run = run_format(DownloadFormat::SpatialWhereAvailable, None, true, true).await;
+        assert_eq!(run.requests, vec![(AudioVariant::Stereo, None)]);
+    }
+
+    #[tokio::test]
+    async fn both_format_should_record_both_files() {
+        let run = run_format(DownloadFormat::Both, Some(MASTER), true, true).await;
+        assert_eq!(
+            (run.status, variants(&run.files)),
+            (
+                DownloadStatus::Done,
+                vec![AudioVariant::Stereo, AudioVariant::Spatial]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn both_format_should_keep_normal_when_the_song_lacks_binaural() {
+        let run = run_format(DownloadFormat::Both, Some(MASTER), true, false).await;
+        assert_eq!(
+            (run.status, variants(&run.files)),
+            (DownloadStatus::Done, vec![AudioVariant::Stereo])
+        );
+    }
+
+    #[tokio::test]
+    async fn spatial_should_not_be_requested_from_a_downloader_without_support() {
+        let run = run_format(DownloadFormat::Both, Some(MASTER), false, true).await;
+        assert_eq!(
+            (run.requests, run.lookups),
+            (vec![(AudioVariant::Stereo, None)], 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_files_should_carry_size_and_duration() {
+        let run = run_format(
+            DownloadFormat::SpatialWhereAvailable,
+            Some(MASTER),
+            true,
+            true,
+        )
+        .await;
+        let file = &run.files[0];
+        assert_eq!(
+            (file.size, file.duration_ms, file.path.file_name()),
+            (
+                Some(1),
+                Some(221_564),
+                Some(std::ffi::OsStr::new("31.spatial.m4a"))
+            )
+        );
+    }
+
+    #[test]
+    fn plan_should_follow_the_format() {
+        let spatial = |fall_back_to_stereo| Step {
+            variant: AudioVariant::Spatial,
+            fall_back_to_stereo,
+        };
+        assert_eq!(
+            [
+                plan_steps(DownloadFormat::Stereo, true),
+                plan_steps(DownloadFormat::SpatialWhereAvailable, true),
+                plan_steps(DownloadFormat::SpatialWhereAvailable, false),
+                plan_steps(DownloadFormat::Both, true),
+                plan_steps(DownloadFormat::Both, false),
+            ],
+            [
+                vec![Step::STEREO],
+                vec![spatial(true)],
+                vec![Step::STEREO],
+                vec![Step::STEREO, spatial(false)],
+                vec![Step::STEREO],
+            ]
+        );
+    }
+
+    #[test]
+    fn step_span_should_split_the_ring_between_both_mixes() {
+        assert_eq!([step_span(0, 2), step_span(1, 2)], [(0.0, 0.5), (0.5, 1.0)]);
+    }
+
+    #[test]
+    fn step_span_should_give_a_stereo_fallback_the_whole_ring() {
+        // Spatial where available: spatial was missing, stereo is the only
+        // version left to fetch.
+        assert_eq!(step_span(0, 1), (0.0, 1.0));
+    }
+
+    #[test]
+    fn step_span_should_keep_the_share_of_a_mix_written_before_a_retry() {
+        assert_eq!(step_span(1, 2), (0.5, 1.0));
+    }
+
+    #[test]
+    fn stereo_on_disk_should_satisfy_a_stereo_only_download() {
+        assert!(all_wanted_present(
+            DownloadFormat::Stereo,
+            true,
+            &[AudioVariant::Stereo],
+            None
+        ));
+    }
+
+    #[test]
+    fn stereo_on_disk_should_not_satisfy_a_both_download() {
+        assert!(!all_wanted_present(
+            DownloadFormat::Both,
+            true,
+            &[AudioVariant::Stereo],
+            None
+        ));
+    }
+
+    #[test]
+    fn stereo_on_disk_should_satisfy_both_for_a_song_known_without_spatial() {
+        assert!(all_wanted_present(
+            DownloadFormat::Both,
+            true,
+            &[AudioVariant::Stereo],
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn spatial_on_disk_should_satisfy_spatial_where_available() {
+        assert!(all_wanted_present(
+            DownloadFormat::SpatialWhereAvailable,
+            true,
+            &[AudioVariant::Spatial],
+            None
+        ));
+    }
+
+    #[test]
+    fn step_span_should_never_run_past_the_end_of_the_ring() {
+        assert_eq!(step_span(1, 1), (0.5, 1.0));
+    }
+
+    // ----- Download management: merge, cancel, pins, unlinked downloads -----
+
+    /// A downloader whose work runs on a task of its own, like the real one's
+    /// blocking decrypt and save: dropping the fetch future does not stop it.
+    /// After a cancel it needs `stop_delay` to wind down. It counts fetches
+    /// and the most fetches it ever ran at once.
+    struct DetachedDownloader {
+        started: mpsc::UnboundedSender<()>,
+        gate: Arc<Notify>,
+        in_flight: Arc<AtomicUsize>,
+        most_at_once: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        stop_delay: StdDuration,
+        /// After a cancel, finish the file anyway (a save that was already
+        /// under way) instead of stopping.
+        complete_after_cancel: Arc<AtomicBool>,
+    }
+
+    impl DetachedDownloader {
+        fn new(started: mpsc::UnboundedSender<()>, gate: Arc<Notify>) -> Self {
+            Self {
+                started,
+                gate,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                most_at_once: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                stop_delay: StdDuration::from_millis(300),
+                complete_after_cancel: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Downloader for DetachedDownloader {
+        fn id(&self) -> &'static str {
+            DOWNLOADER_ID
+        }
+
+        async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(now, Ordering::SeqCst);
+            let _ = self.started.send(());
+            let gate = Arc::clone(&self.gate);
+            let cancel = request.cancel.clone();
+            let in_flight = Arc::clone(&self.in_flight);
+            let stop_delay = self.stop_delay;
+            let output = request.output_path.clone();
+            let variant = request.variant;
+            let complete_after_cancel = self.complete_after_cancel.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                let result = tokio::select! {
+                    () = cancel.cancelled() => {
+                        tokio::time::sleep(stop_delay).await;
+                        if complete_after_cancel {
+                            tokio::fs::write(&output, b"x")
+                                .await
+                                .map(|()| Downloaded::new(output.clone(), variant))
+                                .map_err(DownloadError::from)
+                        } else {
+                            Err(DownloadError::Cancelled)
+                        }
+                    }
+                    () = gate.notified() => tokio::fs::write(&output, b"x")
+                        .await
+                        .map(|()| Downloaded::new(output.clone(), variant))
+                        .map_err(DownloadError::from),
+                };
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                result
+            })
+            .await
+            .map_err(|error| DownloadError::Other(error.to_string()))?
+        }
+    }
+
+    struct Harness {
+        storage: Storage,
+        queue: DownloadQueue,
+        started: mpsc::UnboundedReceiver<()>,
+        gate: Arc<Notify>,
+        most_at_once: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+        complete_after_cancel: Arc<AtomicBool>,
+        dir: tempfile::TempDir,
+    }
+
+    fn harness(concurrency: usize) -> Harness {
+        let storage = Storage::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (started_tx, started) = mpsc::unbounded_channel();
+        let gate = Arc::new(Notify::new());
+        let downloader = DetachedDownloader::new(started_tx, Arc::clone(&gate));
+        let most_at_once = Arc::clone(&downloader.most_at_once);
+        let calls = Arc::clone(&downloader.calls);
+        let in_flight = Arc::clone(&downloader.in_flight);
+        let complete_after_cancel = Arc::clone(&downloader.complete_after_cancel);
+        let mut registry = DownloaderRegistry::new();
+        registry.register(downloader);
+        let queue = DownloadQueue::spawn_with(
+            storage.clone(),
+            Arc::new(registry),
+            dir.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            fast_timing(),
+            Arc::new(NoSearch),
+        );
+        queue.set_concurrency(concurrency);
+        Harness {
+            storage,
+            queue,
+            started,
+            gate,
+            most_at_once,
+            calls,
+            in_flight,
+            complete_after_cancel,
+            dir,
+        }
+    }
+
+    impl Harness {
+        /// Records a stereo file of song `id` on disk and in the store.
+        async fn with_file(&self, id: &str) -> PathBuf {
+            let path = self.dir.path().join(format!("{id}.m4a"));
+            std::fs::write(&path, b"old").unwrap();
+            let mut track = crate::storage::Track::minimal(id, "Song", "Artist");
+            track.audio = crate::storage::TrackAudio::normal(path.clone());
+            self.storage.upsert_track(track).await.unwrap();
+            path
+        }
+
+        async fn row(&self, id: &str) -> Option<DownloadRecord> {
+            self.storage.get_download(id).await.unwrap()
+        }
+
+        /// Waits until the actor has handled every command sent so far.
+        async fn settle(&self) {
+            // `download_album_version` answers through the actor, after the
+            // commands queued before it.
+            let _ = self.queue.download_album_version("none").await;
+        }
+    }
+
+    fn redownload(id: &str) -> DownloadRecord {
+        DownloadRecord {
+            replace: true,
+            ..queued_record(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn download_again_after_pause_should_never_run_two_fetches_of_one_song() {
+        // The reported duplicate: pausing a running download and downloading
+        // it again started a second fetch while the first one was still
+        // winding down (decrypting / saving on its own task).
+        let mut h = harness(2);
+        let mut events = h.queue.events();
+        h.queue.enqueue(vec![queued_record("7")]).unwrap();
+        h.started.recv().await.unwrap();
+        h.queue.pause("7").unwrap();
+        wait_status(&mut events, "7", DownloadStatus::Paused).await;
+        h.queue.enqueue(vec![redownload("7")]).unwrap();
+        h.started.recv().await.unwrap();
+        h.gate.notify_one();
+        wait_status(&mut events, "7", DownloadStatus::Done).await;
+        assert_eq!(h.most_at_once.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rapid_repeated_downloads_should_fetch_a_song_once() {
+        let mut h = harness(4);
+        let mut events = h.queue.events();
+        h.queue
+            .enqueue(vec![
+                queued_record("7"),
+                queued_record("7"),
+                redownload("7"),
+            ])
+            .unwrap();
+        for _ in 0..5 {
+            h.queue.enqueue(vec![queued_record("7")]).unwrap();
+            h.queue.enqueue(vec![redownload("7")]).unwrap();
+        }
+        h.started.recv().await.unwrap();
+        h.settle().await;
+        h.gate.notify_one();
+        wait_status(&mut events, "7", DownloadStatus::Done).await;
+        h.settle().await;
+        assert_eq!(
+            (
+                h.calls.load(Ordering::SeqCst),
+                h.most_at_once.load(Ordering::SeqCst),
+                h.storage.list_downloads().await.unwrap().len()
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_of_a_song_already_on_disk_should_fetch_nothing() {
+        let h = harness(2);
+        h.with_file("7").await;
+        let mut events = h.queue.events();
+        h.queue.enqueue(vec![queued_record("7")]).unwrap();
+        wait_status(&mut events, "7", DownloadStatus::Done).await;
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn redownload_should_fetch_a_song_already_on_disk_again() {
+        let mut h = harness(2);
+        let path = h.with_file("7").await;
+        let mut events = h.queue.events();
+        h.queue.enqueue(vec![redownload("7")]).unwrap();
+        h.started.recv().await.unwrap();
+        h.gate.notify_one();
+        wait_status(&mut events, "7", DownloadStatus::Done).await;
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"x",
+            "the new file replaced the old one"
+        );
+    }
+
+    #[tokio::test]
+    async fn redownload_merged_into_a_waiting_download_should_upgrade_it_to_replace() {
+        let mut h = harness(1);
+        h.with_file("7").await;
+        let mut events = h.queue.events();
+        // "1" holds the only slot, so "7" waits as a plain download.
+        h.queue.enqueue(vec![queued_record("1")]).unwrap();
+        h.started.recv().await.unwrap();
+        h.queue.enqueue(vec![queued_record("7")]).unwrap();
+        h.queue.enqueue(vec![redownload("7")]).unwrap();
+        h.settle().await;
+        assert!(h.row("7").await.unwrap().replace);
+        h.gate.notify_one();
+        wait_status(&mut events, "1", DownloadStatus::Done).await;
+        h.started.recv().await.unwrap();
+        h.gate.notify_one();
+        wait_status(&mut events, "7", DownloadStatus::Done).await;
+        assert_eq!(h.calls.load(Ordering::SeqCst), 2, "7 was fetched again");
+    }
+
+    #[tokio::test]
+    async fn download_of_a_paused_song_should_resume_it() {
+        let mut h = harness(2);
+        let mut events = h.queue.events();
+        h.queue.enqueue(vec![queued_record("7")]).unwrap();
+        h.started.recv().await.unwrap();
+        h.queue.pause("7").unwrap();
+        wait_status(&mut events, "7", DownloadStatus::Paused).await;
+        h.queue.enqueue(vec![queued_record("7")]).unwrap();
+        h.started.recv().await.unwrap();
+        assert_eq!(
+            h.row("7").await.unwrap().status,
+            DownloadStatus::Downloading
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_should_stick_while_the_fetch_winds_down() {
+        let mut h = harness(2);
+        let mut events = h.queue.events();
+        h.queue.enqueue(vec![queued_record("7")]).unwrap();
+        h.started.recv().await.unwrap();
+        h.queue.pause("7").unwrap();
+        wait_status(&mut events, "7", DownloadStatus::Paused).await;
+        // Longer than the downloader needs to stop.
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        assert_eq!(h.row("7").await.unwrap().status, DownloadStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_a_redownload_should_keep_the_complete_file() {
+        let mut h = harness(2);
+        let path = h.with_file("7").await;
+        let mut events = h.queue.events();
+        h.queue.enqueue(vec![redownload("7")]).unwrap();
+        h.started.recv().await.unwrap();
+        h.queue.cancel("7").unwrap();
+        wait_removed(&mut events, "7").await;
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+        let recorded = h.storage.track_audio_files("7").await.unwrap();
+        assert_eq!(
+            (std::fs::read(&path).unwrap(), recorded.len()),
+            (b"old".to_vec(), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_downloads_should_delete_a_file_that_finished_while_cancelling() {
+        let mut h = harness(1);
+        h.complete_after_cancel.store(true, Ordering::SeqCst);
+        h.storage
+            .upsert_track(crate::storage::Track::minimal("4", "Song", "Artist"))
+            .await
+            .unwrap();
+        h.storage
+            .pin_downloads(Some("p.a"), ids(&["4"]))
+            .await
+            .unwrap();
+        h.queue.enqueue(vec![queued_record("4")]).unwrap();
+        h.started.recv().await.unwrap();
+
+        // The cancelled fetch still saves its file; the removal must wait for
+        // that and delete it, instead of the worker recording it afterwards.
+        h.queue
+            .remove_downloads(Some("p.a"), ids(&["4"]))
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+        assert!(!h.dir.path().join("4.m4a").exists());
+        assert_eq!(h.storage.track_audio_files("4").await.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn redownload_merged_while_finishing_should_run_the_worker_again() {
+        let flags = WorkerFlags::new(false);
+        assert!(matches!(after_finish(true, &flags), AttemptEnd::Finished));
+        // Merged after the first check, while the row was being finished.
+        flags.upgraded.store(true, Ordering::SeqCst);
+        assert!(matches!(after_finish(true, &flags), AttemptEnd::Again));
+        assert!(matches!(after_finish(true, &flags), AttemptEnd::Finished));
+        // Nothing was skipped: every mix is fresh, nothing to replace.
+        flags.upgraded.store(true, Ordering::SeqCst);
+        assert!(matches!(after_finish(false, &flags), AttemptEnd::Finished));
+    }
+
+    #[tokio::test]
+    async fn shutdown_should_stop_running_workers_and_keep_their_rows() {
+        let mut h = harness(1);
+        h.queue.enqueue(vec![queued_record("6")]).unwrap();
+        h.started.recv().await.unwrap();
+
+        h.queue.shutdown(StdDuration::from_secs(5)).await;
+
+        assert_eq!(
+            h.in_flight.load(Ordering::SeqCst),
+            0,
+            "no fetch is left running"
+        );
+        assert_eq!(
+            h.row("6").await.map(|row| row.status),
+            Some(DownloadStatus::Downloading),
+            "the next queue resumes the row"
+        );
+        assert!(h.queue.enqueue(vec![queued_record("7")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_should_remove_every_unfinished_row_and_keep_done_ones() {
+        let mut h = harness(1);
+        let mut done = queued_record("9");
+        done.status = DownloadStatus::Done;
+        h.storage.upsert_download(done).await.unwrap();
+        h.queue
+            .enqueue(vec![queued_record("1"), queued_record("2")])
+            .unwrap();
+        h.started.recv().await.unwrap();
+        h.queue.pause("2").unwrap();
+        h.queue.cancel_all().unwrap();
+        h.settle().await;
+        let left: Vec<String> = h
+            .storage
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(left, ["9"]);
+    }
+
+    #[tokio::test]
+    async fn cancel_should_release_the_pins_of_a_song_with_no_audio_but_keep_a_kept_collection() {
+        let h = harness(1);
+        h.storage
+            .register_download_collection(
+                crate::storage::DownloadCollection {
+                    owner: "p.keep".to_owned(),
+                    filter: crate::storage::LibraryFilter::AppleMusic,
+                    kind: DownloadSourceKind::Playlist,
+                    name: "Kept".to_owned(),
+                    keep: false,
+                },
+                Some(true),
+            )
+            .await
+            .unwrap();
+        h.storage
+            .pin_downloads(Some("p.keep"), ids(&["7"]))
+            .await
+            .unwrap();
+        h.storage
+            .pin_downloads(Some("p.other"), ids(&["7"]))
+            .await
+            .unwrap();
+        h.queue.enqueue(vec![queued_record("7")]).unwrap();
+        h.queue.cancel("7").unwrap();
+        h.settle().await;
+        assert_eq!(h.storage.download_owners("7").await.unwrap(), ["p.keep"]);
+    }
+
+    #[tokio::test]
+    async fn stale_worker_writes_should_be_dropped() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_download(queued_record("7")).await.unwrap();
+        let written = storage
+            .update_download_status_if("7", DownloadStatus::Downloading, 0.5, None, || false)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                written,
+                storage.get_download("7").await.unwrap().unwrap().status
+            ),
+            (false, DownloadStatus::Queued)
+        );
+    }
+
+    /// A store with stereo files for songs `1`..=`4` in `media/`, where `1`
+    /// is pinned on its own, `2` by the downloaded playlist `p.1` (of which
+    /// it is still a member), `3` by `p.1` but no longer in it, and `4` has
+    /// no pin. A custom song plays `4`'s file by reference only when
+    /// `reference` is set.
+    async fn unlinked_store(reference: bool) -> (Storage, DownloadQueue, tempfile::TempDir) {
+        let (storage, queue, dir) = queue_with_files(&["1", "2", "3", "4"]).await;
+        storage.pin_downloads(None, ids(&["1"])).await.unwrap();
+        storage
+            .pin_downloads(Some("p.1"), ids(&["2", "3"]))
+            .await
+            .unwrap();
+        storage
+            .register_download_collection(
+                crate::storage::DownloadCollection {
+                    owner: "p.1".to_owned(),
+                    filter: crate::storage::LibraryFilter::AppleMusic,
+                    kind: DownloadSourceKind::Playlist,
+                    name: "List".to_owned(),
+                    keep: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO library_collections (id, kind, position, name, synced_at)
+                       VALUES ('p.1', 'playlist', 0, 'List', 1);
+                     INSERT INTO library_collection_tracks (collection_id, position, track_id)
+                       VALUES ('p.1', 0, '2');",
+                )?;
+                if reference {
+                    c.execute_batch(
+                        "INSERT INTO tracks (id, title, artist, is_custom, audio_mode,
+                                             reference_track_id, updated_at)
+                           VALUES ('local-1', 'Mine', 'Me', 1, 'reference', '4', 1);",
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (storage, queue, dir)
+    }
+
+    #[tokio::test]
+    async fn unlinked_downloads_should_count_unpinned_and_stale_files() {
+        let (storage, _queue, dir) = unlinked_store(false).await;
+        let (files, report) = crate::download_cleanup::unlinked_downloads(&storage, dir.path())
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = files.into_iter().flat_map(|f| f.keys).collect();
+        keys.sort();
+        assert_eq!((keys, report.bytes), (ids(&["3", "4"]), 2));
+    }
+
+    #[tokio::test]
+    async fn clean_up_should_delete_only_unlinked_files() {
+        let (storage, queue, dir) = unlinked_store(true).await;
+        let report = queue.clean_up_unlinked().await.unwrap();
+        let on_disk: Vec<bool> = ["1", "2", "3", "4"]
+            .iter()
+            .map(|id| dir.path().join(format!("{id}.m4a")).exists())
+            .collect();
+        assert_eq!(
+            (report.files, on_disk),
+            (1, vec![true, true, false, true]),
+            "3 left its playlist; 4 is played by a custom song"
+        );
+        assert_eq!(storage.track_audio_files("3").await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn clean_up_should_drop_the_stale_pin() {
+        let (storage, queue, _dir) = unlinked_store(false).await;
+        queue.clean_up_unlinked().await.unwrap();
+        assert_eq!(storage.download_owners("3").await.unwrap().len(), 0);
+    }
+
+    fn done_record(id: &str, track_id: &str) -> DownloadRecord {
+        DownloadRecord {
+            id: id.into(),
+            track_id: track_id.into(),
+            status: DownloadStatus::Done,
+            progress: 1.0,
+            ..queued_record(id)
+        }
+    }
+
+    async fn row_ids(storage: &Storage) -> Vec<String> {
+        let mut ids: Vec<String> = storage
+            .list_downloads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn clean_up_should_delete_the_finished_rows_of_deleted_songs() {
+        let (storage, queue, _dir) = unlinked_store(false).await;
+        for (id, track) in [("1", "1"), ("3", "3"), ("old.3", "3")] {
+            storage
+                .upsert_download(done_record(id, track))
+                .await
+                .unwrap();
+        }
+        queue.clean_up_unlinked().await.unwrap();
+        assert_eq!(row_ids(&storage).await, ids(&["1"]));
+    }
+
+    #[tokio::test]
+    async fn removing_a_collection_should_delete_every_row_of_its_deleted_songs() {
+        let (storage, queue, _dir) = queue_with_files(&["1", "2"]).await;
+        storage
+            .pin_downloads(Some("p.a"), ids(&["1", "2"]))
+            .await
+            .unwrap();
+        storage
+            .pin_downloads(Some("p.b"), ids(&["2"]))
+            .await
+            .unwrap();
+        for (id, track) in [("1", "1"), ("old.1", "1"), ("2", "2")] {
+            storage
+                .upsert_download(done_record(id, track))
+                .await
+                .unwrap();
+        }
+        queue
+            .remove_downloads(Some("p.a"), ids(&["1", "2"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            row_ids(&storage).await,
+            ids(&["2"]),
+            "the shared song keeps its file and its row"
+        );
+    }
+
+    #[tokio::test]
+    async fn kept_collection_should_queue_only_songs_added_since() {
+        let (storage, queue, _dir) = queue_with_files(&[]).await;
+        storage
+            .register_download_collection(
+                crate::storage::DownloadCollection {
+                    owner: "p.1".to_owned(),
+                    filter: crate::storage::LibraryFilter::AppleMusic,
+                    kind: DownloadSourceKind::Playlist,
+                    name: "List".to_owned(),
+                    keep: false,
+                },
+                Some(true),
+            )
+            .await
+            .unwrap();
+        for id in ["1", "2"] {
+            storage
+                .upsert_track(crate::storage::Track::minimal(id, "Song", "Artist"))
+                .await
+                .unwrap();
+        }
+        storage
+            .pin_downloads(Some("p.1"), ids(&["1"]))
+            .await
+            .unwrap();
+        storage
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO library_collections (id, kind, position, name, synced_at)
+                       VALUES ('p.1', 'playlist', 0, 'List', 1);
+                     INSERT INTO library_collection_tracks (collection_id, position, track_id)
+                       VALUES ('p.1', 0, '1'), ('p.1', 1, '2');",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let queued = queue_kept_collections(&storage, &queue).await.unwrap();
+        assert_eq!(
+            (queued, storage.download_owners("2").await.unwrap()),
+            (1, vec!["p.1".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_preview_should_list_shared_songs_as_kept() {
+        let (storage, _queue, _dir) = queue_with_files(&["1", "2", "3"]).await;
+        storage
+            .pin_downloads(Some("p.a"), ids(&["1", "2", "3", "4"]))
+            .await
+            .unwrap();
+        storage
+            .pin_downloads(Some("p.b"), ids(&["2"]))
+            .await
+            .unwrap();
+        storage.pin_downloads(None, ids(&["3"])).await.unwrap();
+        assert_eq!(
+            storage
+                .download_removal_preview("p.a", ids(&["1", "2", "3", "4"]))
+                .await
+                .unwrap(),
+            crate::storage::RemovalPreview {
+                deleted: ids(&["1"]),
+                kept: ids(&["2", "3"]),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_collection_download_should_forget_the_collection() {
+        let (storage, queue, _dir) = unlinked_store(false).await;
+        queue
+            .remove_downloads(Some("p.1"), ids(&["2", "3"]))
+            .await
+            .unwrap();
+        assert_eq!(storage.download_collections().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn old_partial_files_should_be_deleted_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join(".tmpAbC123");
+        let song = dir.path().join("1.m4a");
+        std::fs::write(&partial, b"half").unwrap();
+        std::fs::write(&song, b"whole").unwrap();
+        let old = std::time::SystemTime::now() - StdDuration::from_secs(3_600);
+        std::fs::File::options()
+            .write(true)
+            .open(&partial)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        delete_stale_temp_files(dir.path()).await;
+        assert_eq!((partial.exists(), song.exists()), (false, true));
     }
 }

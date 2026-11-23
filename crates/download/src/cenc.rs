@@ -4,6 +4,12 @@
 //! encryption, which is what Apple Music uses for the `28:ctrp256` flavor,
 //! and AES-128-CBC with pattern encryption (`cbcs` scheme).
 //!
+//! A file may carry several protected sample entries, each with its own
+//! `tenc` (Apple's enhancedHls / spatial streams have two: one per content
+//! key, with different constant IVs). Each `traf` picks its entry through
+//! `tfhd.sample_description_index` (falling back to the `trex` default), and
+//! [`ContentKeys`] supplies the key per sample description.
+//!
 //! The box parser follows "parse, don't validate": every malformed length is
 //! reported as a [`DrmError::Decrypt`] at the single point of reading
 //! ([`read_box`]). Callers higher up — [`decrypt`] and its helpers — then
@@ -54,13 +60,20 @@ const VISUAL_SAMPLE_ENTRY_PRELUDE: usize = 78;
 
 /// A located MP4 box (offset + size in the file buffer).
 #[derive(Debug, Clone, Copy)]
-struct BoxRef {
+pub(crate) struct BoxRef {
     /// Offset of the box header in the buffer.
-    offset: usize,
+    pub(crate) offset: usize,
     /// Total box size (header + payload).
-    size: usize,
+    pub(crate) size: usize,
     /// Offset of the payload (after header).
-    payload: usize,
+    pub(crate) payload: usize,
+}
+
+impl BoxRef {
+    /// Offset just past the box.
+    pub(crate) fn end(self) -> usize {
+        self.offset + self.size
+    }
 }
 
 /// Reads a box header at `offset`.
@@ -76,7 +89,7 @@ struct BoxRef {
 ///
 /// Sizes in `2..=7` and sizes that would run past the end of `data` are
 /// rejected.
-fn read_box(data: &[u8], offset: usize) -> Result<Option<([u8; 4], BoxRef)>, DrmError> {
+pub(crate) fn read_box(data: &[u8], offset: usize) -> Result<Option<([u8; 4], BoxRef)>, DrmError> {
     if offset == data.len() {
         return Ok(None);
     }
@@ -165,7 +178,7 @@ fn read_box(data: &[u8], offset: usize) -> Result<Option<([u8; 4], BoxRef)>, Drm
 }
 
 /// Payload of a full box (version + flags), returning `(version, flags, body_offset)`.
-fn full_box_header(data: &[u8], bref: BoxRef) -> Option<(u8, u32, usize)> {
+pub(crate) fn full_box_header(data: &[u8], bref: BoxRef) -> Option<(u8, u32, usize)> {
     let p = bref.payload;
     if p + 4 > data.len() {
         return None;
@@ -176,7 +189,7 @@ fn full_box_header(data: &[u8], bref: BoxRef) -> Option<(u8, u32, usize)> {
 }
 
 /// Finds the first box of `target` type in `data[start..end]`.
-fn find_box(
+pub(crate) fn find_box(
     data: &[u8],
     start: usize,
     end: usize,
@@ -206,7 +219,7 @@ fn find_box(
 }
 
 /// Descends into nested boxes along `path`, returning the innermost box.
-fn find_box_path(
+pub(crate) fn find_box_path(
     data: &[u8],
     start: usize,
     end: usize,
@@ -336,19 +349,26 @@ fn parse_schm_scheme_type(data: &[u8], bref: BoxRef) -> Result<[u8; 4], DrmError
 
 /// Fields of the `tfhd` box relevant to CENC decryption.
 #[derive(Debug, Clone, Copy)]
-struct TrackFragmentHeader {
+pub(crate) struct TrackFragmentHeader {
     /// `track_ID`; keys the per-track timeline rebase
     /// ([`rebase_fragment_times`]).
-    track_id: u32,
+    pub(crate) track_id: u32,
+    /// Flag 0x000002: the fragment's sample entry (1-based), overriding the
+    /// `trex` default.
+    pub(crate) sample_description_index: Option<u32>,
+    /// Flag 0x000008: per-sample duration when `trun` omits durations.
+    pub(crate) default_sample_duration: Option<u32>,
     /// Per-sample default when `trun` omits per-sample sizes (flag 0x200).
-    default_sample_size: Option<u32>,
+    pub(crate) default_sample_size: Option<u32>,
     /// Flag 0x020000: when set, sample-data base = this `moof`'s start.
-    default_base_is_moof: bool,
+    pub(crate) default_base_is_moof: bool,
     /// Flag 0x000001: explicit base-data-offset (overrides `default-base-is-moof`).
-    base_data_offset: Option<u64>,
+    pub(crate) base_data_offset: Option<u64>,
+    /// Buffer offset of the `base_data_offset` field, when present.
+    pub(crate) base_data_offset_at: Option<usize>,
 }
 
-fn parse_tfhd(data: &[u8], bref: BoxRef) -> Result<TrackFragmentHeader, DrmError> {
+pub(crate) fn parse_tfhd(data: &[u8], bref: BoxRef) -> Result<TrackFragmentHeader, DrmError> {
     let (_, flags, body) = full_box_header(data, bref)
         .ok_or_else(|| DrmError::Decrypt("tfhd: truncated full-box header".into()))?;
 
@@ -358,6 +378,7 @@ fn parse_tfhd(data: &[u8], bref: BoxRef) -> Result<TrackFragmentHeader, DrmError
     let track_id = u32::from_be_bytes([data[body], data[body + 1], data[body + 2], data[body + 3]]);
     let mut off = body + 4;
 
+    let base_data_offset_at = (flags & 0x0000_0001 != 0).then_some(off);
     let base_data_offset = if flags & 0x0000_0001 != 0 {
         if off + 8 > data.len() {
             return Err(DrmError::Decrypt("tfhd: truncated base_data_offset".into()));
@@ -378,25 +399,31 @@ fn parse_tfhd(data: &[u8], bref: BoxRef) -> Result<TrackFragmentHeader, DrmError
         None
     };
 
-    // sample_description_index
-    if flags & 0x0000_0002 != 0 {
+    let sample_description_index = if flags & 0x0000_0002 != 0 {
         if off + 4 > data.len() {
             return Err(DrmError::Decrypt(
                 "tfhd: truncated sample_description_index".into(),
             ));
         }
+        let v = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         off += 4;
-    }
+        Some(v)
+    } else {
+        None
+    };
 
-    // default_sample_duration
-    if flags & 0x0000_0008 != 0 {
+    let default_sample_duration = if flags & 0x0000_0008 != 0 {
         if off + 4 > data.len() {
             return Err(DrmError::Decrypt(
                 "tfhd: truncated default_sample_duration".into(),
             ));
         }
+        let v = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         off += 4;
-    }
+        Some(v)
+    } else {
+        None
+    };
 
     let default_sample_size = if flags & 0x0000_0010 != 0 {
         if off + 4 > data.len() {
@@ -420,23 +447,86 @@ fn parse_tfhd(data: &[u8], bref: BoxRef) -> Result<TrackFragmentHeader, DrmError
 
     Ok(TrackFragmentHeader {
         track_id,
+        sample_description_index,
+        default_sample_duration,
         default_sample_size,
         default_base_is_moof: flags & 0x0002_0000 != 0,
         base_data_offset,
+        base_data_offset_at,
     })
+}
+
+/// Per-track fragment defaults from `moov/mvex/trex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrackExtends {
+    pub(crate) track_id: u32,
+    pub(crate) default_sample_description_index: u32,
+    pub(crate) default_sample_duration: u32,
+}
+
+/// Every `moov/mvex/trex` in `buf` (empty when there is no `mvex`).
+pub(crate) fn read_trex(buf: &[u8]) -> Result<Vec<TrackExtends>, DrmError> {
+    let Some(mvex) = find_box_path(buf, 0, buf.len(), &[*b"moov", *b"mvex"])? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut pos = mvex.payload;
+    while pos < mvex.end() {
+        let Some((t, b)) = read_box(buf, pos)? else {
+            break;
+        };
+        pos = b.end();
+        if t != *b"trex" {
+            continue;
+        }
+        let (_, _, body) = full_box_header(buf, b)
+            .ok_or_else(|| DrmError::Decrypt("trex: truncated full-box header".into()))?;
+        if body + 12 > b.end() {
+            return Err(DrmError::Decrypt("trex: truncated body".into()));
+        }
+        let word = |at: usize| u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+        out.push(TrackExtends {
+            track_id: word(body),
+            default_sample_description_index: word(body + 4),
+            default_sample_duration: word(body + 8),
+        });
+    }
+    Ok(out)
+}
+
+/// The sample entry (1-based) a `traf` uses: its own `tfhd` index, else the
+/// track's `trex` default, else 1.
+fn sample_description_index(tfhd: &TrackFragmentHeader, trex: &[TrackExtends]) -> u32 {
+    tfhd.sample_description_index
+        .or_else(|| {
+            trex.iter()
+                .find(|t| t.track_id == tfhd.track_id)
+                .map(|t| t.default_sample_description_index)
+        })
+        .filter(|&index| index > 0)
+        .unwrap_or(1)
 }
 
 /// Fields of the `trun` box relevant to CENC decryption.
 #[derive(Debug, Clone)]
-struct TrackRunInfo {
+pub(crate) struct TrackRunInfo {
     /// Flag 0x1: signed offset relative to the fragment's base-data location.
     data_offset: Option<i32>,
     /// Per-sample sizes, filled either from trun (flag 0x200) or from `tfhd`'s
     /// `default_sample_size`.
     sizes: Vec<u32>,
+    /// Per-sample durations when the run carries them (flag 0x100).
+    pub(crate) durations: Option<Vec<u32>>,
 }
 
-fn parse_trun(
+impl TrackRunInfo {
+    /// Number of samples in the run.
+    pub(crate) fn sample_count(&self) -> usize {
+        self.sizes.len()
+    }
+}
+
+pub(crate) fn parse_trun(
     data: &[u8],
     bref: BoxRef,
     tfhd_default_sample_size: Option<u32>,
@@ -487,10 +577,25 @@ fn parse_trun(
     if off + total_bytes > data.len() {
         return Err(DrmError::Decrypt("trun: truncated sample run".into()));
     }
+    // Every sample has at least one byte of media in this segment, so a
+    // larger count is corrupt; checking it also bounds the allocations below
+    // when the run stores no per-sample fields (`total_bytes` is then 0).
+    if sample_count > data.len() {
+        return Err(DrmError::Decrypt(
+            "trun: more samples than the segment has bytes".into(),
+        ));
+    }
 
     let mut sizes = Vec::with_capacity(sample_count);
+    let mut durations = has_duration.then(|| Vec::with_capacity(sample_count));
     for _ in 0..sample_count {
-        if has_duration {
+        if let Some(durations) = durations.as_mut() {
+            durations.push(u32::from_be_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+            ]));
             off += 4;
         }
         let size = if has_size {
@@ -513,7 +618,11 @@ fn parse_trun(
         sizes.push(size);
     }
 
-    Ok(TrackRunInfo { data_offset, sizes })
+    Ok(TrackRunInfo {
+        data_offset,
+        sizes,
+        durations,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -538,6 +647,13 @@ fn parse_senc(
     let iv_size = usize::from(default_iv_size);
 
     let mut off = body + 4;
+    // As in `trun`: more samples than the segment has bytes is corrupt, and
+    // the count must not size an allocation unchecked.
+    if sample_count > data.len() {
+        return Err(DrmError::Decrypt(
+            "senc: more samples than the segment has bytes".into(),
+        ));
+    }
     let mut entries = Vec::with_capacity(sample_count);
 
     for _ in 0..sample_count {
@@ -582,43 +698,128 @@ fn parse_senc(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// The AES-128 content keys for a file, by sample description.
+///
+/// Apple's normal streams use one key for the whole file
+/// ([`single`](Self::single)). Spatial streams use one key per key group,
+/// and each group's fragments reference their own sample entry
+/// ([`by_sample_description`](Self::by_sample_description)). The `tenc`
+/// `default_KID` is all zeros there, so keys cannot be chosen by KID.
+#[derive(Clone)]
+pub struct ContentKeys {
+    /// Key for every sample description (normal streams).
+    all: Option<[u8; 16]>,
+    /// Key per 1-based sample description index.
+    by_index: Vec<(u32, [u8; 16])>,
+}
+
+impl ContentKeys {
+    /// One key for every sample description.
+    pub fn single(key: [u8; 16]) -> Self {
+        Self {
+            all: Some(key),
+            by_index: Vec::new(),
+        }
+    }
+
+    /// One key per 1-based sample description index.
+    pub fn by_sample_description(keys: impl IntoIterator<Item = (u32, [u8; 16])>) -> Self {
+        Self {
+            all: None,
+            by_index: keys.into_iter().collect(),
+        }
+    }
+
+    fn key_for(&self, index: u32) -> Result<&[u8; 16], DrmError> {
+        self.all
+            .as_ref()
+            .or_else(|| {
+                self.by_index
+                    .iter()
+                    .find(|(i, _)| *i == index)
+                    .map(|(_, key)| key)
+            })
+            .ok_or_else(|| {
+                DrmError::Decrypt(format!("no content key for sample description {index}"))
+            })
+    }
+}
+
+impl std::fmt::Debug for ContentKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let indices: Vec<u32> = self.by_index.iter().map(|(i, _)| *i).collect();
+        f.debug_struct("ContentKeys")
+            .field("single", &self.all.is_some())
+            .field("sample_descriptions", &indices)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Converts a license's content key into the 16-byte form [`ContentKeys`]
+/// takes.
+///
+/// # Errors
+///
+/// [`DrmError::Decrypt`] when the key is not 16 bytes.
+pub fn content_key(key: &[u8]) -> Result<[u8; 16], DrmError> {
+    key.try_into()
+        .map_err(|_| DrmError::Decrypt("content key must be 16 bytes".into()))
+}
+
+/// The sample description (1-based) each `moof` in `buf` uses, as
+/// `(moof offset, index)` in file order: the first `traf`'s
+/// `tfhd.sample_description_index`, else the `trex` default, else 1.
+///
+/// # Errors
+///
+/// [`DrmError::Decrypt`] for malformed boxes.
+pub fn fragment_sample_descriptions(buf: &[u8]) -> Result<Vec<(usize, u32)>, DrmError> {
+    let trex = read_trex(buf)?;
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some((t, moof)) = read_box(buf, pos)? {
+        pos = moof.end();
+        if t != *b"moof" {
+            continue;
+        }
+        let Some(traf) = find_box(buf, moof.payload, moof.end(), *b"traf")? else {
+            continue;
+        };
+        let tfhd = find_box(buf, traf.payload, traf.end(), *b"tfhd")?
+            .ok_or_else(|| DrmError::Decrypt("traf missing tfhd".into()))?;
+        let tfhd = parse_tfhd(buf, tfhd)?;
+        out.push((moof.offset, sample_description_index(&tfhd, &trex)));
+    }
+    Ok(out)
+}
+
 /// Decrypts a CENC-encrypted MP4 in memory and returns the decrypted bytes.
 ///
-/// The returned buffer has the protected sample entry (`enca`) rewritten to
-/// `mp4a` and the protection sub-boxes (`sinf` inside the sample entry,
+/// Every protected sample entry (`enca` / `encv`) is rewritten to `mp4a` /
+/// `mp4v` and the protection sub-boxes (`sinf` inside the sample entries,
 /// `senc` / `saiz` / `saio` inside each `traf`) renamed to `free` so players
 /// treat the file as unencrypted. Fragment decode times are rebased so each
 /// track starts at 0 ([`rebase_fragment_times`]).
 ///
+/// Each `traf` is decrypted with the `tenc` of the sample entry it
+/// references and the key `keys` holds for that entry.
+///
 /// Returns [`DrmError::Decrypt`] (variant message) for:
 /// * missing or malformed `sinf` / `schm` / `tenc`;
 /// * any scheme other than `cenc` or `cbcs`;
-/// * a `moof` that contains `senc` but cannot be fully decrypted;
+/// * a `moof` that contains `senc` but cannot be fully decrypted, or whose
+///   sample entry is unprotected or has no key;
 /// * malformed MP4 box sizes anywhere in the file.
-pub fn decrypt(data: Vec<u8>, _key_id: &[u8], content_key: &[u8]) -> Result<Vec<u8>, DrmError> {
+pub fn decrypt(data: Vec<u8>, keys: &ContentKeys) -> Result<Vec<u8>, DrmError> {
     // Take ownership so the AES-CTR / AES-CBC passes rewrite the original
     // buffer in place — one fewer full-file copy per song.
     let mut buf = data;
 
-    // 1. Parse encryption metadata from moov/.../stsd/<sample_entry>/sinf.
-    let (scheme_type, tenc) = read_encryption_params(&buf)?;
+    // 1. Parse the encryption metadata of every sample entry in
+    //    moov/.../stsd, and the trex defaults.
+    let protection = read_protection(&buf)?;
 
-    // 2. Pick the cipher scheme. `cenc` is AES-CTR; `cbcs` is AES-CBC with
-    //    sample-based pattern encryption (ISO/IEC 23001-7 clauses 10.1 / 10.4).
-    let scheme = match &scheme_type {
-        b"cenc" => Scheme::Cenc,
-        b"cbcs" => Scheme::Cbcs,
-        _ => {
-            let name = String::from_utf8_lossy(&scheme_type).into_owned();
-            return Err(DrmError::Decrypt(format!("unsupported scheme: {name}")));
-        }
-    };
-
-    let key: &[u8; 16] = content_key
-        .try_into()
-        .map_err(|_| DrmError::Decrypt("content key must be 16 bytes".into()))?;
-
-    // 3. Decrypt every `moof`'s encrypted traf in place. Any malformed metadata
+    // 2. Decrypt every `moof`'s encrypted traf in place. Any malformed metadata
     //    in an encrypted track becomes an error — no silent "oops still
     //    encrypted" output.
     let mut pos = 0;
@@ -627,17 +828,17 @@ pub fn decrypt(data: Vec<u8>, _key_id: &[u8], content_key: &[u8]) -> Result<Vec<
             break;
         };
         if t == *b"moof" {
-            decrypt_moof(&mut buf, b, &tenc, key, scheme)?;
+            decrypt_moof(&mut buf, b, &protection, keys)?;
         }
         pos = b.offset + b.size;
     }
 
-    // 4. Neutralize protection markers: rewrite enca -> mp4a in stsd,
+    // 3. Neutralize protection markers: rewrite enca -> mp4a in stsd,
     //    rename sinf/senc/saiz/saio -> free purely through structural walks
     //    so byte sequences inside mdat are never touched.
     neutralize_protection(&mut buf)?;
 
-    // 5. Start the media timeline at 0. Music-video audio keeps the video's
+    // 4. Start the media timeline at 0. Music-video audio keeps the video's
     //    start offset (about 10 s), which players would otherwise play as
     //    leading silence or show as a wrong duration.
     rebase_fragment_times(&mut buf)?;
@@ -732,8 +933,53 @@ fn rebase_traf_time(
     Ok(())
 }
 
-/// Walks `moov` to find the `(scheme_type, tenc)` for the protected track.
-fn read_encryption_params(buf: &[u8]) -> Result<([u8; 4], TrackEncryption), DrmError> {
+/// How one protected sample entry is encrypted.
+#[derive(Debug, Clone)]
+struct EntryProtection {
+    scheme: Scheme,
+    tenc: TrackEncryption,
+}
+
+/// The encryption metadata of a file.
+#[derive(Debug, Clone)]
+struct Protection {
+    /// Per sample entry of the protected track's `stsd`, in order (index 0 is
+    /// sample description 1); `None` for an unprotected entry.
+    entries: Vec<Option<EntryProtection>>,
+    /// The `trex` defaults, for fragments without a
+    /// `tfhd.sample_description_index`.
+    trex: Vec<TrackExtends>,
+}
+
+impl Protection {
+    fn entry(&self, index: u32) -> Result<&EntryProtection, DrmError> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| self.entries.get(i))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                DrmError::Decrypt(format!(
+                    "encrypted fragment uses sample description {index}, which is not protected"
+                ))
+            })
+    }
+}
+
+fn parse_scheme(scheme_type: [u8; 4]) -> Result<Scheme, DrmError> {
+    match &scheme_type {
+        b"cenc" => Ok(Scheme::Cenc),
+        b"cbcs" => Ok(Scheme::Cbcs),
+        _ => {
+            let name = String::from_utf8_lossy(&scheme_type).into_owned();
+            Err(DrmError::Decrypt(format!("unsupported scheme: {name}")))
+        }
+    }
+}
+
+/// Walks `moov` to find the scheme and `tenc` of every protected sample
+/// entry, plus the `trex` defaults.
+fn read_protection(buf: &[u8]) -> Result<Protection, DrmError> {
     let stsd = find_box_path(
         buf,
         0,
@@ -749,7 +995,8 @@ fn read_encryption_params(buf: &[u8]) -> Result<([u8; 4], TrackEncryption), DrmE
     let entries_start = stsd.payload + 8;
     let stsd_end = stsd.offset + stsd.size;
 
-    // Walk sample entries looking for a protected one (`enca` or `encv`).
+    // Walk every sample entry; protected ones are `enca` or `encv`.
+    let mut entries = Vec::new();
     let mut pos = entries_start;
     while pos < stsd_end {
         let Some((entry_type, entry)) = read_box(buf, pos)? else {
@@ -760,6 +1007,7 @@ fn read_encryption_params(buf: &[u8]) -> Result<([u8; 4], TrackEncryption), DrmE
             b"encv" => Some(VISUAL_SAMPLE_ENTRY_PRELUDE),
             _ => None,
         };
+        let mut protection = None;
         if let Some(prelude) = prelude {
             let child_start = entry
                 .payload
@@ -779,24 +1027,33 @@ fn read_encryption_params(buf: &[u8]) -> Result<([u8; 4], TrackEncryption), DrmE
                 let tenc_bref = find_box_path(buf, sinf.payload, sinf_end, &[*b"schi", *b"tenc"])?
                     .ok_or_else(|| DrmError::Decrypt("sinf missing schi/tenc".into()))?;
                 let tenc = parse_tenc(buf, tenc_bref)?;
-                return Ok((scheme_type, tenc));
+                protection = Some(EntryProtection {
+                    scheme: parse_scheme(scheme_type)?,
+                    tenc,
+                });
             }
         }
+        entries.push(protection);
         pos = entry.offset + entry.size;
     }
 
-    Err(DrmError::Decrypt(
-        "stsd has no protected sample entry with a sinf".into(),
-    ))
+    if entries.iter().all(Option::is_none) {
+        return Err(DrmError::Decrypt(
+            "stsd has no protected sample entry with a sinf".into(),
+        ));
+    }
+    Ok(Protection {
+        entries,
+        trex: read_trex(buf)?,
+    })
 }
 
 /// Decrypts every encrypted `traf` inside this `moof`.
 fn decrypt_moof(
     buf: &mut [u8],
     moof: BoxRef,
-    tenc: &TrackEncryption,
-    key: &[u8; 16],
-    scheme: Scheme,
+    protection: &Protection,
+    keys: &ContentKeys,
 ) -> Result<(), DrmError> {
     let moof_end = moof.offset + moof.size;
     let mut pos = moof.payload;
@@ -805,7 +1062,7 @@ fn decrypt_moof(
             break;
         };
         if t == *b"traf" {
-            decrypt_traf(buf, moof, b, tenc, key, scheme)?;
+            decrypt_traf(buf, moof, b, protection, keys)?;
         }
         pos = b.offset + b.size;
     }
@@ -821,9 +1078,8 @@ fn decrypt_traf(
     buf: &mut [u8],
     moof: BoxRef,
     traf: BoxRef,
-    tenc: &TrackEncryption,
-    key: &[u8; 16],
-    scheme: Scheme,
+    protection: &Protection,
+    keys: &ContentKeys,
 ) -> Result<(), DrmError> {
     let traf_end = traf.offset + traf.size;
 
@@ -838,6 +1094,14 @@ fn decrypt_traf(
 
     // Once senc is present, every downstream failure must bubble up.
     //
+    // The fragment's sample entry decides the scheme, the `tenc` (IV and
+    // pattern) and the key.
+    let index = sample_description_index(&tfhd, &protection.trex);
+    let entry = protection.entry(index)?;
+    let (scheme, tenc) = (entry.scheme, &entry.tenc);
+    let key = keys.key_for(index)?;
+    //
+
     // A `traf` may hold several `trun`s (Apple's music-video audio packs ~6 s
     // of AAC as four runs of ~70 samples). `senc` describes every sample of
     // the `traf` in order, so the runs are concatenated before pairing.
@@ -1565,7 +1829,7 @@ mod tests {
     fn decrypt_rejects_unsupported_scheme_cens() {
         let stsd = mk_stsd(*b"cens", 8);
         let moov = mk_moov_with_stsd(&stsd);
-        let err = decrypt(moov, &[], &[0u8; 16]);
+        let err = decrypt(moov, &ContentKeys::single([0u8; 16]));
         match err {
             Err(DrmError::Decrypt(msg)) => assert!(msg.contains("cens"), "got: {msg}"),
             other => panic!("expected Decrypt error, got {other:?}"),
@@ -1589,7 +1853,7 @@ mod tests {
         stsd_body.extend_from_slice(&enca);
         let stsd = mk_full_box(*b"stsd", 0, 0, &stsd_body);
         let moov = mk_moov_with_stsd(&stsd);
-        match decrypt(moov, &[], &[0u8; 16]) {
+        match decrypt(moov, &ContentKeys::single([0u8; 16])) {
             Err(DrmError::Decrypt(msg)) => assert!(msg.contains("schm"), "got: {msg}"),
             other => panic!("expected Decrypt(missing schm), got {other:?}"),
         }
@@ -1672,6 +1936,24 @@ mod tests {
         let info = parse_trun(&trun_box, bref, Some(100)).unwrap();
         assert_eq!(info.data_offset, Some(64));
         assert_eq!(info.sizes, vec![100, 100, 100]);
+    }
+
+    #[test]
+    fn parse_trun_and_senc_should_reject_a_huge_sample_count_without_allocating() {
+        // No per-sample fields: the run's size check passes for any count, so
+        // only the count check stops a 4-billion-entry allocation.
+        let trun_box = mk_full_box(*b"trun", 0, 0, &u32::MAX.to_be_bytes());
+        let (_, bref) = read_box(&trun_box, 0).unwrap().unwrap();
+        assert!(matches!(
+            parse_trun(&trun_box, bref, Some(100)),
+            Err(DrmError::Decrypt(_))
+        ));
+        let senc_box = mk_full_box(*b"senc", 0, 0, &u32::MAX.to_be_bytes());
+        let (_, bref) = read_box(&senc_box, 0).unwrap().unwrap();
+        assert!(matches!(
+            parse_senc(&senc_box, bref, 0),
+            Err(DrmError::Decrypt(_))
+        ));
     }
 
     #[test]
@@ -1835,7 +2117,7 @@ mod tests {
         let iv = [0x22u8; 8];
         let sample = b"abcdefgh"; // 8 bytes
         let file = build_cenc_file(key, iv, &[sample], true, true, false);
-        let out = decrypt(file, &[], &key).unwrap();
+        let out = decrypt(file, &ContentKeys::single(key)).unwrap();
 
         // Locate mdat in the output and verify its payload is the plaintext.
         let mdat_offset = find_subslice(&out, b"mp4a").is_some().then(|| {
@@ -1860,7 +2142,7 @@ mod tests {
         let iv = [0x44u8; 8];
         let sample = b"HelloCENC world!"; // 16 bytes
         let file = build_cenc_file(key, iv, &[sample], true, false, false);
-        let out = decrypt(file, &[], &key).unwrap();
+        let out = decrypt(file, &ContentKeys::single(key)).unwrap();
 
         // Find mdat in the output and compare its payload to the plaintext.
         let mut pos = 0;
@@ -1883,7 +2165,7 @@ mod tests {
         let iv = [0x66u8; 8];
         let sample = b"abcdefgh";
         let file = build_cenc_file(key, iv, &[sample], true, true, true);
-        match decrypt(file, &[], &key) {
+        match decrypt(file, &ContentKeys::single(key)) {
             Err(DrmError::Decrypt(msg)) => {
                 assert!(msg.to_lowercase().contains("trun"), "got: {msg}");
             }
@@ -2104,7 +2386,7 @@ mod tests {
         let file = concat_bytes(&[&ftyp, &moov, &moof, &mdat]);
 
         // --- act: decrypt -----------------------------------------------------
-        let out = decrypt(file, &[], &key).unwrap();
+        let out = decrypt(file, &ContentKeys::single(key)).unwrap();
 
         // --- assert: mdat payload == plaintext --------------------------------
         let mut pos = 0;
@@ -2251,10 +2533,21 @@ mod tests {
     ) -> Vec<u8> {
         // tfhd: track 1, default-base-is-moof.
         let tfhd = mk_full_box(*b"tfhd", 0, 0x0002_0000, &1u32.to_be_bytes());
+        mk_fragment_with_tfhd(runs, offset_on_every_run, senc, tfdt, &tfhd)
+    }
+
+    /// [`mk_fragment_with_tfdt`] with a caller-built `tfhd` box.
+    fn mk_fragment_with_tfhd(
+        runs: &[Vec<Vec<u8>>],
+        offset_on_every_run: bool,
+        senc: &[u8],
+        tfdt: &[u8],
+        tfhd: &[u8],
+    ) -> Vec<u8> {
         let mfhd = mk_full_box(*b"mfhd", 0, 0, &1u32.to_be_bytes());
 
         let build = |first_data_offset: usize| -> Vec<u8> {
-            let mut traf_children = concat_bytes(&[&tfhd, tfdt]);
+            let mut traf_children = concat_bytes(&[tfhd, tfdt]);
             let mut run_offset = first_data_offset;
             for (k, run) in runs.iter().enumerate() {
                 let with_offset = k == 0 || offset_on_every_run;
@@ -2353,7 +2646,7 @@ mod tests {
             file.extend_from_slice(&mk_fragment(&encrypted, f == 1, &mk_ivless_senc(9)));
         }
 
-        let out = decrypt(file, &[], &key).unwrap();
+        let out = decrypt(file, &ContentKeys::single(key)).unwrap();
 
         let expected: Vec<u8> = fragments
             .iter()
@@ -2394,7 +2687,7 @@ mod tests {
         file.extend_from_slice(&mk_moov_with_stsd(&mk_stsd(*b"cenc", 8)));
         file.extend_from_slice(&mk_fragment(&runs, false, &senc));
 
-        let out = decrypt(file, &[], &key).unwrap();
+        let out = decrypt(file, &ContentKeys::single(key)).unwrap();
 
         let expected: Vec<u8> = plaintexts.iter().flatten().copied().collect();
         assert_eq!(all_mdat_payloads(&out), expected);
@@ -2411,7 +2704,7 @@ mod tests {
         let mut file = mk_cbcs_init(&iv, 1, 9);
         file.extend_from_slice(&mk_fragment(&runs, false, &mk_ivless_senc(5)));
 
-        match decrypt(file, &[], &key) {
+        match decrypt(file, &ContentKeys::single(key)) {
             Err(DrmError::Decrypt(msg)) => assert!(msg.contains("5 senc vs 4 trun"), "got: {msg}"),
             other => panic!("expected a count mismatch, got {other:?}"),
         }
@@ -2426,7 +2719,7 @@ mod tests {
         let mut file = mk_cbcs_init(&iv, 1, 9);
         file.extend_from_slice(&mk_fragment(&encrypted, false, &mk_ivless_senc(2)));
 
-        let out = decrypt(file, &[], &key).unwrap();
+        let out = decrypt(file, &ContentKeys::single(key)).unwrap();
 
         for marker in [b"enca", b"sinf", b"senc", b"pssh"] {
             assert!(
@@ -2571,8 +2864,205 @@ mod tests {
             ));
         }
 
-        let out = decrypt(file, &[], &key).unwrap();
+        let out = decrypt(file, &ContentKeys::single(key)).unwrap();
 
         assert_eq!(read_tfdts(&out), [0, FRAME]);
+    }
+
+    // --- several sample entries (spatial streams) ----------------------------
+
+    /// A cbcs `enca` entry with its own constant IV (pattern 0:0, all-zero
+    /// KID, like Apple's spatial streams).
+    #[expect(
+        clippy::similar_names,
+        reason = "schi, schm and sinf are the spec's own four-letter box codes"
+    )]
+    fn mk_cbcs_entry(constant_iv: &[u8; 16]) -> Vec<u8> {
+        let mut tenc_body = vec![0, 0, 1, 0];
+        tenc_body.extend_from_slice(&[0u8; 16]);
+        tenc_body.push(16);
+        tenc_body.extend_from_slice(constant_iv);
+        let tenc = mk_full_box(*b"tenc", 1, 0, &tenc_body);
+        let schi = mk_box(*b"schi", &tenc);
+        let schm = mk_full_box(
+            *b"schm",
+            0,
+            0,
+            &concat_bytes(&[b"cbcs", &0x0001_0000u32.to_be_bytes()]),
+        );
+        let frma = mk_box(*b"frma", b"mp4a");
+        let sinf = mk_box(*b"sinf", &concat_bytes(&[&frma, &schm, &schi]));
+        mk_box(
+            *b"enca",
+            &concat_bytes(&[&[0u8; AUDIO_SAMPLE_ENTRY_PRELUDE], &sinf]),
+        )
+    }
+
+    /// Init with one `enca` entry per IV and an `mvex/trex` (default sample
+    /// description 1).
+    fn mk_two_entry_init(ivs: &[[u8; 16]]) -> Vec<u8> {
+        let mut stsd_body = u32_len(ivs.len()).to_vec();
+        for iv in ivs {
+            stsd_body.extend_from_slice(&mk_cbcs_entry(iv));
+        }
+        let stsd = mk_full_box(*b"stsd", 0, 0, &stsd_body);
+        let stbl = mk_box(*b"stbl", &stsd);
+        let minf = mk_box(*b"minf", &stbl);
+        let mdia = mk_box(*b"mdia", &minf);
+        let trak = mk_box(*b"trak", &mdia);
+        let trex_body = concat_bytes(&[
+            &1u32.to_be_bytes(),
+            &1u32.to_be_bytes(),
+            &1024u32.to_be_bytes(),
+            &0u32.to_be_bytes(),
+            &0u32.to_be_bytes(),
+        ]);
+        let mvex = mk_box(*b"mvex", &mk_full_box(*b"trex", 0, 0, &trex_body));
+        let moov = mk_box(*b"moov", &concat_bytes(&[&trak, &mvex]));
+        concat_bytes(&[&mk_box(*b"ftyp", b"iso5\0\0\0\0mp42"), &moov])
+    }
+
+    /// `tfhd` for track 1, default-base-is-moof, with an explicit
+    /// `sample_description_index` when given.
+    fn mk_tfhd(sample_description_index: Option<u32>) -> Vec<u8> {
+        match sample_description_index {
+            Some(index) => mk_full_box(
+                *b"tfhd",
+                0,
+                0x0002_0002,
+                &concat_bytes(&[&1u32.to_be_bytes(), &index.to_be_bytes()]),
+            ),
+            None => mk_full_box(*b"tfhd", 0, 0x0002_0000, &1u32.to_be_bytes()),
+        }
+    }
+
+    /// Mirrors Apple's spatial stream: fragment 1 relies on the `trex`
+    /// default (entry 1, key A, IV A); fragment 2 names entry 2 (key B, IV
+    /// B).
+    fn mk_spatial_like_file() -> (Vec<u8>, Vec<u8>) {
+        let (key_a, key_b) = ([0x11u8; 16], [0x22u8; 16]);
+        let (iv_a, iv_b) = ([0xA1u8; 16], [0xB2u8; 16]);
+        let first = vec![vec![sample_plaintext(1, 70), sample_plaintext(2, 33)]];
+        let second = vec![vec![sample_plaintext(3, 64), sample_plaintext(4, 50)]];
+        let mut file = mk_two_entry_init(&[iv_a, iv_b]);
+        file.extend_from_slice(&mk_fragment_with_tfhd(
+            &cbcs_encrypt_runs(&key_a, &iv_a, 0, 0, &first),
+            false,
+            &mk_ivless_senc(2),
+            &[],
+            &mk_tfhd(None),
+        ));
+        file.extend_from_slice(&mk_fragment_with_tfhd(
+            &cbcs_encrypt_runs(&key_b, &iv_b, 0, 0, &second),
+            false,
+            &mk_ivless_senc(2),
+            &[],
+            &mk_tfhd(Some(2)),
+        ));
+        let plain = first
+            .iter()
+            .chain(&second)
+            .flatten()
+            .flatten()
+            .copied()
+            .collect();
+        (file, plain)
+    }
+
+    fn spatial_keys() -> ContentKeys {
+        ContentKeys::by_sample_description([(1, [0x11; 16]), (2, [0x22; 16])])
+    }
+
+    #[test]
+    fn decrypt_should_pick_tenc_and_key_per_sample_description() {
+        let (file, plain) = mk_spatial_like_file();
+
+        let out = decrypt(file, &spatial_keys()).unwrap();
+
+        assert_eq!(all_mdat_payloads(&out), plain);
+    }
+
+    #[test]
+    fn decrypt_should_rename_every_enca_entry() {
+        let (file, _) = mk_spatial_like_file();
+
+        let out = decrypt(file, &spatial_keys()).unwrap();
+
+        let stsd = find_box_path(
+            &out,
+            0,
+            out.len(),
+            &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"],
+        )
+        .unwrap()
+        .unwrap();
+        let mut types = Vec::new();
+        let mut pos = stsd.payload + 8;
+        while pos < stsd.end() {
+            let (t, b) = read_box(&out, pos).unwrap().unwrap();
+            types.push(t);
+            pos = b.end();
+        }
+        assert_eq!(types, [*b"mp4a", *b"mp4a"]);
+    }
+
+    #[test]
+    fn decrypt_should_fail_without_a_key_for_a_used_sample_description() {
+        let (file, _) = mk_spatial_like_file();
+        let keys = ContentKeys::by_sample_description([(1, [0x11; 16])]);
+
+        match decrypt(file, &keys) {
+            Err(DrmError::Decrypt(msg)) => {
+                assert!(msg.contains("sample description 2"), "got: {msg}");
+            }
+            other => panic!("expected a missing-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decrypt_with_one_key_should_garble_the_second_key_group() {
+        let (file, plain) = mk_spatial_like_file();
+        let keys = ContentKeys::single([0x11; 16]);
+
+        let out = decrypt(file, &keys).unwrap();
+
+        assert_ne!(all_mdat_payloads(&out), plain);
+    }
+
+    #[test]
+    fn fragment_sample_descriptions_should_follow_tfhd_then_trex() {
+        let (file, _) = mk_spatial_like_file();
+
+        let indices: Vec<u32> = fragment_sample_descriptions(&file)
+            .unwrap()
+            .into_iter()
+            .map(|(_, index)| index)
+            .collect();
+
+        assert_eq!(indices, [1, 2]);
+    }
+
+    #[test]
+    fn parse_tfhd_should_read_sample_description_index_and_duration() {
+        let tfhd = mk_full_box(
+            *b"tfhd",
+            0,
+            0x0000_000A,
+            &concat_bytes(&[
+                &7u32.to_be_bytes(),
+                &2u32.to_be_bytes(),
+                &1024u32.to_be_bytes(),
+            ]),
+        );
+        let (_, bref) = read_box(&tfhd, 0).unwrap().unwrap();
+        let info = parse_tfhd(&tfhd, bref).unwrap();
+        assert_eq!(
+            (
+                info.track_id,
+                info.sample_description_index,
+                info.default_sample_duration
+            ),
+            (7, Some(2), Some(1024))
+        );
     }
 }

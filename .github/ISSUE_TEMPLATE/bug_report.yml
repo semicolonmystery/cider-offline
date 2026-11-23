@@ -18,7 +18,7 @@ body:
     attributes:
       label: Cider Offline version
       description: The version in the file name you downloaded, or the output of `cider-offline --version` (macOS and Linux).
-      placeholder: 0.1.0
+      placeholder: 0.1.1
     validations:
       required: true
   - type: dropdown

@@ -134,6 +134,54 @@ fn locate_in(chosen: Option<&Path>, defaults: &[PathBuf]) -> Result<PathBuf, Cid
         })
 }
 
+/// Cider's spatial audio (Dolby Atmos) setting: `audio.atmos.enabled` in
+/// `spa-config.yml`, which sits next to `client_options` (Cider's
+/// `client-options.yml`). `None` when the file or the key is missing.
+///
+/// Read only, never written: Cider owns the file.
+pub fn spatial_audio_enabled(client_options: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(client_options.with_file_name(SPA_CONFIG)).ok()?;
+    atmos_enabled(&text)
+}
+
+/// File name of Cider's web-app settings (`audio`, `visual`, ...).
+const SPA_CONFIG: &str = "spa-config.yml";
+
+/// Finds `audio.atmos.enabled` in a block-style YAML document by
+/// indentation, without a YAML parser (as with `client-options.yml`, only
+/// the one key matters).
+fn atmos_enabled(text: &str) -> Option<bool> {
+    const PATH: [&str; 3] = ["audio", "atmos", "enabled"];
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        while stack.last().is_some_and(|(level, _)| *level >= indent) {
+            stack.pop();
+        }
+        let key = key.trim().trim_matches(['"', '\'']);
+        let value = value.trim();
+        let parents: Vec<&str> = stack.iter().map(|(_, k)| *k).collect();
+        if parents == PATH[..2] && key == PATH[2] {
+            return match value.split('#').next().unwrap_or_default().trim() {
+                "true" | "True" | "TRUE" => Some(true),
+                "false" | "False" | "FALSE" => Some(false),
+                _ => None,
+            };
+        }
+        if value.is_empty() {
+            stack.push((indent, key));
+        }
+    }
+    None
+}
+
 /// Read-only snapshot of Cider's proxy configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiderProxyState {
@@ -589,6 +637,37 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    /// The shape of Cider's `spa-config.yml` around the setting (2026-11-20).
+    const SPA_FIXTURE: &str = "visual:\r\n  sounds:\r\n    enabled: false\r\n\
+audio:\r\n  volume: 1\r\n  atmos:\r\n    enabled: true\r\n    binaural: true\r\n\
+    devicePreferences:\r\n      default: binaural\r\n  crossfade:\r\n    enabled: false\r\n";
+
+    #[test]
+    fn atmos_setting_should_be_read_from_its_section() {
+        assert_eq!(atmos_enabled(SPA_FIXTURE), Some(true));
+    }
+
+    #[test]
+    fn atmos_setting_should_read_false() {
+        let text = SPA_FIXTURE.replace("    enabled: true", "    enabled: false");
+        assert_eq!(atmos_enabled(&text), Some(false));
+    }
+
+    #[test]
+    fn other_sections_enabled_keys_should_be_ignored() {
+        let text =
+            "audio:\n  crossfade:\n    enabled: true\nvisual:\n  atmos:\n    enabled: true\n";
+        assert_eq!(atmos_enabled(text), None);
+    }
+
+    #[test]
+    fn spatial_setting_should_be_read_next_to_client_options() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("spa-config.yml"), SPA_FIXTURE).unwrap();
+        let client_options = dir.path().join("client-options.yml");
+        assert_eq!(spatial_audio_enabled(&client_options), Some(true));
+    }
 
     /// A realistic `client-options.yml` fixture: many unrelated keys, a quoted
     /// empty scalar, a flow sequence, an empty value, and the proxy keys. CRLF

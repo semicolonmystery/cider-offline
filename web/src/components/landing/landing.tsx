@@ -75,10 +75,9 @@ function SiteFooter() {
     <footer className="border-t border-border bg-sidebar">
       <div className="mx-auto grid max-w-[1200px] gap-6 px-4 py-12 text-sm leading-normal text-muted-foreground sm:px-8">
         <p className="max-w-[65ch] text-pretty">
-          {SITE_NAME} is for personal use with your own Apple Music subscription. It is not
-          affiliated with or endorsed by Apple or the Cider Collective. It decrypts content you are
-          already licensed to stream so you can play it offline on your own machine. Use it at your
-          own risk.
+          {SITE_NAME} is for personal use with your own Apple Music subscription, so you can keep
+          listening to your library in Cider when you&apos;re offline. It is not affiliated with or
+          endorsed by Apple or the Cider Collective. Use it at your own risk.
         </p>
         <p className="flex flex-wrap gap-x-6 gap-y-2">
           <span>Open source under the MIT license.</span>

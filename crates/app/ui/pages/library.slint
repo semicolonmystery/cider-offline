@@ -6,7 +6,7 @@ import { ListView, LineEdit } from "std-widgets.slint";
 import {
     Theme, Icons, Icon, IconButton, IconToggle, PillButton, Segmented, IconSegmented,
     ActionButton, SearchField, Badge, Artwork, Skeleton, DownloadControl, CircularProgress,
-    Toast, Busy, FocusRing,
+    Toast, Busy, FocusRing, SpatialBadge,
 } from "../components.slint";
 import { LibraryState, CollectionRow, TrackRow, DownloadsState, DownloadRow } from "../globals.slint";
 import { LibraryAddDialog } from "library-add.slint";
@@ -36,6 +36,15 @@ component CollectionCard inherits Rectangle {
     property <bool> live: !root.item.placeholder;
     property <bool> hovered: touch.has-hover && root.live;
     property <bool> active: root.item.dl-status == "queued" || root.item.dl-status == "downloading";
+    // Something of it is in the queue (a finished row alone doesn't count:
+    // it stays "done" after its file is removed).
+    property <bool> queued: root.item.dl-status != "" && root.item.dl-status != "done";
+    // "12 of 206" on the chip of a partly downloaded collection.
+    property <bool> show-count: root.item.partial && !root.queued && !root.item.downloaded;
+    property <bool> has-files: root.item.downloaded || root.item.partial || root.item.elsewhere;
+    // "Remove downloads" applies to what the collection itself pins; a
+    // collection saved only through other downloads pins nothing to remove.
+    property <bool> can-remove: root.item.pinned || (root.has-files && !root.item.elsewhere);
 
     accessible-role: button;
     accessible-label: root.item.name;
@@ -80,23 +89,40 @@ component CollectionCard inherits Rectangle {
                 animate background { duration: 120ms; }
             }
 
-            // Download chip (top-right), display only.
-            if root.live && (root.item.dl-status != "" || root.item.downloaded): Rectangle {
+            // Download chip (top-right), display only. A partly downloaded
+            // collection shows its share as a ring and "n of N".
+            if root.live && (root.queued || root.has-files): Rectangle {
                 x: parent.width - self.width - 8px;
                 y: 8px;
-                width: 28px;
+                width: min(chip-row.preferred-width, parent.width - 16px);
                 height: 28px;
                 border-radius: 14px;
                 background: #00000080;
-                DownloadControl {
-                    x: 4px;
-                    y: 4px;
-                    ring-size: 20px;
-                    on-dark: true;
-                    can-toggle: false;
-                    status: root.item.dl-status;
-                    progress: root.item.dl-progress;
-                    downloaded: root.item.downloaded;
+                clip: true;
+                chip-row := HorizontalLayout {
+                    padding: 4px;
+                    padding-right: root.show-count ? 10px : 4px;
+                    spacing: 6px;
+                    DownloadControl {
+                        ring-size: 20px;
+                        on-dark: true;
+                        can-toggle: false;
+                        status: root.item.dl-status;
+                        progress: root.item.dl-progress;
+                        downloaded: root.item.downloaded;
+                        partial: root.item.partial;
+                        elsewhere: root.item.elsewhere;
+                        fraction: root.item.dl-total > 0 ? root.item.dl-done / root.item.dl-total : 0;
+                        count: "\{root.item.dl-done} of \{root.item.dl-total}";
+                    }
+
+                    if root.show-count: Text {
+                        text: "\{root.item.dl-done} of \{root.item.dl-total}";
+                        font-size: Theme.caption;
+                        font-weight: 600;
+                        color: #FFFFFF;
+                        vertical-alignment: center;
+                    }
                 }
             }
 
@@ -160,28 +186,50 @@ component CollectionCard inherits Rectangle {
         menu := ContextMenuArea {
             enabled: root.live;
             Menu {
-                if root.item.dl-status == "" && !root.item.downloaded: MenuItem {
-                    title: "Download";
+                if root.item.partial: MenuItem {
+                    title: "\{root.item.dl-done} of \{root.item.dl-total} songs downloaded";
+                    enabled: false;
+                }
+                if root.item.elsewhere: MenuItem {
+                    title: "Saved through other downloads";
+                    enabled: false;
+                }
+                if !root.active && !root.item.downloaded: MenuItem {
+                    title: root.item.elsewhere ? "Link downloads" : root.item.partial ? "Download missing songs" : "Download";
                     activated => {
                         LibraryState.download-collection(root.item.id);
                     }
                 }
                 if root.active: MenuItem {
-                    title: "Pause download";
+                    title: "Pause downloads";
                     activated => {
-                        LibraryState.toggle-collection-download(root.item.id);
+                        LibraryState.collection-download-action(root.item.id, "pause");
                     }
                 }
                 if root.item.dl-status == "paused": MenuItem {
-                    title: "Resume download";
+                    title: "Resume downloads";
                     activated => {
-                        LibraryState.toggle-collection-download(root.item.id);
+                        LibraryState.collection-download-action(root.item.id, "resume");
                     }
                 }
                 if root.item.dl-status == "failed": MenuItem {
-                    title: "Retry download";
+                    title: "Retry failed downloads";
                     activated => {
-                        LibraryState.toggle-collection-download(root.item.id);
+                        LibraryState.collection-download-action(root.item.id, "retry");
+                    }
+                }
+                if root.item.dl-status != "" && root.item.dl-status != "done": MenuItem {
+                    title: "Cancel downloads…";
+                    activated => {
+                        LibraryState.collection-download-action(root.item.id, "cancel");
+                    }
+                }
+                MenuItem {
+                    title: "Keep downloaded";
+                    checkable: true;
+                    checked: root.item.keep;
+                    activated => {
+                        LibraryState.set-keep-downloaded(root.item.id, !root.item.keep);
                     }
                 }
                 MenuItem {
@@ -191,13 +239,24 @@ component CollectionCard inherits Rectangle {
                         LibraryState.fetch-collection-lyrics(root.item.id);
                     }
                 }
-                if (root.item.pinned || root.item.downloaded) && !root.active: MenuSeparator { }
-                if (root.item.pinned || root.item.downloaded) && !root.active: MenuItem {
-                    title: "Remove download…";
+                MenuItem {
+                    title: "Remove lyrics…";
+                    enabled: !LibraryState.bulk-busy;
                     activated => {
-                        LibraryUi.confirm-kind = "collection";
-                        LibraryUi.confirm-title = root.item.name;
-                        LibraryUi.confirm-id = root.item.id;
+                        LibraryState.remove-collection-lyrics(root.item.id);
+                    }
+                }
+                if (root.item.pinned || root.has-files) && !root.active: MenuSeparator { }
+                if (root.item.pinned || root.has-files) && !root.active: MenuItem {
+                    title: "Re-download all…";
+                    activated => {
+                        LibraryState.redownload-collection(root.item.id);
+                    }
+                }
+                if root.can-remove && !root.active: MenuItem {
+                    title: "Remove downloads…";
+                    activated => {
+                        LibraryState.remove-collection-download(root.item.id);
                     }
                 }
                 if root.item.is-custom: MenuSeparator { }
@@ -417,7 +476,9 @@ component TrackItem inherits Rectangle {
                 y: 8px;
                 width: root.title-w;
                 height: 18px;
-                property <length> badge-w: root.item.is-custom ? badge.width + 6px : 0px;
+                property <length> custom-w: root.item.is-custom ? badge.width + 6px : 0px;
+                property <length> spatial-w: root.item.has-spatial ? spatial.width + 6px : 0px;
+                property <length> badge-w: self.custom-w + self.spatial-w;
 
                 title := Text {
                     x: 0;
@@ -434,6 +495,13 @@ component TrackItem inherits Rectangle {
                     x: title.width + 6px;
                     y: 1px;
                     visible: root.item.is-custom;
+                }
+
+                spatial := SpatialBadge {
+                    x: title.width + parent.custom-w + 6px;
+                    y: (parent.height - self.height) / 2;
+                    size: 14px;
+                    visible: root.item.has-spatial;
                 }
             }
 
@@ -564,7 +632,7 @@ component TrackItem inherits Rectangle {
             menu := ContextMenuArea {
                 enabled: root.live;
                 Menu {
-                    if (root.item.dl-status == "" || root.item.dl-status == "done") && !root.item.has-audio && !root.item.is-custom: MenuItem {
+                    if (root.item.dl-status == "" || root.item.dl-status == "done") && root.item.missing && !root.item.is-custom: MenuItem {
                         title: "Download";
                         activated => {
                             LibraryState.download-track(root.item.id);
@@ -586,6 +654,12 @@ component TrackItem inherits Rectangle {
                         title: "Retry download";
                         activated => {
                             DownloadsState.retry(root.item.catalog-id);
+                        }
+                    }
+                    if root.active || root.item.dl-status == "paused" || root.item.dl-status == "failed": MenuItem {
+                        title: "Cancel download";
+                        activated => {
+                            DownloadsState.cancel(root.item.catalog-id);
                         }
                     }
                     MenuItem {
@@ -621,6 +695,13 @@ component TrackItem inherits Rectangle {
                             LibraryState.choose-lyrics-file(root.item.id);
                         }
                     }
+                    if root.has-lyrics: MenuItem {
+                        title: root.item.lyrics == "custom" ? "Remove lyrics…" : "Remove lyrics";
+                        enabled: !root.item.busy;
+                        activated => {
+                            LibraryState.remove-lyrics(root.item.id);
+                        }
+                    }
                     if root.item.is-custom || root.reorderable: MenuSeparator { }
                     if root.item.is-custom: MenuItem {
                         title: "Edit details…";
@@ -643,6 +724,13 @@ component TrackItem inherits Rectangle {
                         }
                     }
                     if !root.item.is-custom && root.item.has-audio && !root.active: MenuSeparator { }
+                    if !root.item.is-custom && root.item.has-audio && !root.active: MenuItem {
+                        title: "Re-download…";
+                        enabled: !root.item.busy;
+                        activated => {
+                            LibraryState.redownload-track(root.item.id);
+                        }
+                    }
                     if !root.item.is-custom && root.item.has-audio && !root.active: MenuItem {
                         title: "Remove download…";
                         enabled: !root.item.busy;
@@ -883,6 +971,11 @@ component CollectionDetail inherits Rectangle {
     in property <bool> short;
 
     property <bool> is-album: LibraryState.detail-kind != "playlist";
+    property <bool> detail-active: LibraryState.detail-dl-status == "queued" || LibraryState.detail-dl-status == "downloading";
+    property <bool> detail-has-files: LibraryState.detail-downloaded || LibraryState.detail-partial || LibraryState.detail-elsewhere;
+    // See `CollectionCard.can-remove`.
+    property <bool> detail-can-remove: LibraryState.detail-pinned || (root.detail-has-files && !LibraryState.detail-elsewhere);
+    property <string> dl-count: "\{LibraryState.detail-dl-done} of \{LibraryState.detail-dl-total}";
     property <length> content-w: root.width - 2 * root.pad;
     property <length> cover: root.short ? 96px : root.content-w >= 1000px ? 220px : 160px;
 
@@ -982,6 +1075,10 @@ component CollectionDetail inherits Rectangle {
                             status: LibraryState.detail-dl-status;
                             progress: LibraryState.detail-dl-progress;
                             downloaded: LibraryState.detail-downloaded;
+                            partial: LibraryState.detail-partial;
+                            elsewhere: LibraryState.detail-elsewhere;
+                            fraction: LibraryState.detail-dl-total > 0 ? LibraryState.detail-dl-done / LibraryState.detail-dl-total : 0;
+                            count: root.dl-count;
                             label: root.is-album ? "album" : "playlist";
                             start => {
                                 LibraryState.download-collection(LibraryState.collection);
@@ -1006,6 +1103,52 @@ component CollectionDetail inherits Rectangle {
 
                             detail-menu := ContextMenuArea {
                                 Menu {
+                                    if LibraryState.detail-partial: MenuItem {
+                                        title: "\{root.dl-count} songs downloaded";
+                                        enabled: false;
+                                    }
+                                    if LibraryState.detail-elsewhere: MenuItem {
+                                        title: "Saved through other downloads";
+                                        enabled: false;
+                                    }
+                                    if !root.detail-active && !LibraryState.detail-downloaded: MenuItem {
+                                        title: LibraryState.detail-elsewhere ? "Link downloads" : LibraryState.detail-partial ? "Download missing songs" : "Download";
+                                        activated => {
+                                            LibraryState.download-collection(LibraryState.collection);
+                                        }
+                                    }
+                                    if root.detail-active: MenuItem {
+                                        title: "Pause downloads";
+                                        activated => {
+                                            LibraryState.collection-download-action(LibraryState.collection, "pause");
+                                        }
+                                    }
+                                    if LibraryState.detail-dl-status == "paused": MenuItem {
+                                        title: "Resume downloads";
+                                        activated => {
+                                            LibraryState.collection-download-action(LibraryState.collection, "resume");
+                                        }
+                                    }
+                                    if LibraryState.detail-dl-status == "failed": MenuItem {
+                                        title: "Retry failed downloads";
+                                        activated => {
+                                            LibraryState.collection-download-action(LibraryState.collection, "retry");
+                                        }
+                                    }
+                                    if LibraryState.detail-dl-status != "" && LibraryState.detail-dl-status != "done": MenuItem {
+                                        title: "Cancel downloads…";
+                                        activated => {
+                                            LibraryState.collection-download-action(LibraryState.collection, "cancel");
+                                        }
+                                    }
+                                    MenuItem {
+                                        title: "Keep downloaded";
+                                        checkable: true;
+                                        checked: LibraryState.detail-keep;
+                                        activated => {
+                                            LibraryState.set-keep-downloaded(LibraryState.collection, !LibraryState.detail-keep);
+                                        }
+                                    }
                                     MenuItem {
                                         title: "Fetch lyrics for all songs";
                                         enabled: !LibraryState.bulk-busy;
@@ -1013,13 +1156,24 @@ component CollectionDetail inherits Rectangle {
                                             LibraryState.fetch-collection-lyrics(LibraryState.collection);
                                         }
                                     }
-                                    if (LibraryState.detail-pinned || LibraryState.detail-downloaded) && LibraryState.detail-dl-status != "downloading" && LibraryState.detail-dl-status != "queued": MenuSeparator { }
-                                    if (LibraryState.detail-pinned || LibraryState.detail-downloaded) && LibraryState.detail-dl-status != "downloading" && LibraryState.detail-dl-status != "queued": MenuItem {
-                                        title: "Remove download…";
+                                    MenuItem {
+                                        title: "Remove lyrics…";
+                                        enabled: !LibraryState.bulk-busy;
                                         activated => {
-                                            LibraryUi.confirm-kind = "collection";
-                                            LibraryUi.confirm-title = LibraryState.detail-title;
-                                            LibraryUi.confirm-id = LibraryState.collection;
+                                            LibraryState.remove-collection-lyrics(LibraryState.collection);
+                                        }
+                                    }
+                                    if (LibraryState.detail-pinned || root.detail-has-files) && !root.detail-active: MenuSeparator { }
+                                    if (LibraryState.detail-pinned || root.detail-has-files) && !root.detail-active: MenuItem {
+                                        title: "Re-download all…";
+                                        activated => {
+                                            LibraryState.redownload-collection(LibraryState.collection);
+                                        }
+                                    }
+                                    if root.detail-can-remove && !root.detail-active: MenuItem {
+                                        title: "Remove downloads…";
+                                        activated => {
+                                            LibraryState.remove-collection-download(LibraryState.collection);
                                         }
                                     }
                                     if LibraryState.detail-is-custom: MenuSeparator { }
@@ -1041,6 +1195,28 @@ component CollectionDetail inherits Rectangle {
 
                         if LibraryState.bulk-busy: Busy {
                             y: 9px;
+                        }
+
+                        // Beside the link of a collection saved through
+                        // other downloads.
+                        if LibraryState.detail-elsewhere && LibraryState.detail-dl-status != "queued"
+                            && LibraryState.detail-dl-status != "downloading": Text {
+                            text: "Saved through other downloads";
+                            font-size: Theme.callout;
+                            color: Theme.text-secondary;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        // "12 of 206 songs downloaded" beside a partly
+                        // downloaded collection's ring.
+                        if LibraryState.detail-partial && LibraryState.detail-dl-status != "queued"
+                            && LibraryState.detail-dl-status != "downloading": Text {
+                            text: "\{root.dl-count} songs downloaded";
+                            font-size: Theme.callout;
+                            color: Theme.text-secondary;
+                            vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
                 }
@@ -1140,12 +1316,18 @@ component DownloadItem inherits Rectangle {
                 }
             }
 
+            if root.item.spatial && root.item.status == "done": SpatialBadge {
+                y: (parent.height - self.height) / 2;
+            }
+
             DownloadControl {
                 opacity: root.unavailable ? 0.55 : 1;
                 y: (parent.height - self.height) / 2;
                 ring-size: 22px;
                 status: root.item.status;
                 progress: root.item.progress;
+                // The drawer lists queue rows: a finished row is "done".
+                downloaded: root.item.status == "done";
                 reason: root.item.status == "failed" || root.unavailable ? root.item.message : "";
                 toggle => {
                     if root.item.status == "failed" {
@@ -1295,10 +1477,17 @@ component DownloadsDrawer inherits Rectangle {
                         drawer-menu := ContextMenuArea {
                             Menu {
                                 MenuItem {
-                                    title: "Clear completed";
+                                    title: "Clear finished";
                                     enabled: DownloadsState.done-count > 0;
                                     activated => {
                                         DownloadsState.clear-finished();
+                                    }
+                                }
+                                MenuItem {
+                                    title: "Cancel all…";
+                                    enabled: root.has-live || root.has-paused || DownloadsState.failed-count > 0 || DownloadsState.unavailable-count > 0;
+                                    activated => {
+                                        DownloadsState.cancel-all();
                                     }
                                 }
                                 if root.has-live && root.has-paused: MenuItem {

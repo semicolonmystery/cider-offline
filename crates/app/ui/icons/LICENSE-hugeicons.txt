@@ -2,7 +2,15 @@ The SVG icons in this directory are from the Hugeicons free icon set
 ("Stroke Rounded" style), package @hugeicons/core-free-icons 4.2.0
 (https://hugeicons.com). They were converted from the package's ESM icon
 arrays into standalone SVG files; `pause-solid.svg` and `play-solid.svg` are
-filled variants of the Pause and Play icons.
+filled variants of the Pause and Play icons, and `headphones-spatial.svg` is
+the Headphones icon with three sound-wave bars added under the headband (the
+free set has no headphones-with-waves icon).
+
+The `note-*.svg` glyphs (eighth, quarter, beamed eighths, beamed sixteenths)
+are the standard music-note shapes, drawn for the Overview page's note
+texture after the proportions of the set's Music Note 03 (round filled heads,
+2px stems, a solid beam). The free set's music notes are outlines with hollow
+heads, which do not read as the familiar shapes at 14-28 px.
 
 MIT License
 

@@ -191,22 +191,22 @@ impl Cdm {
         Self::from_wvd(&bytes)
     }
 
-    /// Starts a new license session from a Widevine PSSH box.
-    ///
-    /// Test-only helper for the KDF / HMAC roundtrip exercises — production
-    /// code paths always have a service cert (fetched from `widevineCert`)
-    /// and should call [`Self::open_session_with_cert`].
+    /// Starts a new license session from a Widevine PSSH box, without a
+    /// service certificate (the client id goes in cleartext either way). Used
+    /// for the enhancedHls (spatial) keys, which come with no
+    /// `widevine-cert-url`.
     ///
     /// # Errors
     ///
     /// Returns [`DrmError::InvalidWvd`] if `init_data` is not a parseable
     /// Widevine PSSH box carrying a 16-byte KID (R6: no "whole blob is the
     /// KID" fallback).
-    #[cfg(test)]
     pub fn open_session(&self, init_data: &[u8]) -> Result<CdmSession<'_>, DrmError> {
+        let (key_id, pssh_data) = parse_init_data(init_data)?;
         Ok(CdmSession {
             device: &self.device,
-            key_id: extract_kid_from_init_data(init_data)?,
+            key_id,
+            pssh_data,
             service_cert: None,
             license_request_msg: None,
         })
@@ -230,9 +230,11 @@ impl Cdm {
         init_data: &[u8],
         service_cert: Vec<u8>,
     ) -> Result<CdmSession<'_>, DrmError> {
+        let (key_id, pssh_data) = parse_init_data(init_data)?;
         Ok(CdmSession {
             device: &self.device,
-            key_id: extract_kid_from_init_data(init_data)?,
+            key_id,
+            pssh_data,
             service_cert: Some(service_cert),
             license_request_msg: None,
         })
@@ -247,6 +249,10 @@ impl Cdm {
 pub struct CdmSession<'cdm> {
     device: &'cdm WvdDevice,
     key_id: [u8; 16],
+    /// The PSSH box's `WidevineCencHeader` payload, verbatim. Sent as the
+    /// challenge's `pssh_data`, as Chromium's CDM does: re-encoding it would
+    /// drop fields such as enhancedHls' `protection_scheme = 'cbcs'`.
+    pssh_data: Vec<u8>,
     #[expect(
         dead_code,
         reason = "reserved for privacy-mode client-id encryption; today the client id goes cleartext (matches Apple's accepted flow) but holding the cert keeps the shape right for the privacy-mode patch"
@@ -260,15 +266,6 @@ pub struct CdmSession<'cdm> {
 }
 
 impl CdmSession<'_> {
-    /// Builds the PSSH init data (protobuf-encoded `WidevineCencHeader`).
-    fn pssh_init_data(&self) -> Vec<u8> {
-        let header = WidevineCencHeader {
-            algorithm: Some(1), // AESCTR
-            key_id: vec![self.key_id.to_vec()],
-        };
-        header.encode_to_vec()
-    }
-
     /// Builds the serialized `SignedMessage` containing the license request.
     /// Returns the bytes to send as the challenge, and saves the raw
     /// `LicenseRequest` protobuf bytes for later HMAC-key derivation.
@@ -293,7 +290,7 @@ impl CdmSession<'_> {
             client_id: Some(self.device.client_id.clone()),
             content_id: Some(ContentIdentification {
                 widevine_pssh_data: Some(WidevinePsshData {
-                    pssh_data: vec![self.pssh_init_data()],
+                    pssh_data: vec![self.pssh_data.clone()],
                     license_type: Some(LICENSE_TYPE_STREAMING),
                     request_id: Some(request_id.to_vec()),
                 }),
@@ -647,25 +644,39 @@ fn decrypt_content_key(enc_key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>
 /// Returns [`DrmError::InvalidWvd`] if `init_data` is not a parseable
 /// Widevine PSSH box or its payload carries no KID of the expected 16-byte
 /// length.
+#[cfg(test)]
 fn extract_kid_from_init_data(init_data: &[u8]) -> Result<[u8; 16], DrmError> {
-    let kid = parse_widevine_pssh_kid(init_data).ok_or_else(|| {
+    parse_init_data(init_data).map(|(kid, _)| kid)
+}
+
+/// Splits a Widevine PSSH box into its 16-byte KID and its verbatim
+/// `WidevineCencHeader` payload.
+///
+/// # Errors
+///
+/// [`DrmError::InvalidWvd`] if `init_data` is not a parseable Widevine PSSH
+/// box or its KID is not 16 bytes.
+fn parse_init_data(init_data: &[u8]) -> Result<([u8; 16], Vec<u8>), DrmError> {
+    let (kid, payload) = parse_widevine_pssh(init_data).ok_or_else(|| {
         DrmError::InvalidWvd(
             "init_data is not a parseable Widevine PSSH box: wrap bare KIDs via build_pssh_box \
              before opening a session"
                 .into(),
         )
     })?;
-    <[u8; 16]>::try_from(kid.as_slice()).map_err(|_| {
+    let kid = <[u8; 16]>::try_from(kid.as_slice()).map_err(|_| {
         DrmError::InvalidWvd(format!(
             "Widevine PSSH key_id must be 16 bytes, got {}",
             kid.len()
         ))
-    })
+    })?;
+    Ok((kid, payload.to_vec()))
 }
 
-/// Parses `data` as a Widevine PSSH box and returns its first KID. Returns
-/// `None` if `data` is not a well-formed Widevine PSSH box or carries no KID.
-fn parse_widevine_pssh_kid(data: &[u8]) -> Option<Vec<u8>> {
+/// Parses `data` as a Widevine PSSH box and returns its first KID and the
+/// raw `WidevineCencHeader` payload. Returns `None` if `data` is not a
+/// well-formed Widevine PSSH box or carries no KID.
+fn parse_widevine_pssh(data: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     // Minimum v0 PSSH box: 4 size + 4 "pssh" + 1 version + 3 flags + 16 sys_id + 4 data_size = 32
     if data.len() < 32 || &data[4..8] != b"pssh" {
         return None;
@@ -679,26 +690,28 @@ fn parse_widevine_pssh_kid(data: &[u8]) -> Option<Vec<u8>> {
         // v1: kid_count (u32 BE) + N * 16-byte KID, then data_size + data.
         let kid_count = u32::from_be_bytes(data.get(off..off + 4)?.try_into().ok()?) as usize;
         off = off.checked_add(4)?;
-        if kid_count > 0 {
-            let end = off.checked_add(16)?;
-            if end <= data.len() {
-                return Some(data[off..end].to_vec());
-            }
-        }
+        let v1_kid = if kid_count > 0 {
+            data.get(off..off.checked_add(16)?).map(<[u8]>::to_vec)
+        } else {
+            None
+        };
         off = off.checked_add(kid_count.checked_mul(16)?)?;
+        if let Some(kid) = v1_kid {
+            let payload = pssh_payload(data, off).unwrap_or_default();
+            return Some((kid, payload));
+        }
     }
+    let payload = pssh_payload(data, off)?;
+    let header = WidevineCencHeader::decode(payload).ok()?;
+    Some((header.key_id.into_iter().next()?, payload))
+}
+
+/// The `data_size`-prefixed payload of a PSSH box whose `data_size` field
+/// starts at `off`.
+fn pssh_payload(data: &[u8], off: usize) -> Option<&[u8]> {
     let size_end = off.checked_add(4)?;
-    if size_end > data.len() {
-        return None;
-    }
-    let data_size = u32::from_be_bytes(data[off..size_end].try_into().ok()?) as usize;
-    off = size_end;
-    let payload_end = off.checked_add(data_size)?;
-    if payload_end > data.len() {
-        return None;
-    }
-    let header = WidevineCencHeader::decode(&data[off..payload_end]).ok()?;
-    header.key_id.into_iter().next()
+    let data_size = u32::from_be_bytes(data.get(off..size_end)?.try_into().ok()?) as usize;
+    data.get(size_end..size_end.checked_add(data_size)?)
 }
 
 /// Builds a full PSSH box for the given key id (used in Apple API calls).
@@ -908,6 +921,48 @@ mod tests {
         let session = cdm.open_session(&pssh).unwrap();
         // The session must have extracted the 16-byte KID from the PSSH box.
         assert_eq!(session.key_id, kid);
+    }
+
+    /// The `s1/e1` PSSH of an enhancedHls (spatial) playlist: a v0 box whose
+    /// payload is `key_id` plus `protection_scheme = 'cbcs'`, no `algorithm`.
+    const SPATIAL_PSSH_B64: &str =
+        "AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgSEAAAAAAAAAAAczEvZTEgICBI88aJmwY=";
+
+    #[test]
+    fn challenge_should_carry_the_pssh_payload_verbatim() {
+        let pssh = BASE64_STANDARD.decode(SPATIAL_PSSH_B64).unwrap();
+        let payload = pssh[32..].to_vec();
+        let cdm = Cdm::from_wvd(crate::DEFAULT_WVD_BYTES).unwrap();
+        let mut session = cdm.open_session(&pssh).unwrap();
+        let challenge = session.create_license_request().unwrap();
+
+        let signed = SignedMessage::decode(challenge.as_slice()).unwrap();
+        let request = LicenseRequest::decode(signed.msg.unwrap().as_slice()).unwrap();
+        let sent = request
+            .content_id
+            .and_then(|c| c.widevine_pssh_data)
+            .map(|d| d.pssh_data)
+            .unwrap();
+        assert_eq!(sent, vec![payload]);
+    }
+
+    #[test]
+    fn spatial_pssh_should_yield_the_s1_e1_key_id() {
+        let pssh = BASE64_STANDARD.decode(SPATIAL_PSSH_B64).unwrap();
+        let kid = extract_kid_from_init_data(&pssh).unwrap();
+        assert_eq!(&kid, b"\0\0\0\0\0\0\0\0s1/e1   ");
+    }
+
+    #[test]
+    fn wrapped_bare_kid_payload_should_match_the_old_rebuilt_header() {
+        let kid = *b"0123456789abcdef";
+        let rebuilt = WidevineCencHeader {
+            algorithm: Some(1),
+            key_id: vec![kid.to_vec()],
+        }
+        .encode_to_vec();
+        let (_, payload) = parse_init_data(&build_pssh_box(&kid)).unwrap();
+        assert_eq!(payload, rebuilt);
     }
 
     /// End-to-end proof that the KDF + HMAC + content-key-unwrap path is

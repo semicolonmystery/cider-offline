@@ -376,6 +376,9 @@ struct Inner {
     requested: Notify,
     /// Auth tokens were captured / changed.
     tokens_changed: Notify,
+    /// Counts stored token changes, for watchers outside the sync loop
+    /// (the UI's "Apple Music session" state).
+    token_changes: watch::Sender<u64>,
     status: watch::Sender<SyncStatus>,
     /// Serializes runs (scheduled vs. requested vs. headless).
     gate: Mutex<()>,
@@ -426,6 +429,7 @@ impl LibrarySync {
                 api: AppleApi::new()?,
                 requested: Notify::new(),
                 tokens_changed: Notify::new(),
+                token_changes: watch::Sender::new(0),
                 status: watch::Sender::new(SyncStatus::default()),
                 gate: Mutex::new(()),
                 prefetch,
@@ -441,6 +445,16 @@ impl LibrarySync {
     /// Signals that auth tokens were captured or changed.
     pub(crate) fn tokens_changed(&self) {
         self.inner.tokens_changed.notify_one();
+        self.inner
+            .token_changes
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    /// Changes whenever a captured auth token was stored (the value counts
+    /// the changes; token values are never exposed), so a watcher learns of
+    /// a captured Apple Music session at once.
+    pub fn subscribe_tokens(&self) -> watch::Receiver<u64> {
+        self.inner.token_changes.subscribe()
     }
 
     /// Subscribes to sync status updates.
@@ -850,5 +864,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.tracks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stored_tokens_should_wake_a_session_watcher() {
+        let sync = LibrarySync::new(Storage::open_in_memory().unwrap()).unwrap();
+        let mut tokens = sync.subscribe_tokens();
+        sync.tokens_changed();
+        tokio::time::timeout(std::time::Duration::from_secs(1), tokens.changed())
+            .await
+            .expect("a token change wakes the watcher")
+            .unwrap();
+        assert_eq!(*tokens.borrow_and_update(), 1);
     }
 }

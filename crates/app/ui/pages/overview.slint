@@ -1,397 +1,491 @@
-import { Switch, ListView, ScrollView } from "std-widgets.slint";
-import {
-    Theme, Icons, Icon, BigToggle, Dot, ActionButton, Group, GroupHeading, ListRow,
-    RowSeparator, PageTitle,
-} from "../components.slint";
-import { ProxyState, CiderState } from "../globals.slint";
+// Overview page: the mode, one very large switch, and a single line when
+// something needs attention.
+//
+// The background is two layers. Under the content sits a magenta layer with
+// a drifting music-note texture (`NoteField`). The ON ripple and the OFF fade
+// are masks over that layer: the page background colour drawn on top with
+// alpha `1 - mask`, as one radial gradient (`RevealMask`, `FadeMask`). Over a
+// plain background that is the same picture as an alpha mask on the layer,
+// and it costs one gradient fill per frame instead of an offscreen pass.
 
-/// Shown while the local CA is not trusted: the two first-run steps.
-component Onboarding inherits Rectangle {
-    border-radius: Theme.radius-md;
-    background: Theme.accent-soft;
-    height: body.preferred-height;
+import { Theme, Icons, Icon, FocusRing } from "../components.slint";
+import { ProxyState, CiderState, OverviewAnim } from "../globals.slint";
 
-    body := VerticalLayout {
-        padding: 16px;
-        spacing: 8px;
-
-        Text {
-            text: "Two steps to get started";
-            font-size: Theme.headline;
-            font-weight: 600;
-            color: Theme.text-primary;
-        }
-
-        Text {
-            wrap: word-wrap;
-            font-size: Theme.body;
-            color: Theme.text-primary;
-            text: "1. Trust the local certificate. The proxy creates its own certificate authority on this computer so it can read Apple Music traffic and keep Cider working offline. Your system asks for confirmation.";
-        }
-
-        Text {
-            wrap: word-wrap;
-            font-size: Theme.body;
-            color: Theme.text-primary;
-            text: "2. Route Cider through the proxy (below), or set Cider's HTTP and HTTPS proxy to " + ProxyState.address + " and restart it.";
-        }
-
-        HorizontalLayout {
-            alignment: start;
-            ActionButton {
-                text: ProxyState.trust-busy ? "Working…" : "Trust certificate";
-                kind: "primary";
-                enabled: !ProxyState.trust-busy;
-                clicked => {
-                    ProxyState.install-ca();
-                }
-            }
-        }
+global Mask {
+    /// Clamps to 0..1.
+    public pure function unit(value: float) -> float {
+        return clamp(value, 0, 1);
     }
 }
 
-/// A dismissable notice at the top of the Overview page.
-component HintBanner inherits Rectangle {
+/// The magenta layer's notes: a few SVG glyphs, each rasterized once at its
+/// size and then only moved. Drifts with a 20 fps timer (shared drift up and
+/// to the right, plus each note's own sway). Only exists while the window is
+/// live; removing it frees the elements and their textures.
+component NoteField inherits Rectangle {
+    in property <brush> dark-tone;
+    in property <brush> light-tone;
+    // Notes leave on one side and come back on the other, out of sight.
+    property <length> margin: 48px;
+    property <float> span-x: (root.width + 2 * root.margin) / 1px;
+    property <float> span-y: (root.height + 2 * root.margin) / 1px;
+    // Shared drift, px per second.
+    property <float> drift-x: 7;
+    property <float> drift-y: -5;
+
+    pure function wrap(value: float, span: float) -> float {
+        return value - floor(value / span) * span;
+    }
+
+    Timer {
+        interval: 50ms;
+        running: !OverviewAnim.reduced-motion;
+        triggered => {
+            OverviewAnim.time += 0.05;
+        }
+    }
+
+    for note in OverviewAnim.notes: Image {
+        property <float> sway: sin((OverviewAnim.time * note.freq + note.phase) * 1rad);
+        property <float> bob: cos((OverviewAnim.time * note.freq * 0.7 + note.phase) * 1rad);
+        x: root.wrap(note.x * root.span-x + (root.drift-x + note.vx) * OverviewAnim.time + note.amp * self.sway, root.span-x) * 1px - root.margin;
+        y: root.wrap(note.y * root.span-y + (root.drift-y + note.vy) * OverviewAnim.time + note.amp * 0.6 * self.bob, root.span-y) * 1px - root.margin;
+        width: note.size * 1px;
+        height: note.size * 1px;
+        source: note.glyph == 0 ? @image-url("../icons/note-eighth.svg")
+            : note.glyph == 1 ? @image-url("../icons/note-quarter.svg")
+            : note.glyph == 2 ? @image-url("../icons/note-beamed.svg")
+            : @image-url("../icons/note-sixteenth.svg");
+        colorize: note.light ? root.light-tone : root.dark-tone;
+        transform-rotation: (note.tilt + 8 * self.sway) * 1deg;
+        accessible-role: none;
+    }
+}
+
+/// The ON reveal: three ring crests travel out from the centre, then a
+/// filled disc follows them. `progress` runs 0..1 over the animation; the
+/// crests and the disc move at a constant speed, like ripples on water.
+/// Draws `cover` (the page background) where the layer is still hidden.
+component RevealMask inherits Rectangle {
+    in property <length> cx;
+    in property <length> cy;
+    // Distance from the centre to the farthest page corner.
+    in property <length> reach;
+    in property <float> progress;
+    in property <color> cover;
+
+    // Seconds into the 2 s timeline. A crest crosses `reach` in 1.25 s.
+    property <float> s: root.progress * 2;
+    property <float> speed: 1 / 1.25;
+    // Soft edge of every band, as a fraction of `reach`.
+    property <float> e: 0.012;
+    property <float> r0: (root.s - 0) * root.speed * 1.08;
+    property <float> r1: (root.s - 0.16) * root.speed * 1.08;
+    property <float> r2: (root.s - 0.32) * root.speed * 1.08;
+    property <float> f: (root.s - 0.75) * root.speed * 1.04;
+    // How open each band is (0 until it has grown past its soft edges).
+    property <float> v0: Mask.unit(root.r0 / (2 * root.e));
+    property <float> v1: Mask.unit(root.r1 / (2 * root.e));
+    property <float> v2: Mask.unit(root.r2 / (2 * root.e));
+    property <float> vf: Mask.unit(root.f / (2 * root.e));
+    // Stop positions, centre outwards, kept in order.
+    property <float> p1: Mask.unit(root.f);
+    property <float> p2: max(root.p1, Mask.unit(root.f + root.e));
+    property <float> p3: max(root.p2, Mask.unit(root.r2 - 0.05));
+    property <float> p4: max(root.p3, Mask.unit(root.r2 - 0.05 + root.e));
+    property <float> p5: max(root.p4, Mask.unit(root.r2 - root.e));
+    property <float> p6: max(root.p5, Mask.unit(root.r2));
+    property <float> p7: max(root.p6, Mask.unit(root.r1 - 0.07));
+    property <float> p8: max(root.p7, Mask.unit(root.r1 - 0.07 + root.e));
+    property <float> p9: max(root.p8, Mask.unit(root.r1 - root.e));
+    property <float> p10: max(root.p9, Mask.unit(root.r1));
+    property <float> p11: max(root.p10, Mask.unit(root.r0 - 0.09));
+    property <float> p12: max(root.p11, Mask.unit(root.r0 - 0.09 + root.e));
+    property <float> p13: max(root.p12, Mask.unit(root.r0 - root.e));
+    property <float> p14: max(root.p13, Mask.unit(root.r0));
+    property <color> shut: root.cover;
+    property <color> open-f: root.cover.with-alpha(1 - root.vf);
+    property <color> open-0: root.cover.with-alpha(1 - root.v0);
+    property <color> open-1: root.cover.with-alpha(1 - root.v1);
+    property <color> open-2: root.cover.with-alpha(1 - root.v2);
+
+    background: @radial-gradient(circle root.reach at root.cx root.cy,
+        root.open-f 0, root.open-f root.p1, root.shut root.p2,
+        root.shut root.p3, root.open-2 root.p4, root.open-2 root.p5, root.shut root.p6,
+        root.shut root.p7, root.open-1 root.p8, root.open-1 root.p9, root.shut root.p10,
+        root.shut root.p11, root.open-0 root.p12, root.open-0 root.p13, root.shut root.p14,
+        root.shut 1);
+}
+
+/// The OFF fade: the page background comes back as a soft-edged disc that
+/// grows from the centre. `progress` runs 0..1.
+component FadeMask inherits Rectangle {
+    in property <length> cx;
+    in property <length> cy;
+    in property <length> reach;
+    in property <float> progress;
+    in property <color> cover;
+
+    // Width of the soft front, as a fraction of `reach`.
+    property <float> soft: 0.22;
+    // Eased: quick at the centre, settling at the edges.
+    property <float> eased: 1 - (1 - root.progress) * (1 - root.progress);
+    property <float> d: root.eased * (1 + root.soft) - root.soft;
+    property <float> inner: max(root.d, 0);
+
+    property <color> c0: root.cover.with-alpha(Mask.unit((root.d + root.soft) / root.soft));
+    property <color> c1: root.cover.with-alpha(Mask.unit((root.d + root.soft - root.inner) / root.soft));
+    property <color> clear: root.cover.with-alpha(0);
+    property <float> front: Mask.unit(root.d + root.soft);
+
+    background: @radial-gradient(circle root.reach at root.cx root.cy,
+        root.c0 0, root.c1 root.inner, root.clear root.front, root.clear 1);
+}
+
+/// The mode switch: a large pill whose knob carries a note. Click, Space or
+/// Enter toggles it.
+component HeroToggle inherits Rectangle {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    property <length> inset: 7px;
+    property <length> knob-size: root.height - 2 * root.inset;
+    property <bool> hovered: touch.has-hover && root.enabled;
+    property <duration> slide: OverviewAnim.reduced-motion ? 0ms : 340ms;
+
+    width: 176px;
+    height: 92px;
+    border-radius: root.height / 2;
+    // On: frosted white over the magenta. Off: a quiet grey track.
+    background: root.checked
+        ? (root.hovered ? #FFFFFF47 : #FFFFFF33)
+        : Theme.text-tertiary.with-alpha(root.hovered ? 0.5 : 0.36);
+    border-width: 1px;
+    border-color: root.checked ? #FFFFFF66 : Theme.separator;
+    opacity: root.enabled ? 1 : 0.45;
+    animate background { duration: 200ms; }
+
+    accessible-role: switch;
+    accessible-label: "Active mode";
+    accessible-description: root.checked
+        ? "Apple Music traffic is cached and served from this computer when offline."
+        : "All traffic is forwarded untouched.";
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        root.flip();
+    }
+
+    function flip() {
+        if !root.enabled {
+            return;
+        }
+        root.checked = !root.checked;
+        root.toggled(root.checked);
+    }
+
+    knob := Rectangle {
+        // Squeezes wider while pressed, like a finger on a real switch.
+        width: touch.pressed ? root.knob-size + 16px : root.knob-size;
+        height: root.knob-size;
+        y: root.inset;
+        x: root.checked ? root.width - self.width - root.inset : root.inset;
+        border-radius: root.knob-size / 2;
+        background: #FFFFFF;
+        drop-shadow-blur: 10px;
+        drop-shadow-offset-y: 2px;
+        drop-shadow-color: #00000047;
+        animate x { duration: root.slide; easing: ease-out-back; }
+        animate width { duration: 140ms; easing: ease-out; }
+
+        Image {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 38px;
+            height: 38px;
+            source: @image-url("../icons/note-eighth.svg");
+            colorize: root.checked ? Theme.accent : #AEAEB2;
+            accessible-role: none;
+        }
+    }
+
+    // The whole pill, knob and empty track alike. A click toggles without
+    // taking focus, like the std Switch, so no focus ring appears.
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            root.flip();
+        }
+    }
+
+    // Keys only (Tab, then Space or Enter): with focus-on-click it would take
+    // the press away from the TouchArea under it, so a click on the track
+    // would only focus.
+    focus := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " {
+                root.flip();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    // The app's focus ring (2px, 4px outside), shown on keyboard focus only,
+    // like the std Switch; white on the magenta page, where the accent would
+    // vanish.
+    Rectangle {
+        x: -4px;
+        y: -4px;
+        width: parent.width + 8px;
+        height: parent.height + 8px;
+        border-radius: self.height / 2;
+        border-width: focus.has-focus ? 2px : 0px;
+        border-color: root.checked ? #FFFFFF : Theme.accent;
+    }
+}
+
+/// A text button styled as a link ("Go to Settings", "Dismiss").
+component TextLink inherits Rectangle {
     in property <string> text;
-    callback dismiss();
+    in property <color> tone;
+    callback activated();
 
-    border-radius: Theme.radius-md;
-    background: Theme.accent-soft;
-    height: row.preferred-height;
+    width: label.preferred-width;
+    height: label.preferred-height;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => {
+        root.activated();
+    }
 
-    row := HorizontalLayout {
-        padding: 16px;
-        spacing: 16px;
+    label := Text {
+        text: root.text;
+        color: root.tone;
+        font-size: Theme.callout;
+        font-weight: 600;
+    }
 
-        Text {
-            horizontal-stretch: 1;
-            vertical-alignment: center;
-            wrap: word-wrap;
-            font-size: Theme.body;
-            color: Theme.text-primary;
-            text: root.text;
+    // Underline on hover and keyboard focus.
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: root.tone;
+        visible: touch.has-hover || focus.has-focus;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            focus.focus();
+            root.activated();
         }
+    }
 
-        VerticalLayout {
-            alignment: center;
-            ActionButton {
-                text: "Dismiss";
-                clicked => {
-                    root.dismiss();
-                }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " {
+                root.activated();
+                return accept;
             }
+            reject
         }
     }
 }
 
-/// Overview page: the mode switch as the hero, status groups and the live
-/// activity feed.
+/// Overview page: the mode title, the switch, and an issue line when needed.
 export component OverviewPage inherits Rectangle {
+    /// "Go to Settings" of the issue line: open Settings at this section.
+    callback open-settings(string);
+
     property <length> pad: root.width >= 1100px ? 32px : 24px;
-    // Certificate row status line (dot + text under the row title). States
-    // come from `TrustState::ui_key`: trusted, untrusted, error; plus checking.
-    property <string> trust-status: ProxyState.trust-busy ? "Working…"
-        : ProxyState.trust-state == "trusted"
-        ? (ProxyState.trust-message != "" ? ProxyState.trust-message : "Trusted by this computer")
-        : ProxyState.trust-state == "untrusted" ? "Not installed"
-        : ProxyState.trust-state == "checking" ? "Checking…" : "Needs attention";
-    property <color> trust-tone: ProxyState.trust-busy || ProxyState.trust-state == "checking" ? Theme.text-tertiary
-        : ProxyState.trust-state == "trusted" ? Theme.ok
-        : ProxyState.trust-state == "untrusted" ? Theme.warn : Theme.error;
+    property <bool> active: ProxyState.active;
+    property <bool> live: OverviewAnim.live;
+    // The ripple starts at the switch.
+    property <length> cx: root.width / 2;
+    property <length> cy: max(root.height * 0.5, 190px);
+    property <length> reach: sqrt(pow(max(root.cx, root.width - root.cx) / 1px, 2) + pow(max(root.cy, root.height - root.cy) / 1px, 2)) * 1px + 2px;
+    property <duration> on-time: 2000ms;
+    property <duration> off-time: 900ms;
+    // An ON ripple or OFF fade is playing (frames follow the display while
+    // it does; otherwise nothing here asks for frames except the notes).
+    property <bool> rippling: false;
+    property <bool> fading: false;
+    property <duration> started;
+    property <float> on-progress: OverviewAnim.freeze-on >= 0 ? OverviewAnim.freeze-on
+        : root.rippling ? Mask.unit((animation-tick() - root.started) / root.on-time) : 1;
+    property <float> off-progress: OverviewAnim.freeze-off >= 0 ? OverviewAnim.freeze-off
+        : root.fading ? Mask.unit((animation-tick() - root.started) / root.off-time) : 1;
+    // Text and icons sit on the magenta layer while Active.
+    property <color> ink: root.active ? #FFFFFF : Theme.text-primary;
+    property <color> ink-soft: root.active ? #FFFFFFDE : Theme.text-secondary;
+    animate ink, ink-soft { duration: OverviewAnim.reduced-motion ? 0ms : 450ms; delay: OverviewAnim.reduced-motion ? 0ms : root.active ? 150ms : 380ms; }
+
+    // The issue line: the most important problem, and where it is fixed
+    // ("" section = a hint that can only be dismissed).
+    property <string> issue: ProxyState.last-error != "" ? ProxyState.last-error
+        : ProxyState.starting ? ""
+        : !ProxyState.running ? "The proxy is not running."
+        : ProxyState.trust-state == "untrusted" ? "The certificate isn't trusted yet, so Cider can't use the proxy."
+        : ProxyState.trust-state == "error" ? "The certificate needs attention."
+        : CiderState.automatic && !CiderState.available ? "Cider's settings file wasn't found."
+        : CiderState.automatic && !CiderState.routed ? "Cider isn't routed through this proxy."
+        : !ProxyState.session-captured ? "No Apple Music session captured yet. Play a song in Cider while it uses the proxy."
+        : ProxyState.translocation-hint ? "macOS is running this copy from a temporary read-only location, so its portable “data” folder isn't used. Run  xattr -dr com.apple.quarantine  on the unzipped folder and open the app again."
+        : ProxyState.tray-hint ? "No system tray found, so closing the window quits the app. On GNOME, install the “AppIndicator and KStatusNotifierItem Support” extension."
+        : "";
+    property <string> issue-section: ProxyState.last-error != "" || !ProxyState.running ? "proxy"
+        : ProxyState.trust-state == "untrusted" || ProxyState.trust-state == "error" ? "certificate"
+        : CiderState.automatic && (!CiderState.available || !CiderState.routed) ? "cider"
+        : !ProxyState.session-captured ? "proxy"
+        : "";
+
+    clip: true;
+    background: Theme.bg-window;
+
+    changed active => {
+        if root.live && !OverviewAnim.reduced-motion {
+            root.started = animation-tick();
+            root.rippling = root.active;
+            root.fading = !root.active;
+        } else {
+            root.rippling = false;
+            root.fading = false;
+        }
+    }
+    // Losing the window jumps to the end state.
+    changed live => {
+        if !root.live {
+            root.rippling = false;
+            root.fading = false;
+        }
+    }
+
+    Timer {
+        interval: root.on-time;
+        running: root.rippling;
+        triggered => {
+            root.rippling = false;
+        }
+    }
+
+    Timer {
+        interval: root.off-time;
+        running: root.fading;
+        triggered => {
+            root.fading = false;
+        }
+    }
+
+    // The magenta layer. Plain while the window is not live.
+    if root.active || root.fading || OverviewAnim.freeze-off >= 0: Rectangle {
+        background: Theme.accent;
+        if root.live: NoteField {
+            width: parent.width;
+            height: parent.height;
+            dark-tone: Theme.accent.darker(0.16);
+            light-tone: Theme.accent.brighter(0.12);
+        }
+    }
+
+    if root.active && (root.rippling || OverviewAnim.freeze-on >= 0): RevealMask {
+        cx: root.cx;
+        cy: root.cy;
+        reach: root.reach;
+        progress: root.on-progress;
+        cover: Theme.bg-window;
+    }
+
+    if !root.active && (root.fading || OverviewAnim.freeze-off >= 0): FadeMask {
+        cx: root.cx;
+        cy: root.cy;
+        reach: root.reach;
+        progress: root.off-progress;
+        cover: Theme.bg-window;
+    }
 
     VerticalLayout {
-        padding-left: root.pad;
-        padding-right: root.pad;
-        padding-top: 16px;
-        padding-bottom: root.pad;
-        spacing: 16px;
+        x: root.pad;
+        y: 16px;
+        width: root.width - 2 * root.pad;
+        height: self.preferred-height;
+        spacing: 4px;
 
-        PageTitle {
-            height: 56px;
-            title: "Overview";
-            subtitle: "A local proxy between Cider and Apple Music.";
+        Text {
+            text: root.active ? "Active" : "Passthrough";
+            font-size: 30px;
+            font-weight: 700;
+            color: root.ink;
+            accessible-role: none;
         }
 
-        // Shown when no system tray exists: closing the window quits the app.
-        if ProxyState.tray-hint: HintBanner {
-            text: "No system tray found, so closing the window quits the app. On GNOME, install the “AppIndicator and KStatusNotifierItem Support” extension to keep it running in the background.";
-            dismiss => {
-                ProxyState.dismiss-tray-hint();
-            }
+        Text {
+            wrap: word-wrap;
+            font-size: Theme.body;
+            color: root.ink-soft;
+            text: root.active
+                ? "Apple Music traffic is cached and served from this computer when offline."
+                : "All traffic is forwarded untouched. Nothing is cached.";
         }
+    }
 
-        // macOS runs a quarantined portable copy from a read-only temporary
-        // folder (App Translocation), where the `data` folder is not found.
-        if ProxyState.translocation-hint: HintBanner {
-            text: "macOS is running this copy from a temporary read-only location, so the portable “data” folder next to it is not used. Quit, run  xattr -dr com.apple.quarantine  on the unzipped folder in Terminal, and open the app again.";
-            dismiss => {
-                ProxyState.translocation-hint = false;
-            }
+    HeroToggle {
+        x: root.cx - self.width / 2;
+        y: root.cy - self.height / 2;
+        checked <=> ProxyState.active;
+        enabled: ProxyState.running;
+        toggled(on) => {
+            ProxyState.set-active(on);
         }
+    }
 
-        if ProxyState.trust-state != "trusted" && ProxyState.trust-state != "checking": Onboarding { }
+    if root.issue != "": Rectangle {
+        width: min(issue-row.preferred-width, root.width - 2 * root.pad);
+        height: issue-row.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: root.height - root.pad - self.height;
+        accessible-role: text;
+        accessible-label: root.issue;
 
-        // Hero: the mode switch.
-        Rectangle {
-            border-radius: Theme.radius-md;
-            background: Theme.bg-fill;
-            height: hero.preferred-height;
-
-            hero := HorizontalLayout {
-                padding: 16px;
-                spacing: 16px;
-
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 4px;
-                    horizontal-stretch: 1;
-                    Text {
-                        text: ProxyState.active ? "Active" : "Passthrough";
-                        font-size: Theme.title;
-                        font-weight: 700;
-                        color: Theme.text-primary;
-                    }
-
-                    Text {
-                        wrap: word-wrap;
-                        font-size: Theme.body;
-                        color: Theme.text-secondary;
-                        text: ProxyState.active
-                            ? "Apple Music traffic is cached and served from this computer when offline."
-                            : "All traffic is forwarded untouched. Nothing is cached.";
-                    }
-                }
-
-                VerticalLayout {
-                    alignment: center;
-                    BigToggle {
-                        checked <=> ProxyState.active;
-                        enabled: ProxyState.running;
-                        toggled(on) => {
-                            ProxyState.set-active(on);
-                        }
-                    }
-                }
-            }
-        }
-
-        HorizontalLayout {
-            spacing: 16px;
-            alignment: stretch;
-            vertical-stretch: 0;
-
-            // Status.
+        issue-row := HorizontalLayout {
+            spacing: 8px;
             VerticalLayout {
-                horizontal-stretch: 1;
-                spacing: 8px;
-                alignment: start;
-                GroupHeading {
-                    text: "Proxy";
-                }
-
-                Group {
-                    ListRow {
-                        title: ProxyState.starting ? "Starting…"
-                            : !ProxyState.running ? "Proxy stopped"
-                            : ProxyState.online ? "Online" : "Offline, serving from this computer";
-                        description: ProxyState.running && ProxyState.online ? "Apple Music is reachable." : "";
-                        Dot {
-                            tone: !ProxyState.running ? Theme.error : ProxyState.online ? Theme.ok : Theme.warn;
-                        }
-                    }
-
-                    RowSeparator { }
-
-                    ListRow {
-                        title: "Address";
-                        description: ProxyState.address;
-                        address := TextInput {
-                            width: 0px;
-                            height: 0px;
-                            read-only: true;
-                            text: ProxyState.address;
-                        }
-
-                        ActionButton {
-                            text: "Copy";
-                            clicked => {
-                                address.select-all();
-                                address.copy();
-                                address.clear-selection();
-                            }
-                        }
-                    }
-
-                    RowSeparator { }
-
-                    ListRow {
-                        title: "Requests seen";
-                        Text {
-                            text: ProxyState.requests-seen;
-                            font-size: Theme.body;
-                            color: Theme.text-secondary;
-                        }
-                    }
-
-                    RowSeparator { }
-
-                    ListRow {
-                        title: "Served from this computer";
-                        Text {
-                            text: ProxyState.served-locally;
-                            font-size: Theme.body;
-                            color: Theme.text-secondary;
-                        }
-                    }
-                }
-            }
-
-            // Certificate and Cider.
-            VerticalLayout {
-                horizontal-stretch: 1;
-                spacing: 8px;
-                alignment: start;
-                GroupHeading {
-                    text: "Setup";
-                }
-
-                Group {
-                    ListRow {
-                        title: "Certificate";
-                        status: root.trust-status;
-                        status-tone: root.trust-tone;
-                        // A trusted CA's note (if any) is the status itself.
-                        description: ProxyState.trust-state == "trusted" ? "" : ProxyState.trust-message;
-
-                        if ProxyState.trust-state != "trusted" && ProxyState.trust-state != "checking": ActionButton {
-                            text: ProxyState.trust-state == "untrusted" ? "Install" : "Fix";
-                            enabled: !ProxyState.trust-busy;
-                            clicked => {
-                                ProxyState.install-ca();
-                            }
-                        }
-
-                        ActionButton {
-                            text: "Check again";
-                            enabled: !ProxyState.trust-busy;
-                            clicked => {
-                                ProxyState.recheck-ca();
-                            }
-                        }
-                    }
-
-                    RowSeparator { }
-
-                    if CiderState.automatic: ListRow {
-                        title: "Route Cider through this proxy";
-                        // Status line, then the settings file in use (the
-                        // description sits under the label).
-                        description: (!CiderState.available
-                            ? (CiderState.message != "" ? CiderState.message : "Cider's settings file was not found. Choose it to continue.")
-                            : CiderState.message != "" ? CiderState.message
-                            : CiderState.routed ? "Changing this restarts Cider." : "Turning this on edits Cider's settings and restarts it.")
-                            + (CiderState.config-path != "" ? "\nSettings file: " + CiderState.config-path : "");
-                        ActionButton {
-                            text: "Choose config file…";
-                            enabled: !CiderState.busy;
-                            clicked => {
-                                CiderState.choose-config();
-                            }
-                        }
-
-                        Switch {
-                            checked <=> CiderState.routed;
-                            enabled: CiderState.available && !CiderState.busy;
-                            toggled => {
-                                CiderState.set-routed(self.checked);
-                            }
-                        }
-                    }
-
-                    if !CiderState.automatic: ListRow {
-                        title: "Use Cider with this proxy";
-                        description: CiderState.guide;
-                    }
-
-                    RowSeparator { }
-
-                    ListRow {
-                        title: "Capture Apple traffic to disk";
-                        description: "For troubleshooting. Saved in the capture folder.";
-                        Switch {
-                            checked <=> ProxyState.capture;
-                            enabled: ProxyState.running;
-                            toggled => {
-                                ProxyState.set-capture(self.checked);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if ProxyState.last-error != "": Rectangle {
-            border-radius: Theme.radius-md;
-            background: Theme.error.with-alpha(0.12);
-            height: error-row.preferred-height;
-            error-row := HorizontalLayout {
-                padding: 12px;
-                spacing: 8px;
+                alignment: center;
                 Icon {
                     source: Icons.alert;
                     size: 16px;
-                    tint: Theme.error;
-                }
-
-                Text {
-                    text: ProxyState.last-error;
-                    font-size: Theme.body;
-                    wrap: word-wrap;
-                    color: Theme.error;
-                    horizontal-stretch: 1;
+                    tint: root.active ? #FFFFFF : Theme.warn;
                 }
             }
-        }
 
-        // Activity.
-        GroupHeading {
-            text: "Activity";
-        }
-
-        Rectangle {
-            vertical-stretch: 1;
-            min-height: 96px;
-            border-radius: Theme.radius-md;
-            background: Theme.bg-fill;
-
-            if ProxyState.activity.length == 0: Text {
-                text: "Nothing yet.";
-                font-size: Theme.body;
-                color: Theme.text-secondary;
-                horizontal-alignment: center;
+            Text {
+                horizontal-stretch: 1;
                 vertical-alignment: center;
+                wrap: word-wrap;
+                text: root.issue;
+                font-size: Theme.callout;
+                color: root.ink-soft;
             }
 
-            if ProxyState.activity.length > 0: ListView {
-                for row in ProxyState.activity: HorizontalLayout {
-                    padding-left: 14px;
-                    padding-right: 14px;
-                    spacing: 12px;
-                    height: 32px;
-                    Text {
-                        text: row.time;
-                        width: 64px;
-                        vertical-alignment: center;
-                        color: Theme.text-tertiary;
-                        font-size: Theme.caption;
-                    }
-
-                    Text {
-                        text: row.text;
-                        vertical-alignment: center;
-                        overflow: elide;
-                        font-size: Theme.body;
-                        color: row.level == "error" ? Theme.error : row.level == "warn" ? Theme.warn : Theme.text-primary;
+            VerticalLayout {
+                alignment: center;
+                TextLink {
+                    text: root.issue-section != "" ? "Go to Settings" : "Dismiss";
+                    tone: root.active ? #FFFFFF : Theme.accent;
+                    activated => {
+                        if root.issue-section != "" {
+                            root.open-settings(root.issue-section);
+                        } else if ProxyState.translocation-hint {
+                            ProxyState.translocation-hint = false;
+                        } else {
+                            ProxyState.dismiss-tray-hint();
+                        }
                     }
                 }
             }

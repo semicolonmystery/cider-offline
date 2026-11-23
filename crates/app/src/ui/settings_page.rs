@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use cider_offline_core::lyrics::TARGET_QUALITIES;
 use cider_offline_core::{
-    AutoCacheMode, Config, DetailLevel, FailurePolicy, LyricsProviderId, LyricsSettings, SongsPage,
-    clamp_concurrency,
+    AutoCacheMode, Config, DetailLevel, DownloadFormat, FailurePolicy, LyricsProviderId,
+    LyricsSettings, SongsPage, UnlinkedCleanup, UnlinkedReport, clamp_concurrency,
 };
 use slint::{ComponentHandle as _, ModelRc, VecModel};
 
-use super::{AppContext, LyricsProviderRow, SettingsState, dialogs};
+use super::{AppContext, LyricsProviderRow, SettingsState, dialogs, format};
 use crate::cleanup;
 
 /// Settings state owned by the UI thread.
@@ -19,6 +19,13 @@ use crate::cleanup;
 pub struct SettingsData {
     /// Port requested by "Apply" that the proxy has not confirmed yet.
     pending_port: Cell<Option<u16>>,
+}
+
+/// Shows the data and capture folders. The paths wrap between folders
+/// instead of widening the page.
+pub(super) fn show_folders(state: &SettingsState<'_>, paths: &cider_offline_core::AppPaths) {
+    state.set_data_dir(format::breakable(&paths.data_dir().display().to_string()).into());
+    state.set_captures_dir(format::breakable(&paths.captures_dir().display().to_string()).into());
 }
 
 /// Wires the Settings callbacks.
@@ -37,6 +44,13 @@ pub fn bind(ctx: &Rc<AppContext>) {
         state.set_songs_page(i32::from(config.library.songs_page.as_u8()));
         state.set_overwrite_lyrics(config.overwrite_lyrics);
         state.set_download_concurrency(i32::try_from(config.download_concurrency()).unwrap_or(1));
+        state.set_download_format(i32::from(config.download_format.as_u8()));
+        state.set_play_other_mix(config.play_other_downloaded_mix);
+        state.set_remove_lyrics_with_downloads(config.remove_lyrics_with_downloads);
+        state.set_unlinked_mode(i32::from(
+            config.unlinked_downloads == UnlinkedCleanup::Automatic,
+        ));
+        state.set_unlinked_hours(i32::try_from(config.unlinked_cleanup_hours()).unwrap_or(6));
         fill_lyrics(&state, &config);
     }
     state.set_autostart_supported(ctx.autostart.is_some());
@@ -47,8 +61,7 @@ pub fn bind(ctx: &Rc<AppContext>) {
         })
     });
     state.set_start_with_os(start_with_os);
-    state.set_data_dir(ctx.paths.data_dir().display().to_string().into());
-    state.set_captures_dir(ctx.paths.captures_dir().display().to_string().into());
+    show_folders(&state, &ctx.paths);
 
     let c = Rc::clone(ctx);
     state.on_apply_port(move |port| apply_port(&c, port));
@@ -60,6 +73,11 @@ pub fn bind(ctx: &Rc<AppContext>) {
     });
     let c = Rc::clone(ctx);
     state.on_set_download_concurrency(move |value| set_download_concurrency(&c, value));
+    let c = Rc::clone(ctx);
+    state.on_set_download_format(move |index| set_download_format(&c, index));
+    let c = Rc::clone(ctx);
+    state.on_set_play_other_mix(move |enabled| set_play_other_mix(&c, enabled));
+    bind_unlinked(ctx, &state);
     let c = Rc::clone(ctx);
     state.on_set_auto_cache_mode(move |index| set_auto_cache_mode(&c, index));
     let c = Rc::clone(ctx);
@@ -73,6 +91,10 @@ pub fn bind(ctx: &Rc<AppContext>) {
     });
     let c = Rc::clone(ctx);
     state.on_set_songs_page(move |index| set_songs_page(&c, index));
+    let c = Rc::clone(ctx);
+    state.on_set_remove_lyrics_with_downloads(move |enabled| {
+        c.update_config(|config| config.remove_lyrics_with_downloads = enabled);
+    });
     let c = Rc::clone(ctx);
     state.on_set_overwrite_lyrics(move |enabled| {
         update_lyrics(&c, |config| config.overwrite_lyrics = enabled);
@@ -239,6 +261,10 @@ fn apply_port(ctx: &Rc<AppContext>, port: i32) {
     show_message(ctx, &format!("Restarting the proxy on port {port}…"));
     let mut config = ctx.config().clone();
     config.proxy.port = port;
+    // The saved mode is not the startup rule: before the first trust check
+    // (say the first start failed on a busy port) the restart must not be
+    // Active (see `overview::start_mode`).
+    config.mode = super::overview::restart_mode(ctx);
     ctx.service.restart(config);
 }
 
@@ -306,6 +332,160 @@ fn set_songs_page(ctx: &Rc<AppContext>, index: i32) {
     let page = u8::try_from(index).map_or(SongsPage::Apple, SongsPage::from_u8);
     ctx.update_config(|config| config.library.songs_page = page);
     ctx.service.set_songs_page(page);
+}
+
+/// Persists the "Download format" choice and applies it to the running
+/// queue at once (the next fetch that starts uses it).
+fn set_download_format(ctx: &Rc<AppContext>, index: i32) {
+    let format = u8::try_from(index).map_or(DownloadFormat::Stereo, DownloadFormat::from_u8);
+    ctx.update_config(|config| config.download_format = format);
+    ctx.service.set_download_format(format);
+    // What counts as missing follows the format.
+    super::library::reload(ctx);
+}
+
+/// Wires the "Unlinked downloads" controls.
+fn bind_unlinked(ctx: &Rc<AppContext>, state: &SettingsState<'_>) {
+    let c = Rc::clone(ctx);
+    state.on_set_unlinked_mode(move |index| {
+        let mode = if index == 1 {
+            UnlinkedCleanup::Automatic
+        } else {
+            UnlinkedCleanup::Manual
+        };
+        set_unlinked_cleanup(&c, Some(mode), None);
+    });
+    let c = Rc::clone(ctx);
+    state.on_set_unlinked_hours(move |hours| {
+        set_unlinked_cleanup(&c, None, u32::try_from(hours).ok());
+    });
+    let c = Rc::clone(ctx);
+    state.on_refresh_unlinked(move || refresh_unlinked(&c));
+    let c = Rc::clone(ctx);
+    state.on_clean_up_unlinked(move || clean_up_unlinked(&c));
+}
+
+/// Persists the "Unlinked downloads" mode and / or the hours between
+/// automatic clean-ups, and applies them to the running app.
+fn set_unlinked_cleanup(ctx: &Rc<AppContext>, mode: Option<UnlinkedCleanup>, hours: Option<u32>) {
+    ctx.update_config(|config| {
+        if let Some(mode) = mode {
+            config.unlinked_downloads = mode;
+        }
+        if let Some(hours) = hours {
+            config.unlinked_cleanup_hours =
+                hours.clamp(1, cider_offline_core::config::MAX_UNLINKED_CLEANUP_HOURS);
+        }
+    });
+    let config = ctx.config();
+    ctx.service
+        .set_unlinked_cleanup(config.unlinked_downloads, config.unlinked_cleanup_hours());
+}
+
+/// The "Clean up now" line for what was found.
+fn unlinked_summary(report: &UnlinkedReport) -> String {
+    if report.files == 0 {
+        "No unlinked downloads right now.".to_owned()
+    } else {
+        format!(
+            "{} not needed by any download.",
+            format::files_and_size(report.files, report.bytes)
+        )
+    }
+}
+
+/// The message after "Clean up now" deleted `removed`.
+fn cleaned_up_message(removed: &UnlinkedReport) -> String {
+    if removed.files == 0 {
+        "Nothing was deleted.".to_owned()
+    } else {
+        format!(
+            "Deleted {}.",
+            format::files_and_size(removed.files, removed.bytes)
+        )
+    }
+}
+
+/// Shows `report` on the "Clean up now" row.
+pub(super) fn set_unlinked(state: &SettingsState<'_>, report: &UnlinkedReport) {
+    state.set_unlinked_count(i32::try_from(report.files).unwrap_or(i32::MAX));
+    state.set_unlinked_summary(unlinked_summary(report).into());
+}
+
+fn show_unlinked(ctx: &AppContext, report: &UnlinkedReport) {
+    ctx.with_ui(|ui| set_unlinked(&ui.global::<SettingsState>(), report));
+}
+
+/// Re-counts the unlinked downloads for the "Clean up now" row.
+pub(super) fn refresh_unlinked(ctx: &Rc<AppContext>) {
+    ctx.with_backend(
+        |backend| async move { backend.downloads.unlinked_downloads().await },
+        |ctx, result| match result {
+            Some(Ok(report)) => show_unlinked(ctx, &report),
+            Some(Err(error)) => {
+                tracing::warn!(%error, "could not count unlinked downloads");
+            }
+            None => {}
+        },
+    );
+}
+
+/// "Clean up now": counts the unlinked downloads again, asks, then deletes
+/// them.
+fn clean_up_unlinked(ctx: &Rc<AppContext>) {
+    ctx.with_backend(
+        |backend| async move { backend.downloads.unlinked_downloads().await },
+        |ctx, result| {
+            let Some(Ok(report)) = result else { return };
+            show_unlinked(ctx, &report);
+            if report.files == 0 {
+                return;
+            }
+            let message = format!(
+                "Delete {} that no album, playlist or single download needs any more? Custom audio and links to local files are kept. You can download them again.",
+                format::files_and_size(report.files, report.bytes)
+            );
+            let c = Rc::clone(ctx);
+            dialogs::confirm(
+                ctx,
+                dialogs::Prompt {
+                    title: "Clean up unlinked downloads",
+                    message: &message,
+                    confirm: "Delete",
+                    destructive: true,
+                },
+                move || {
+                    c.with_backend(
+                        |backend| async move { backend.downloads.clean_up_unlinked().await },
+                        |ctx, result| {
+                            match result {
+                                Some(Ok(removed)) => {
+                                    tracing::info!(
+                                        files = removed.files,
+                                        "unlinked downloads deleted"
+                                    );
+                                    show_message(ctx, &cleaned_up_message(&removed));
+                                }
+                                Some(Err(error)) => show_message(
+                                    ctx,
+                                    &format!("Could not clean up the downloads: {error}"),
+                                ),
+                                None => {}
+                            }
+                            refresh_unlinked(ctx);
+                        },
+                    );
+                },
+            );
+        },
+    );
+}
+
+/// Persists "Play the other downloaded mix" and applies it to the running
+/// proxy at once (the next playback request uses it).
+fn set_play_other_mix(ctx: &Rc<AppContext>, enabled: bool) {
+    ctx.update_config(|config| config.play_other_downloaded_mix = enabled);
+    ctx.service.set_play_other_downloaded_mix(enabled);
 }
 
 /// Persists the "Simultaneous downloads" choice and applies it to the

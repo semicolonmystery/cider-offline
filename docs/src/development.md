@@ -43,6 +43,12 @@ CI (`.github/workflows/ci.yml`) runs exactly these checks, on the whole workspac
 
 The workspace forbids `unsafe` code and warns on missing docs and on Clippy's pedantic lints, so `-D warnings` makes those hard errors. The app crate only denies `unsafe` instead of forbidding it, for two scoped exceptions: the code Slint generates from the `.slint` files, and one Windows call (`AllowSetForegroundWindow`, so a second launch can bring the running window to the front).
 
+## Database migrations
+
+The library database (`store.sqlite`) is versioned with SQLite's `user_version`. The migrations are the numbered SQL files in `crates/core/src/storage/migrations/`, listed in `storage/migrations.rs`, and the app applies the ones a database hasn't had yet when it opens it. Each one runs in a single transaction together with its version bump, with foreign keys off (SQLite's table rebuild needs that) and a `foreign_key_check` before it commits. A database newer than the app is refused.
+
+A migration that has been released is never edited. A schema change is a new file with the next number, and it should upgrade real data without losing anything: test it on a copy of a real database (the ignored test `real_db_copy_should_migrate_cleanly` takes one through `CIDER_DB_COPY`). No table is `STRICT`, so that older SQLite versions, such as Python 3.8's, can still open the file.
+
 ## Headless checks
 
 The app binary has a few modes that run against your real data without opening a window, for checking library, offline and download behaviour against the live Apple Music API. They need tokens the proxy has already captured from Cider, and they print no token values. Run them with the app closed, from a debug or release build:
@@ -51,7 +57,7 @@ The app binary has a few modes that run against your real data without opening a
 | --- | --- |
 | `cider-offline --library-check [--fresh] [--import-tokens <store.sqlite>]` | Runs one library sync and compares the result with what the Library page reads. `--fresh` syncs into a new temporary database that has only the tokens, `--import-tokens` copies the tokens from another database first. |
 | `cider-offline --offline-check [--captures <dir>] [--baseline] [--verbose]` | Starts the proxy forced offline on a free port, over a temporary copy of the database, and replays captured Cider requests against it through real TLS. Then checks the library contents, artwork, search, playback, the Songs page setting and lyrics, offline and online. `--captures` defaults to the app's captures folder. |
-| `cider-offline --download-check <catalog id>... [--concurrency N]` | Runs the given songs through the real download queue and downloader, printing every queue event. |
+| `cider-offline --download-check <catalog id>... [--concurrency N] [--format stereo\|spatial_where_available\|both]` | Runs the given songs through the real download queue and downloader, printing every queue event and then each recorded file (mix, size, duration). `--format` overrides `download_format` from `config.toml`. |
 | `cider-offline --lyrics-check [--collection NAME] [--default-settings] [--overwrite]` | Counts songs with lyrics, runs "Fetch all missing lyrics" (or one collection's fetch) and counts again. |
 | `cider-offline --lyrics-check --provider <id\|all> [--collection NAME]... [--limit N] [--ids ID...] [--show-ttml]` | Asks one provider (or each in turn) about some songs and prints what it found. Stores nothing. |
 | `cider-offline --perf-check [--collection NAME]` | Times the paged library queries, the cover prefetch and opening a large playlist. |
@@ -96,8 +102,8 @@ What goes into the packages:
 Releases are built by `.github/workflows/release.yml` when a tag starting with `v` is pushed:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 The workflow first checks that the tag (without its `v`) equals both the workspace version in `Cargo.toml` and the version in `crates/app/Packager.toml`, and stops if they differ. Then it builds:
@@ -127,7 +133,7 @@ mdbook serve docs --open
 
 ## Website
 
-The site at <https://cider-offline.podik.cz> is a Next.js static export in `web/` (React, TypeScript, Tailwind and shadcn). For now its root page only redirects to the book. It also holds the 404 page for the whole domain, the sitemap, `robots.txt` and the image for link previews. It needs Node.js 26 (the current LTS). From `web/`:
+The site at <https://cider-offline.podik.cz> is a Next.js static export in `web/` (React, TypeScript, Tailwind, shadcn and GSAP). Its root page is a one-page landing site with a scroll-driven tour of the app, rebuilt in HTML from the Slint sources; the book is served under `/docs/`. It also holds the 404 page for the whole domain, the sitemap, `robots.txt` and the image for link previews. It needs Node.js 26 (the current LTS). From `web/`:
 
 ```sh
 npm ci              # install from package-lock.json

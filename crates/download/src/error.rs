@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use cider_offline_core::download::DownloadError;
+use cider_offline_core::storage::AudioVariant;
 
 /// Errors that can occur during DRM-protected audio download and decryption.
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +49,10 @@ pub enum DrmError {
     /// or `"music video: hls-playlist-url only"`).
     #[error("webPlayback returned no ctrp audio asset ({0})")]
     NoAudioAsset(String),
+    /// The song has no such version: no enhancedHls master, or a master
+    /// without the binaural (spatial) variant.
+    #[error("no {0} version of this song")]
+    VariantUnavailable(AudioVariant),
     /// webPlayback returned an empty `songList`.
     ///
     /// Observed with unlinked library ids (`i.…`). The argument is the
@@ -161,6 +166,8 @@ impl From<DrmError> for DownloadError {
                 DownloadError::unavailable(message)
             }
             DrmError::Cancelled => DownloadError::Cancelled,
+            DrmError::VariantUnavailable(variant) => DownloadError::variant_unavailable(variant),
+
             DrmError::Io(e) => DownloadError::Io(e),
             DrmError::InvalidWvd(_)
             | DrmError::Decrypt(_)

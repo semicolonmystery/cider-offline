@@ -10,7 +10,8 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use cider_offline_core::download::{DownloadError, DownloadRequest, Downloader};
+//! use cider_offline_core::download::{DownloadError, DownloadRequest, Downloaded, Downloader};
+//! use cider_offline_core::storage::AudioVariant;
 //! use cider_offline_core::{Config, ProxyHandle, async_trait};
 //!
 //! /// Example: picks files from a folder the user keeps in sync themselves.
@@ -20,10 +21,10 @@
 //! impl Downloader for FolderDownloader {
 //!     fn id(&self) -> &'static str { "folder" }
 //!
-//!     async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+//!     async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
 //!         let source = self.folder.join(format!("{}.m4a", request.playback.adam_id()));
 //!         tokio::fs::copy(&source, &request.output_path).await?;
-//!         Ok(request.output_path.clone())
+//!         Ok(Downloaded::new(request.output_path.clone(), AudioVariant::Stereo))
 //!     }
 //! }
 //!
@@ -54,9 +55,24 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::media::{AUDIO_EXTENSIONS, is_valid_media_id};
+use crate::storage::AudioVariant;
 
 /// Id of [`LocalImportDownloader`] in the registry.
 pub const LOCAL_IMPORT: &str = "local-import";
+
+/// Stem suffix of a spatial file: `<adam id>.spatial.m4a`.
+pub const SPATIAL_FILE_SUFFIX: &str = ".spatial";
+
+/// File name a downloader writes for `variant` of the song `adam_id`:
+/// `<adam id>.m4a` for [`AudioVariant::Stereo`], `<adam id>.spatial.m4a` for
+/// [`AudioVariant::Spatial`].
+#[must_use]
+pub fn media_file_name(adam_id: &str, variant: AudioVariant) -> String {
+    match variant {
+        AudioVariant::Stereo => format!("{adam_id}.m4a"),
+        AudioVariant::Spatial => format!("{adam_id}{SPATIAL_FILE_SUFFIX}.m4a"),
+    }
+}
 
 /// Errors from a [`Downloader`].
 ///
@@ -68,6 +84,7 @@ pub const LOCAL_IMPORT: &str = "local-import";
 /// | [`Unavailable`](Self::Unavailable) | "Can't download yet", never retried |
 /// | [`Transient`](Self::Transient) | retried with backoff (at least `retry_after`) |
 /// | [`AuthExpired`](Self::AuthExpired) | failed, not retried: the user re-signs in through Cider |
+/// | [`VariantUnavailable`](Self::VariantUnavailable) | the song has no such version; the queue falls back or skips it |
 /// | [`Cancelled`](Self::Cancelled) | the row keeps the state the user chose (paused / removed) |
 /// | [`Io`](Self::Io) | retried with backoff |
 /// | [`Other`](Self::Other) | retried with backoff |
@@ -125,6 +142,16 @@ pub enum DownloadError {
         /// What Apple returned.
         message: String,
     },
+    /// The song exists but not in the requested [`DownloadRequest::variant`]
+    /// (a song without a Dolby Atmos mix has no spatial version). Never
+    /// retried; the queue falls back to another variant or skips this one,
+    /// depending on the download format.
+    #[error("this song has no {variant} version")]
+    #[non_exhaustive]
+    VariantUnavailable {
+        /// The variant that was asked for.
+        variant: AudioVariant,
+    },
     /// The download stopped because [`DownloadRequest::cancel`] fired.
     #[error("download cancelled")]
     Cancelled,
@@ -171,6 +198,11 @@ impl DownloadError {
         Self::AuthExpired {
             message: message.into(),
         }
+    }
+
+    /// [`DownloadError::VariantUnavailable`] for `variant`.
+    pub fn variant_unavailable(variant: AudioVariant) -> Self {
+        Self::VariantUnavailable { variant }
     }
 }
 
@@ -345,13 +377,18 @@ pub struct DownloaderCapabilities {
     /// `false`, the queue marks music videos "Can't download yet" without
     /// calling the downloader.
     pub music_videos: bool,
+    /// Whether [`AudioVariant::Spatial`] requests are supported. While
+    /// `false`, the queue downloads only the normal version, whatever the
+    /// download format says.
+    pub spatial: bool,
 }
 
 impl DownloaderCapabilities {
-    /// Songs only.
+    /// Normal songs only.
     pub const fn new() -> Self {
         Self {
             music_videos: false,
+            spatial: false,
         }
     }
 
@@ -359,6 +396,13 @@ impl DownloaderCapabilities {
     #[must_use]
     pub const fn with_music_videos(mut self, supported: bool) -> Self {
         self.music_videos = supported;
+        self
+    }
+
+    /// Declares (or withdraws) support for the spatial version of songs.
+    #[must_use]
+    pub const fn with_spatial(mut self, supported: bool) -> Self {
+        self.spatial = supported;
         self
     }
 }
@@ -454,8 +498,17 @@ pub struct DownloadRequest {
     pub playback: PlaybackId,
     /// Song or music video.
     pub kind: MediaKind,
-    /// The final file to write (`<media_dir>/<adam id>.m4a` for the queue).
-    /// Write `<output_path>.part` first, then rename it here.
+    /// Which version of the song to produce. Always
+    /// [`AudioVariant::Stereo`] unless the downloader declared
+    /// [`DownloaderCapabilities::spatial`].
+    pub variant: AudioVariant,
+    /// The song's `extendedAssetUrls.enhancedHls` master playlist, when the
+    /// catalog has one. The queue sets it for [`AudioVariant::Spatial`]
+    /// requests: the spatial stream is a variant of this playlist.
+    pub enhanced_hls: Option<String>,
+    /// The final file to write ([`media_file_name`] in the media directory
+    /// for the queue). Write a temporary file next to it first, then rename
+    /// it here.
     pub output_path: PathBuf,
     /// Fires when the user pauses or removes the download, or the app shuts
     /// down. Check it between segments and return
@@ -472,14 +525,18 @@ pub struct DownloadRequest {
 }
 
 impl DownloadRequest {
-    /// A catalog-play song request for `adam_id`, writing
-    /// `<media_dir>/<adam_id>.m4a`.
+    /// A catalog-play request for the normal version of song `adam_id`,
+    /// writing `<media_dir>/<adam_id>.m4a`.
     pub fn new(adam_id: impl Into<String>, media_dir: impl Into<PathBuf>) -> Self {
         let adam_id = adam_id.into();
         Self {
-            output_path: media_dir.into().join(format!("{adam_id}.m4a")),
+            output_path: media_dir
+                .into()
+                .join(media_file_name(&adam_id, AudioVariant::Stereo)),
             playback: PlaybackId::catalog(adam_id),
             kind: MediaKind::Song,
+            variant: AudioVariant::Stereo,
+            enhanced_hls: None,
             cancel: CancellationToken::new(),
             info: TrackInfo::default(),
             source: None,
@@ -488,12 +545,29 @@ impl DownloadRequest {
     }
 
     /// Sets the playback identity and renames the output file after its
-    /// adam id (`<media_dir>/<adam id>.m4a`).
+    /// adam id ([`media_file_name`]).
     #[must_use]
     pub fn with_playback(mut self, playback: PlaybackId) -> Self {
         self.output_path
-            .set_file_name(format!("{}.m4a", playback.adam_id()));
+            .set_file_name(media_file_name(playback.adam_id(), self.variant));
         self.playback = playback;
+        self
+    }
+
+    /// Sets the variant to produce and renames the output file to match
+    /// ([`media_file_name`]).
+    #[must_use]
+    pub fn with_variant(mut self, variant: AudioVariant) -> Self {
+        self.output_path
+            .set_file_name(media_file_name(self.playback.adam_id(), variant));
+        self.variant = variant;
+        self
+    }
+
+    /// Sets the song's `enhancedHls` master playlist URL.
+    #[must_use]
+    pub fn with_enhanced_hls(mut self, url: Option<String>) -> Self {
+        self.enhanced_hls = url;
         self
     }
 
@@ -533,6 +607,41 @@ impl DownloadRequest {
     }
 }
 
+/// What a successful [`Downloader::fetch`] produced.
+///
+/// Build it with [`new`](Self::new) and
+/// [`with_duration_ms`](Self::with_duration_ms) (the struct is
+/// `#[non_exhaustive]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Downloaded {
+    /// The written file (normally [`DownloadRequest::output_path`]).
+    pub path: PathBuf,
+    /// Which version of the song the file holds.
+    pub variant: AudioVariant,
+    /// Playback length of the file in milliseconds, when the downloader
+    /// knows it.
+    pub duration_ms: Option<u32>,
+}
+
+impl Downloaded {
+    /// A `variant` file at `path` with no known duration.
+    pub fn new(path: impl Into<PathBuf>, variant: AudioVariant) -> Self {
+        Self {
+            path: path.into(),
+            variant,
+            duration_ms: None,
+        }
+    }
+
+    /// Sets the file's playback length.
+    #[must_use]
+    pub fn with_duration_ms(mut self, duration_ms: Option<u32>) -> Self {
+        self.duration_ms = duration_ms;
+        self
+    }
+}
+
 /// Produces a local audio file for a track.
 ///
 /// The contract between core and a downloader:
@@ -540,9 +649,13 @@ impl DownloadRequest {
 /// - **Request**: [`DownloadRequest::playback`] says exactly which ids go into
 ///   `webPlayback` and the license call, and [`DownloadRequest::kind`] whether
 ///   it is a song or a music video. Core has already resolved both, including
-///   the playable twin of a library-only item.
-/// - **Output**: write `<output_path>.part`, then rename it to
-///   [`DownloadRequest::output_path`]. Write nowhere else.
+///   the playable twin of a library-only item. [`DownloadRequest::variant`]
+///   names the version to produce.
+/// - **Output**: write a temporary file, then rename it to
+///   [`DownloadRequest::output_path`]. Write nowhere else. Return
+///   [`Downloaded`] with the variant actually produced (and the duration,
+///   when known), or [`DownloadError::VariantUnavailable`] when the song has
+///   no such version.
 /// - **Errors**: return the typed [`DownloadError`] variant that fits
 ///   ([`DownloadError::Unavailable`], [`DownloadError::Transient`],
 ///   [`DownloadError::AuthExpired`], ...). Core maps each one to retry, no retry or
@@ -551,8 +664,8 @@ impl DownloadRequest {
 ///   [`DownloadRequest::progress`] when it is set, and check [`DownloadRequest::cancel`] between segments
 ///   and around blocking work.
 /// - **Capabilities**: declare what it supports with
-///   [`Downloader::capabilities`]; music videos are only sent to a
-///   downloader that declares them.
+///   [`Downloader::capabilities`]; music videos and spatial requests are only
+///   sent to a downloader that declares them.
 #[async_trait]
 pub trait Downloader: Send + Sync + 'static {
     /// Stable registry id.
@@ -563,9 +676,8 @@ pub trait Downloader: Send + Sync + 'static {
         DownloaderCapabilities::new()
     }
 
-    /// Produces the audio file and returns its path (normally
-    /// [`DownloadRequest::output_path`]).
-    async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError>;
+    /// Produces the audio file and says what it wrote.
+    async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError>;
 }
 
 /// Downloaders by id. Always contains [`LocalImportDownloader`].
@@ -638,7 +750,7 @@ impl Downloader for LocalImportDownloader {
         LOCAL_IMPORT
     }
 
-    async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+    async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
         let source = request
             .source
             .as_deref()
@@ -655,7 +767,8 @@ impl Downloader for LocalImportDownloader {
         let tmp = media_dir.join(format!("{id}.{ext}.part"));
         tokio::fs::copy(source, &tmp).await?;
         tokio::fs::rename(&tmp, &dest).await?;
-        Ok(dest)
+        // An imported file is always the song's normal version.
+        Ok(Downloaded::new(dest, AudioVariant::Stereo))
     }
 }
 
@@ -676,7 +789,7 @@ mod tests {
             .fetch(&request(dir.path(), Some(source)))
             .await
             .unwrap();
-        assert_eq!(dest, dir.path().join("media").join("123.mp3"));
+        assert_eq!(dest.path, dir.path().join("media").join("123.mp3"));
     }
 
     #[tokio::test]
@@ -742,11 +855,46 @@ mod tests {
             fn id(&self) -> &'static str {
                 "plain"
             }
-            async fn fetch(&self, _: &DownloadRequest) -> Result<PathBuf, DownloadError> {
+            async fn fetch(&self, _: &DownloadRequest) -> Result<Downloaded, DownloadError> {
                 Err(DownloadError::Cancelled)
             }
         }
         assert!(!Plain.capabilities().music_videos);
+    }
+
+    #[test]
+    fn default_capabilities_should_exclude_spatial() {
+        assert!(!DownloaderCapabilities::default().spatial);
+    }
+
+    #[test]
+    fn with_variant_should_name_spatial_output_after_adam_id() {
+        let request = DownloadRequest::new("0", "/media")
+            .with_playback(PlaybackId::library("a.6814096109", "6814096109"))
+            .with_variant(AudioVariant::Spatial);
+        assert_eq!(
+            request.output_path,
+            PathBuf::from("/media").join("6814096109.spatial.m4a")
+        );
+    }
+
+    #[test]
+    fn with_playback_should_keep_the_spatial_file_name() {
+        let request = DownloadRequest::new("0", "/media")
+            .with_variant(AudioVariant::Spatial)
+            .with_playback(PlaybackId::catalog("42"));
+        assert_eq!(
+            request.output_path,
+            PathBuf::from("/media").join("42.spatial.m4a")
+        );
+    }
+
+    #[test]
+    fn new_request_should_ask_for_the_normal_variant() {
+        assert_eq!(
+            DownloadRequest::new("1", "/m").variant,
+            AudioVariant::Stereo
+        );
     }
 
     #[test]

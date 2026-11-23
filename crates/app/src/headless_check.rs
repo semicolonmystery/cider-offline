@@ -1,7 +1,7 @@
 //! Headless checks against the real store, without a window or the proxy.
 //!
 //! ```text
-//! cider-offline --download-check <catalog id>... [--concurrency N]
+//! cider-offline --download-check <catalog id>... [--concurrency N] [--format normal|spatial_where_available|both]
 //! cider-offline --lyrics-check [--collection NAME] [--default-settings] [--overwrite]
 //! cider-offline --lyrics-check --provider <id|all> [--collection NAME]... [--limit N] [--ids ID...] [--show-ttml]
 //! ```
@@ -9,7 +9,9 @@
 //! - `--download-check` runs the given tracks through the real download queue
 //!   and DRM downloader (the same code paths as the app) and prints every
 //!   queue event with a timestamp: stages, progress, retries, the final
-//!   status. Token values are never printed.
+//!   status, then every recorded audio file (variant, size, duration).
+//!   `--format` picks the download format (default: `config.toml`'s).
+//!   Token values are never printed.
 //! - `--lyrics-check` counts tracks with lyrics, runs "Fetch all missing
 //!   lyrics" (or one collection's "Fetch lyrics"), and counts again.
 //!   `--default-settings` uses the default lyrics settings instead of
@@ -30,9 +32,9 @@ use anyhow::{Context as _, bail};
 use cider_offline_core::download::DownloaderRegistry;
 use cider_offline_core::storage::{LyricsQuality, LyricsSource};
 use cider_offline_core::{
-    AppPaths, Config, DownloadEvent, DownloadQueue, DownloadRecord, DownloadSourceKind,
-    DownloadStatus, Library, LibraryFilter, LibraryQuery, LyricsProviderId, LyricsSettings,
-    Storage,
+    AppPaths, Config, DownloadEvent, DownloadFormat, DownloadQueue, DownloadRecord,
+    DownloadSourceKind, DownloadStatus, Library, LibraryFilter, LibraryQuery, LyricsProviderId,
+    LyricsSettings, Storage,
 };
 use cider_offline_download::DrmDownloader;
 
@@ -46,10 +48,12 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 /// Which check to run.
 #[derive(Debug)]
 pub enum Check {
-    /// Download these catalog ids at this concurrency.
+    /// Download these catalog ids at this concurrency, in this format
+    /// (`None`: the configured one).
     Download {
         ids: Vec<String>,
         concurrency: usize,
+        format: Option<DownloadFormat>,
     },
     /// Fetch missing lyrics (all, or one collection by name).
     Lyrics {
@@ -98,7 +102,12 @@ pub fn parse(args: &[String]) -> Option<Check> {
         let concurrency = value("--concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(cider_offline_core::DEFAULT_CONCURRENCY);
-        return Some(Check::Download { ids, concurrency });
+        let format = value("--format").and_then(|v| parse_format(&v));
+        return Some(Check::Download {
+            ids,
+            concurrency,
+            format,
+        });
     }
     if args.iter().any(|a| a == LYRICS_FLAG) {
         if let Some(provider) = value("--provider") {
@@ -130,6 +139,16 @@ pub fn parse(args: &[String]) -> Option<Check> {
     None
 }
 
+/// Parses a `--format` value (the `config.toml` spelling).
+fn parse_format(value: &str) -> Option<DownloadFormat> {
+    match value {
+        "stereo" => Some(DownloadFormat::Stereo),
+        "spatial_where_available" | "spatial" => Some(DownloadFormat::SpatialWhereAvailable),
+        "both" => Some(DownloadFormat::Both),
+        _ => None,
+    }
+}
+
 /// Runs a check and returns its process result.
 pub fn run(check: Check) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -143,8 +162,16 @@ pub fn run(check: Check) -> anyhow::Result<()> {
             .context("creating the data directories")?;
         let storage = Storage::open_async(paths.database_file()).await?;
         match check {
-            Check::Download { ids, concurrency } => {
-                download_check(storage, &paths, ids, concurrency).await
+            Check::Download {
+                ids,
+                concurrency,
+                format,
+            } => {
+                let format = match format {
+                    Some(format) => format,
+                    None => Config::load_or_default(&paths.config_file())?.download_format,
+                };
+                download_check(storage, &paths, ids, concurrency, format).await
             }
             Check::Lyrics {
                 collection,
@@ -180,6 +207,7 @@ async fn download_check(
     paths: &AppPaths,
     ids: Vec<String>,
     concurrency: usize,
+    format: DownloadFormat,
 ) -> anyhow::Result<()> {
     if ids.is_empty() {
         bail!("give at least one catalog id after {DOWNLOAD_FLAG}");
@@ -202,6 +230,7 @@ async fn download_check(
         None,
     );
     queue.set_concurrency(concurrency);
+    queue.set_download_format(format);
     let mut events = queue.events();
 
     let mut records = Vec::with_capacity(ids.len());
@@ -227,12 +256,13 @@ async fn download_check(
             progress: 0.0,
             message: None,
             deferred: false,
+            replace: false,
             created_at: 0,
             updated_at: 0,
         });
     }
     say(&format!(
-        "download-check: {} track(s), concurrency {concurrency}",
+        "download-check: {} track(s), concurrency {concurrency}, format {format:?}",
         ids.len()
     ));
     queue.enqueue(records)?;
@@ -241,6 +271,16 @@ async fn download_check(
     say("RESULTS:");
     for (id, result) in &outcome {
         say(&format!("  {id}: {result}"));
+        for file in storage.track_audio_files(id).await? {
+            say(&format!(
+                "    {} {} size={} duration_ms={}",
+                file.variant,
+                file.path.display(),
+                file.size.map_or_else(|| "-".to_owned(), |s| s.to_string()),
+                file.duration_ms
+                    .map_or_else(|| "-".to_owned(), |d| d.to_string()),
+            ));
+        }
     }
     Ok(())
 }

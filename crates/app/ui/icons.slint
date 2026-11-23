@@ -22,6 +22,9 @@ export global Icons {
     out property <image> pause: @image-url("icons/pause-solid.svg");
     out property <image> play: @image-url("icons/play-solid.svg");
     out property <image> done: @image-url("icons/checkmark-circle-02.svg");
+    // Every song is on disk, but through other downloads, not this album's
+    // or playlist's own (Hugeicons Link02Icon).
+    out property <image> linked-elsewhere: @image-url("icons/link-02.svg");
     out property <image> retry: @image-url("icons/arrow-reload-horizontal.svg");
     out property <image> alert: @image-url("icons/alert-circle.svg");
     out property <image> refresh: @image-url("icons/refresh.svg");
@@ -44,4 +47,6 @@ export global Icons {
     out property <image> audio-file: @image-url("icons/file-music.svg");
     out property <image> image-file: @image-url("icons/file-import.svg");
     out property <image> folder: @image-url("icons/folder-01.svg");
+    // A downloaded spatial mix (Hugeicons HeadphonesIcon plus sound-wave bars).
+    out property <image> spatial: @image-url("icons/headphones-spatial.svg");
 }

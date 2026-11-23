@@ -14,15 +14,14 @@
 //! Songs" playlist pinned first), then albums; within each, names compare
 //! case-insensitively and accent-insensitively (`Český` sorts with `C`).
 //!
-//! # Dedup (other views)
+//! # One row per song
 //!
-//! The same song can be cached under both a catalog id (numeric, type `songs`)
-//! and a library id (`i.…`, type `library-songs`), the library row carrying the
-//! catalog id of its twin in `catalog_id`. Within any card, members are deduped
-//! by `catalog_id` (falling back to the row id, which *is* the catalog id for the
-//! catalog twin), so the pair collapses to one. [`LibraryFilter::Downloaded`]
-//! additionally drops a plain catalog row at the SQL level when a library row
-//! references it.
+//! Apple names a song by its catalog id and by library ids (`i.…`, `a.…`);
+//! the store keeps one `tracks` row per song and the other ids as aliases
+//! (see [`super::songs`]). Collections list their members by whatever id
+//! Apple used there, so member ids are resolved to song ids here: every view
+//! returns song ids, each song once per flat list, and a card never lists one
+//! song twice.
 //!
 //! # Album grouping (other views)
 //!
@@ -60,6 +59,31 @@ pub enum LibraryFilter {
     /// any track whose audio the user supplied or changed, plus any album or
     /// playlist that contains such a track.
     Custom,
+}
+
+impl LibraryFilter {
+    /// SQLite string form (`download_collections.filter`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppleMusic => "apple_music",
+            Self::Downloaded => "downloaded",
+            Self::All => "all",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Parses the string form; `None` for unknown values.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "apple_music" => Some(Self::AppleMusic),
+            "downloaded" => Some(Self::Downloaded),
+            "all" => Some(Self::All),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
 }
 
 /// A collection in the library view together with its member track ids, in
@@ -223,12 +247,11 @@ fn track_order(track: &Track) -> (u32, u32, String) {
 
 // ----- Assembly (pure) --------------------------------------------------------
 
-/// The within-card dedup key for a track: its catalog id when known, else its
-/// own id — which, for a catalog-native row, *is* the catalog id, so a library
-/// song and its catalog twin collapse to one. (A stronger key than a bare title,
-/// which would wrongly merge two distinct same-titled songs.)
+/// The within-card dedup key for a track: its song id (one row per song, so
+/// a song listed under two of its ids collapses to one). A stronger key than
+/// a bare title, which would wrongly merge two distinct same-titled songs.
 fn member_key(track: &Track) -> String {
-    track.catalog_id.clone().unwrap_or_else(|| track.id.clone())
+    track.id.clone()
 }
 
 /// Drops later duplicates of the same song within one card, by [`member_key`],
@@ -429,21 +452,17 @@ pub(super) fn track_predicate(filter: LibraryFilter) -> &'static str {
     match filter {
         // Only the API-synced snapshot: the tracks Apple returned for the
         // synced collections. Passive capture never reaches here.
-        LibraryFilter::AppleMusic => "t.id IN (SELECT track_id FROM library_collection_tracks)",
-        // A track is downloaded if it has a local audio file or a completed
-        // download row. A plain catalog row is dropped when a library row
-        // references it as its catalog twin (dedup of the same song under
-        // both ids).
-        LibraryFilter::Downloaded => {
-            "(t.audio_path IS NOT NULL
-              OR EXISTS (
-                  SELECT 1 FROM downloads d
-                  WHERE (d.track_id = t.id OR d.track_id = t.catalog_id) AND d.status = 'done'
-              ))
-             AND NOT EXISTS (
-                 SELECT 1 FROM tracks l WHERE l.catalog_id = t.id AND l.id <> t.id
-             )"
+        // Members are listed by the id Apple used in the collection; each
+        // names one song.
+        LibraryFilter::AppleMusic => {
+            "t.id IN (SELECT COALESCE(ma.track_id, m.track_id)
+                      FROM library_collection_tracks m
+                      LEFT JOIN track_aliases ma ON ma.alias = m.track_id)"
         }
+        // A song is downloaded if it has a local audio file (any variant).
+        // A finished queue row alone is not enough: it stays "done" after
+        // the file is removed or cleaned up.
+        LibraryFilter::Downloaded => "EXISTS (SELECT 1 FROM track_audio a WHERE a.track_id = t.id)",
         LibraryFilter::All => "1",
         LibraryFilter::Custom => CUSTOM_TRACK_PREDICATE,
     }
@@ -455,16 +474,11 @@ fn filter_tracks(
     codec: &PathCodec,
     filter: LibraryFilter,
 ) -> Result<Vec<Track>, StorageError> {
-    let columns = TRACK_COLUMNS
-        .split(", ")
-        .map(|column| format!("t.{column}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     load_tracks(
         conn,
         codec,
         &format!(
-            "SELECT {columns} FROM tracks t WHERE {} ORDER BY {TRACK_ORDER}",
+            "SELECT {TRACK_COLUMNS} FROM tracks t WHERE {} ORDER BY {TRACK_ORDER}",
             track_predicate(filter)
         ),
     )
@@ -504,14 +518,29 @@ fn membership_for(
     conn: &Connection,
     collections: &[Playlist],
 ) -> Result<HashMap<String, Vec<String>>, StorageError> {
+    let songs = alias_map(conn)?;
     let mut out = HashMap::new();
     for collection in collections {
         let ids = super::repo::playlist_track_ids(conn, &collection.id)?;
         if !ids.is_empty() {
-            out.insert(collection.id.clone(), ids);
+            out.insert(collection.id.clone(), to_songs(&songs, ids));
         }
     }
     Ok(out)
+}
+
+/// The song id of every alias, by alias.
+fn alias_map(conn: &Connection) -> Result<HashMap<String, String>, StorageError> {
+    let mut stmt = conn.prepare("SELECT alias, track_id FROM track_aliases")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Collection member ids (any id of each song) as song ids, in order.
+fn to_songs(songs: &HashMap<String, String>, ids: Vec<String>) -> Vec<String> {
+    ids.into_iter()
+        .map(|id| songs.get(&id).cloned().unwrap_or(id))
+        .collect()
 }
 
 /// Splits loaded collections into album-kind and playlist-kind.
@@ -604,14 +633,15 @@ fn apple_music_contents(
     // tracks Apple returned for them. Passive capture never reaches here.
     let synced = super::synced::load_synced(conn)?;
     let tracks = filter_tracks(conn, codec, LibraryFilter::AppleMusic)?;
+    let songs = alias_map(conn)?;
     let mut collections: Vec<LibraryCollection> = synced
         .into_iter()
         .map(|synced| {
             let mut collection = synced.collection;
-            collection.name = collection.name.trim().to_owned();
+            collection.name = String::from(collection.name.trim());
             LibraryCollection {
                 collection,
-                track_ids: synced.track_ids,
+                track_ids: to_songs(&songs, synced.track_ids),
             }
         })
         .collect();
@@ -634,11 +664,15 @@ fn with_synced(
     mut membership: HashMap<String, Vec<String>>,
 ) -> Result<CollectionsWithMembers, StorageError> {
     let synced = super::synced::load_synced(conn)?;
+    let songs = alias_map(conn)?;
     let synced_ids: HashSet<&str> = synced.iter().map(|s| s.collection.id.as_str()).collect();
     collections.retain(|c| !synced_ids.contains(c.id.as_str()));
     drop(synced_ids);
     for entry in synced {
-        membership.insert(entry.collection.id.clone(), entry.track_ids);
+        membership.insert(
+            entry.collection.id.clone(),
+            to_songs(&songs, entry.track_ids),
+        );
         collections.push(entry.collection);
     }
     Ok((collections, membership))
@@ -700,7 +734,8 @@ fn custom_contents(conn: &Connection, codec: &PathCodec) -> Result<LibraryConten
              WHERE p.is_custom = 1
                 OR p.id IN (
                     SELECT pt.playlist_id FROM playlist_tracks pt
-                    JOIN tracks t ON t.id = pt.track_id
+                    LEFT JOIN track_aliases pa ON pa.alias = pt.track_id
+                    JOIN tracks t ON t.id = COALESCE(pa.track_id, pt.track_id)
                     WHERE {CUSTOM_TRACK_PREDICATE}
                 )
              ORDER BY p.name"
@@ -1182,7 +1217,11 @@ mod tests {
             .await
             .unwrap();
         storage
-            .set_track_audio("i.a", Some(PathBuf::from("a.m4a")))
+            .set_track_audio(
+                "i.a",
+                crate::storage::AudioVariant::Stereo,
+                Some(PathBuf::from("a.m4a")),
+            )
             .await
             .unwrap();
         let contents = storage
@@ -1197,8 +1236,8 @@ mod tests {
 
     #[tokio::test]
     async fn downloaded_should_collapse_catalog_twin_of_a_library_song() {
-        // A library song `i.c` (catalog twin `321`) and the catalog row `321`,
-        // both with local audio: only the library row remains.
+        // A library song `i.c` (catalog twin `321`) and the catalog row `321`
+        // are one song, listed once under its catalog id.
         let storage = store();
         storage
             .apply_catalog_update(CatalogUpdate {
@@ -1214,19 +1253,27 @@ mod tests {
             .await
             .unwrap();
         storage
-            .set_track_audio("i.c", Some(PathBuf::from("c.m4a")))
+            .set_track_audio(
+                "i.c",
+                crate::storage::AudioVariant::Stereo,
+                Some(PathBuf::from("c.m4a")),
+            )
             .await
             .unwrap();
         storage
-            .set_track_audio("321", Some(PathBuf::from("c.m4a")))
+            .set_track_audio(
+                "321",
+                crate::storage::AudioVariant::Stereo,
+                Some(PathBuf::from("c.m4a")),
+            )
             .await
             .unwrap();
         let contents = storage
             .library_contents(LibraryFilter::Downloaded)
             .await
             .unwrap();
-        assert_eq!(contents.tracks.len(), 1);
-        assert_eq!(contents.tracks[0].id, "i.c");
+        let ids: Vec<&str> = contents.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["321"]);
     }
 
     // ----- API-synced Apple Music library ----------------------------------

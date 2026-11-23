@@ -28,7 +28,10 @@ use crate::lyrics::{
     NeteaseProvider, ProviderError, TrackOutcome, lrc_to_ttml, plain_to_ttml, ttml_quality,
 };
 pub use crate::lyrics::{LyricsProgress, LyricsReport};
-use crate::storage::{CustomAudio, LyricsSource, Storage, StorageError, TrackRecord};
+use crate::storage::{
+    CustomAudio, DroppedAudio, LyricsQuality, LyricsSource, SongRekey, Storage, StorageError,
+    TrackRecord,
+};
 
 /// Errors from [`Library`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -267,8 +270,8 @@ impl Library {
                 duration_ms: track.duration_ms,
             })
             .with_source(Some(source.to_path_buf()));
-        let path = downloader.fetch(&request).await?;
-        if let Some(old) = &track.audio_path
+        let path = downloader.fetch(&request).await?.path;
+        if let Some(old) = &track.audio.normal
             && *old != path
             && self.owns(old)
         {
@@ -303,7 +306,7 @@ impl Library {
         // files and rows match the auto-cache path; fall back to the row id for
         // catalog-native tracks.
         let catalog_id = record.catalog_or_id().to_owned();
-        let request = DownloadRequest::new(catalog_id, self.paths.media_dir())
+        let request = DownloadRequest::new(catalog_id.clone(), self.paths.media_dir())
             .with_info(TrackInfo {
                 title: track.title.clone(),
                 artist: track.artist.clone(),
@@ -311,16 +314,22 @@ impl Library {
                 duration_ms: track.duration_ms,
             })
             .with_source(source.map(Path::to_path_buf));
-        let path = downloader.fetch(&request).await?;
-        if let Some(old) = &track.audio_path
-            && *old != path
+        let fetched = downloader.fetch(&request).await?;
+        let path = fetched.path;
+        if let Some(old) = track.audio.get(fetched.variant)
+            && old != path.as_path()
             && self.owns(old)
         {
             remove_quietly(old).await;
         }
         self.storage
-            .set_track_audio(&track.id, Some(path.clone()))
+            .set_track_audio(&track.id, fetched.variant, Some(path.clone()))
             .await?;
+        if !track.is_custom {
+            // Like a single-song download: pinned on its download key, so the
+            // file never counts as an unlinked download.
+            self.storage.pin_downloads(None, vec![catalog_id]).await?;
+        }
         tracing::info!(track = %track.id, downloader = downloader_id, "local audio recorded");
         Ok(path)
     }
@@ -463,6 +472,173 @@ impl Library {
         Ok(LyricsSource::Custom)
     }
 
+    /// Removes the local lyrics of a song (any of its ids): the files Apple
+    /// answers and lyrics lookups left, and with `include_custom` also the
+    /// lyrics the user imported. Without it custom lyrics stay and the song
+    /// keeps [`LyricsSource::Custom`]; otherwise its lyrics state becomes
+    /// [`LyricsSource::None`]. Returns whether anything was removed (an
+    /// unknown song removes nothing).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn remove_lyrics(
+        &self,
+        track_id: &str,
+        include_custom: bool,
+    ) -> Result<bool, LibraryError> {
+        let Some(record) = self.storage.find_track(track_id).await? else {
+            return Ok(false);
+        };
+        let id = record.catalog_or_id().to_owned();
+        let store = self.lyrics.store();
+        let had_provider = store.has_provider(&id).await;
+        let had_custom = store.has_custom(&id).await;
+        if include_custom {
+            store.remove(&id).await;
+        } else {
+            store.remove_provider(&id).await;
+        }
+        let (source, quality) = if had_custom && !include_custom {
+            let quality = store.quality(&id).unwrap_or(record.track.lyrics_quality);
+            (LyricsSource::Custom, quality)
+        } else {
+            (LyricsSource::None, LyricsQuality::None)
+        };
+        let state_changed =
+            record.track.lyrics_source != source || record.track.lyrics_quality != quality;
+        if state_changed {
+            self.storage.set_lyrics_state(&id, source, quality).await?;
+        }
+        let removed = had_provider || (include_custom && had_custom) || state_changed;
+        if removed {
+            tracing::info!(track = %id, include_custom, "lyrics removed");
+        }
+        Ok(removed)
+    }
+
+    /// [`Self::remove_lyrics`] for several songs, never touching custom
+    /// lyrics (a collection's "Remove lyrics", and removing downloads with
+    /// "Remove lyrics when removing downloads" on). Returns how many songs
+    /// lost lyrics; a song that fails is logged and skipped.
+    pub async fn remove_provider_lyrics(&self, track_ids: &[String]) -> usize {
+        let mut removed = 0;
+        for id in track_ids {
+            match self.remove_lyrics(id, false).await {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(track = %id, %error, "could not remove lyrics"),
+            }
+        }
+        removed
+    }
+
+    /// Settles what lives outside the database after song `rekey.from` took
+    /// the id `rekey.into` (a re-key or merge, see
+    /// [`Storage::subscribe_rekeys`]): its lyrics files move to the new id
+    /// ([`Self::adopt_lyrics`]) and each audio file the merge dropped is
+    /// settled ([`Self::settle_dropped_audio`]).
+    pub(crate) async fn apply_song_rekey(&self, rekey: &SongRekey) {
+        if let Err(error) = self.adopt_lyrics(&rekey.from).await {
+            tracing::warn!(from = %rekey.from, into = %rekey.into, %error, "could not move lyrics");
+        }
+        for dropped in &rekey.dropped_audio {
+            self.settle_dropped_audio(&rekey.into, dropped).await;
+        }
+    }
+
+    /// Moves the lyrics files saved under `id` to the lyrics id of the song
+    /// `id` now names, when that differs (the song was re-keyed or merged),
+    /// never replacing the song's own files (see [`LyricsStore::move_to`]).
+    /// The song's lyrics state then follows its files: custom lyrics make it
+    /// [`LyricsSource::Custom`], other files keep a provider source
+    /// ([`LyricsSource::Apple`] when it had none), no files make it
+    /// [`LyricsSource::None`]. Returns whether anything moved.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn adopt_lyrics(&self, id: &str) -> Result<bool, LibraryError> {
+        let Some(record) = self.storage.find_track(id).await? else {
+            return Ok(false);
+        };
+        let song = record.catalog_or_id();
+        if song == id {
+            return Ok(false);
+        }
+        let store = self.lyrics.store();
+        if !store.move_to(id, song).await {
+            return Ok(false);
+        }
+        let (source, quality) = match store.quality(song) {
+            None => (LyricsSource::None, LyricsQuality::None),
+            Some(quality) if store.has_custom(song).await => (LyricsSource::Custom, quality),
+            Some(quality) => match record.track.lyrics_source {
+                LyricsSource::None | LyricsSource::Custom => (LyricsSource::Apple, quality),
+                source => (source, quality),
+            },
+        };
+        if (source, quality) != (record.track.lyrics_source, record.track.lyrics_quality) {
+            self.storage.set_lyrics_state(song, source, quality).await?;
+        }
+        tracing::info!(from = %id, into = %song, "lyrics moved to the song's new id");
+        Ok(true)
+    }
+
+    /// [`Self::adopt_lyrics`] for every id with lyrics files: catches up on
+    /// re-keys made while nothing listened (another run, a missed event).
+    /// Returns how many ids had files moved; a failure is logged and skipped.
+    pub(crate) async fn adopt_all_lyrics(&self) -> usize {
+        let mut moved = 0;
+        for (id, _) in self.lyrics.store().indexed() {
+            match self.adopt_lyrics(&id).await {
+                Ok(true) => moved += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(track = %id, %error, "could not move lyrics"),
+            }
+        }
+        moved
+    }
+
+    /// Settles an audio file a merge dropped from song `song` (the song kept
+    /// another file for the same mix). The file on disk wins: when the kept
+    /// file is missing and the dropped one exists, the dropped one is
+    /// recorded again. When both exist, the dropped one is a duplicate and is
+    /// deleted, but only inside the media folder and when no audio row
+    /// records it (a custom song's audio included). Anything else is left.
+    pub(crate) async fn settle_dropped_audio(&self, song: &str, dropped: &DroppedAudio) {
+        let path = self.storage.resolve_stored_path(&dropped.dropped);
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return;
+        }
+        let kept = self.storage.resolve_stored_path(&dropped.kept);
+        if !tokio::fs::try_exists(&kept).await.unwrap_or(true) {
+            match self.storage.restore_dropped_audio(song, dropped).await {
+                Ok(true) => tracing::info!(
+                    %song, file = %path.display(), "kept the merged song's file that exists"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%song, %error, "could not record a merged file"),
+            }
+            return;
+        }
+        if !self.owns(&path) {
+            return;
+        }
+        match self.storage.audio_path_recorded(&dropped.dropped).await {
+            Ok(false) => match tokio::fs::remove_file(&path).await {
+                Ok(()) => tracing::info!(
+                    %song, file = %path.display(), "deleted a merged song's duplicate file"
+                ),
+                Err(error) => tracing::warn!(
+                    file = %path.display(), %error, "could not delete a duplicate file"
+                ),
+            },
+            Ok(true) => {}
+            Err(error) => tracing::warn!(%song, %error, "could not check a merged file"),
+        }
+    }
+
     /// Looks lyrics up for every track without lyrics. See
     /// [`Self::fetch_lyrics_for`].
     ///
@@ -519,10 +695,10 @@ impl Library {
         let Some(record) = self.storage.find_track(track_id).await? else {
             return Ok(());
         };
-        if let Some(audio) = &record.track.audio_path
-            && self.owns(audio)
-        {
-            remove_quietly(audio).await;
+        for (_, audio) in record.track.audio.iter() {
+            if self.owns(audio) {
+                remove_quietly(audio).await;
+            }
         }
         self.lyrics.store().remove(&record.track.id).await;
         if let Some(catalog_id) = &record.catalog_id {
@@ -816,7 +992,18 @@ mod tests {
         let library = library(&dir).await;
         let path = library.import_audio("100", &source(&dir)).await.unwrap();
         let track = library.storage().get_track("i.lib").await.unwrap().unwrap();
-        assert_eq!(track.audio_path, Some(path));
+        assert_eq!(track.audio.normal, Some(path));
+    }
+
+    #[tokio::test]
+    async fn import_should_pin_the_song_so_it_is_never_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = library(&dir).await;
+        library.import_audio("i.lib", &source(&dir)).await.unwrap();
+        assert_eq!(
+            library.storage().download_owners("100").await.unwrap(),
+            [String::new()]
+        );
     }
 
     #[tokio::test]
@@ -841,7 +1028,7 @@ mod tests {
         assert!(path.starts_with(library.paths.media_dir()));
         let track = library.storage().get_track(&id).await.unwrap().unwrap();
         assert_eq!(track.audio_mode, Some(CustomAudioMode::LocalCopy));
-        assert_eq!(track.audio_path, Some(path));
+        assert_eq!(track.audio.normal, Some(path));
     }
 
     #[tokio::test]
@@ -999,6 +1186,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_lyrics_should_keep_custom_lyrics_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = with_custom_lyrics(&dir).await;
+        let removed = library.remove_provider_lyrics(&["i.lib".to_owned()]).await;
+        let store = library.lyrics.store();
+        let stored = library.storage.get_track("i.lib").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                removed,
+                store.has_provider("100").await,
+                store.has_custom("100").await,
+                stored.lyrics_source
+            ),
+            (1, false, true, LyricsSource::Custom)
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_songs_lyrics_explicitly_should_remove_custom_lyrics_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = with_custom_lyrics(&dir).await;
+        let removed = library.remove_lyrics("i.lib", true).await.unwrap();
+        let stored = library.storage.get_track("i.lib").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                removed,
+                library.lyrics.store().exists("100").await,
+                stored.lyrics_source,
+                stored.lyrics_quality
+            ),
+            (true, false, LyricsSource::None, LyricsQuality::None)
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_provider_lyrics_should_clear_the_lyrics_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = library(&dir).await;
+        library
+            .lyrics
+            .store()
+            .write("100", LyricsKind::Line, "<tt>apple</tt>")
+            .await
+            .unwrap();
+        library
+            .storage
+            .set_lyrics_state("100", LyricsSource::Apple, LyricsQuality::Line)
+            .await
+            .unwrap();
+        let removed = library.remove_lyrics("i.lib", false).await.unwrap();
+        let stored = library.storage.get_track("100").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                removed,
+                library.lyrics.store().exists("100").await,
+                stored.lyrics_source
+            ),
+            (true, false, LyricsSource::None)
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_lyrics_of_a_song_without_any_should_remove_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = library(&dir).await;
+        assert!(!library.remove_lyrics("i.lib", true).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn explicit_refetch_should_keep_custom_lyrics() {
         let dir = tempfile::tempdir().unwrap();
         let library = with_custom_lyrics(&dir).await;
@@ -1103,6 +1359,105 @@ mod tests {
                 .artwork_path("https://is1-ssl.mzstatic.com/image/thumb/M/x.jpg/600x600bb.jpg")
                 .await
                 .is_none()
+        );
+    }
+
+    /// Stores song `id` (no catalog id) with title "Song".
+    async fn add_song(library: &Library, id: &str) {
+        library
+            .storage()
+            .apply_catalog_update(CatalogUpdate {
+                tracks: vec![TrackMetadata {
+                    id: id.to_owned(),
+                    title: "Song".to_owned(),
+                    artist: "Artist".to_owned(),
+                    ..TrackMetadata::default()
+                }],
+                ..CatalogUpdate::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_song_linked_to_its_catalog_id_should_keep_its_lyrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = library(&dir).await;
+        let mut rekeys = library.storage().subscribe_rekeys();
+        add_song(&library, "i.only").await;
+        let store = library.lyrics_store();
+        store.write_custom("i.only", "<tt>mine</tt>").await.unwrap();
+        library
+            .storage()
+            .set_lyrics_state("i.only", LyricsSource::Custom, LyricsQuality::Line)
+            .await
+            .unwrap();
+        assert!(
+            library
+                .storage()
+                .link_catalog_twin("i.only", "200")
+                .await
+                .unwrap()
+        );
+        library
+            .apply_song_rekey(&rekeys.recv().await.unwrap())
+            .await;
+        let song = library.storage().find_track("200").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                store.read_custom("200").await,
+                store.exists("i.only").await,
+                store.quality("200").is_some(),
+                song.track.lyrics_source,
+            ),
+            (
+                Some("<tt>mine</tt>".to_owned()),
+                false,
+                true,
+                LyricsSource::Custom
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_should_delete_the_duplicate_file_it_no_longer_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = library(&dir).await;
+        let mut rekeys = library.storage().subscribe_rekeys();
+        let media = library.paths.media_dir();
+        for (id, name) in [("i.two", "i.two.m4a"), ("300", "300.m4a")] {
+            add_song(&library, id).await;
+            let path = media.join(name);
+            std::fs::write(&path, b"audio").unwrap();
+            library
+                .storage()
+                .set_audio_by_any_id(id, crate::storage::AudioVariant::Stereo, Some(path))
+                .await
+                .unwrap();
+        }
+        assert!(
+            library
+                .storage()
+                .link_catalog_twin("i.two", "300")
+                .await
+                .unwrap()
+        );
+        library
+            .apply_song_rekey(&rekeys.recv().await.unwrap())
+            .await;
+        let song = library
+            .storage()
+            .find_track("i.two")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                song.track.audio.normal,
+                media.join("300.m4a").exists(),
+                media.join("i.two.m4a").exists(),
+            ),
+            (Some(media.join("300.m4a")), true, false)
         );
     }
 }

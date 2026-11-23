@@ -2,7 +2,7 @@
 # Smoke-tests the Linux packages that release.yml builds, from the repository
 # root, after `cargo packager` (AppImage, .deb, pacman) and `cargo generate-rpm`:
 #
-#   VERSION=0.1.0 bash packaging/ci/smoke-test-linux.sh
+#   VERSION=0.1.1 bash packaging/ci/smoke-test-linux.sh
 #
 # For every package it checks that the shipped binary prints
 # `cider-offline $VERSION` for `--version`, that `--version` does not create a

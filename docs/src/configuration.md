@@ -17,11 +17,16 @@ If you edit the file by hand, quit the app first, or it may overwrite your chang
 
 | Key | Type | Default | Effect |
 | --- | --- | --- | --- |
-| `mode` | `"active"` or `"passthrough"` | `"active"` | Mode the proxy starts in. `passthrough` forwards everything untouched. |
+| `mode` | `"active"` or `"passthrough"` | `"active"` | The last mode you picked. The app writes it but no longer reads it at startup: it always starts in Passthrough and switches to Active once the certificate is trusted (see [Overview](using.md#overview)). |
 | `capture` | bool | `false` | Write Apple Music requests and responses to the `captures` folder. |
 | `auto_cache` | `"off"`, `"instant"` or `"deferred"` | `"off"` | Download songs as they play: never, right away, or once playback has been idle for 30 seconds. |
 | `detail_level` | `"full"` or `"minimal"` | `"full"` | How much metadata is stored for each song. `minimal` keeps only id, title, artist, album, duration and artwork. |
 | `download_concurrency` | integer | `0` | Downloads that run at once, 1 to 6. `0` means the default, 2. Larger values are capped at 6. |
+| `download_format` | `"stereo"`, `"spatial_where_available"` or `"both"` | `"stereo"` | Which mix of a song a download saves (**Settings > Downloads > Download format**). `stereo` is the stereo mix Cider plays by default. The spatial mix is the Dolby Atmos mix rendered for headphones (binaural stereo), which only songs mastered in Atmos have. `spatial_where_available` saves the spatial mix when the song has one and the stereo mix otherwise; `both` saves the stereo mix plus the spatial one when it exists. Each extra mix is a download of its own (about the same size). |
+| `play_other_downloaded_mix` | bool | `false` | **Play the other downloaded mix** (Settings > Downloads): when Cider asks for a mix you haven't downloaded (stereo or spatial), play the one you did download instead of streaming from Apple. Offline, this always happens. See [Stereo and spatial mixes](using.md#stereo-and-spatial-mixes). |
+| `remove_lyrics_with_downloads` | bool | `false` | **Remove lyrics when removing downloads** (Settings > Downloads): **Remove download** on a song, album or playlist also deletes the lyrics the app fetched for the songs whose files are deleted. Lyrics you imported (custom lyrics) are never removed this way. See [Removing lyrics](using.md#removing-lyrics). |
+| `unlinked_downloads` | `"manual"` or `"automatic"` | `"manual"` | **Unlinked downloads** (Settings > Downloads): downloaded songs no album, playlist or single download needs any more. `manual` keeps them until **Clean up now…**; `automatic` deletes them every `unlinked_cleanup_hours` hours. Custom audio and links to local files are never touched. See [Shared songs and unlinked downloads](using.md#shared-songs-and-unlinked-downloads). |
+| `unlinked_cleanup_hours` | integer | `0` | Hours between automatic clean-ups, 1 to 168. `0` means the default, 6. Larger values are capped at 168 (a week). |
 | `overwrite_audio` | bool | `false` | Replace audio a song already has when downloading or importing, instead of skipping it. |
 | `overwrite_lyrics` | bool | `false` | When fetching lyrics for a collection or after a download, look up songs that already have lyrics again. Apple lyrics are always kept. |
 | `start_with_os` | bool | `false` | Start the app when you sign in. |
@@ -79,6 +84,11 @@ capture = false
 auto_cache = "deferred"
 detail_level = "full"
 download_concurrency = 2
+download_format = "stereo"
+play_other_downloaded_mix = false
+remove_lyrics_with_downloads = false
+unlinked_downloads = "manual"
+unlinked_cleanup_hours = 6
 overwrite_audio = false
 overwrite_lyrics = false
 start_with_os = true

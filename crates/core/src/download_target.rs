@@ -76,6 +76,39 @@ impl TwinSearch for CatalogClient {
     }
 }
 
+/// Where the queue finds a song's spatial stream (the real one is
+/// [`CatalogClient::spatial_master_url`]).
+#[async_trait]
+pub(crate) trait SpatialLookup: Send + Sync {
+    /// The `enhancedHls` master playlist of catalog song `catalog_id`, or
+    /// `None` when the song has no spatial version.
+    async fn spatial_master(&self, catalog_id: &str) -> Result<Option<String>, CatalogError>;
+}
+
+#[async_trait]
+impl SpatialLookup for CatalogClient {
+    async fn spatial_master(&self, catalog_id: &str) -> Result<Option<String>, CatalogError> {
+        self.spatial_master_url(catalog_id).await
+    }
+}
+
+/// Looks up the spatial master playlist of `catalog_id`, mapping catalog
+/// failures like the twin search does.
+///
+/// # Errors
+///
+/// [`DownloadError::AuthExpired`] for missing or rejected tokens,
+/// [`DownloadError::Transient`] otherwise.
+pub(crate) async fn spatial_master(
+    lookup: &dyn SpatialLookup,
+    catalog_id: &str,
+) -> Result<Option<String>, DownloadError> {
+    lookup
+        .spatial_master(catalog_id)
+        .await
+        .map_err(|error| catalog_error("catalog lookup", error))
+}
+
 /// Resolves the queued id `track_id` into a [`Target`].
 ///
 /// # Errors
@@ -213,7 +246,10 @@ async fn remote_twin(
         return Ok(None);
     }
     let term = format!("{} {}", original.title, original.artist).replace([',', '&'], " ");
-    let hits = search.search_songs(&term).await.map_err(search_error)?;
+    let hits = search
+        .search_songs(&term)
+        .await
+        .map_err(|error| catalog_error("catalog search", error))?;
     Ok(hits
         .into_iter()
         .find(|hit| key.matches(&TwinKey::of_candidate(hit)))
@@ -334,16 +370,16 @@ fn store_error(error: &StorageError) -> DownloadError {
     DownloadError::transient(format!("local store: {error}"))
 }
 
-fn search_error(error: CatalogError) -> DownloadError {
+fn catalog_error(context: &str, error: CatalogError) -> DownloadError {
     match error {
         CatalogError::MissingToken(_)
         | CatalogError::Status {
             status: 401 | 403, ..
         } => DownloadError::auth_expired(error.to_string()),
         CatalogError::Status { status, .. } => {
-            DownloadError::transient_http(status, None, format!("catalog search: {error}"))
+            DownloadError::transient_http(status, None, format!("{context}: {error}"))
         }
-        other => DownloadError::transient(format!("catalog search: {other}")),
+        other => DownloadError::transient(format!("{context}: {other}")),
     }
 }
 

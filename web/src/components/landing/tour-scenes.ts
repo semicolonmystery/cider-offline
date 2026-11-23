@@ -38,7 +38,7 @@ export const TOUR_SCENES: readonly TourScene[] = [
     id: "download",
     side: "left",
     title: "Download what you want offline",
-    body: "Download a song, an album or a playlist. The app asks Apple Music for each song the way Cider does, decrypts it on your computer and saves it as an .m4a file. Two songs download at a time, and lyrics are fetched when each one finishes.",
+    body: "Download a song, an album or a playlist. The app asks Apple Music for each song the way Cider does and saves it on your computer for offline playback in Cider. Two songs download at a time, and lyrics are fetched when each one finishes.",
     view: "album",
     download: "progress",
     windowLabel:

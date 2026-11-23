@@ -595,6 +595,27 @@ export component Badge inherits Rectangle {
     }
 }
 
+/// Marks a song with a downloaded spatial mix (headphones with sound waves).
+/// Shown next to the downloaded mark, never instead of it.
+export component SpatialBadge inherits Rectangle {
+    in property <length> size: 16px;
+    in property <color> tint: Theme.text-secondary;
+    width: root.size;
+    height: root.size;
+    accessible-role: AccessibleRole.image;
+    accessible-label: "Spatial mix (Dolby Atmos for headphones)";
+
+    Tooltip {
+        text: @markdown("Spatial mix (Dolby Atmos for headphones)");
+    }
+
+    Icon {
+        source: Icons.spatial;
+        size: root.size;
+        tint: root.tint;
+    }
+}
+
 /// Sidebar navigation entry (full width, or a 40x32 rail button).
 export component NavItem inherits Rectangle {
     in property <string> text;
@@ -819,6 +840,14 @@ export component DownloadControl inherits Rectangle {
     in property <string> status;
     in property <float> progress;
     in property <bool> downloaded;
+    // Partly downloaded (a collection): `fraction` of its songs are complete;
+    // `count` says so in words ("12 of 206").
+    in property <bool> partial;
+    in property <float> fraction;
+    in property <string> count;
+    // Every song is on disk, but some only through other downloads (a
+    // collection that does not pin them all); click links them to it.
+    in property <bool> elsewhere;
     in property <length> ring-size: 24px;
     in property <bool> can-toggle: true;
     // Draw the idle "download" button (rows show it only on hover).
@@ -837,9 +866,13 @@ export component DownloadControl inherits Rectangle {
     property <bool> paused: root.status == "paused";
     property <bool> failed: root.status == "failed";
     property <bool> active: root.queued || root.running || root.paused || root.failed;
-    property <bool> is-done: !root.active && (root.downloaded || root.status == "done");
+    // Done only when the caller says the files are there: a finished queue
+    // row stays "done" after its files are removed.
+    property <bool> is-done: !root.active && root.downloaded;
     property <bool> unavailable: !root.active && !root.is-done && root.status == "unavailable";
-    property <bool> idle: !root.active && !root.is-done && !root.unavailable;
+    property <bool> is-elsewhere: !root.active && !root.is-done && !root.unavailable && root.elsewhere;
+    property <bool> is-partial: !root.active && !root.is-done && !root.unavailable && !root.is-elsewhere && root.partial;
+    property <bool> idle: !root.active && !root.is-done && !root.unavailable && !root.is-elsewhere && !root.is-partial;
     property <length> stroke: root.ring-size <= 24px ? 2px : 2.5px;
 
     property <color> secondary: root.on-dark ? #FFFFFFB3 : Theme.text-secondary;
@@ -847,6 +880,8 @@ export component DownloadControl inherits Rectangle {
     property <color> live: root.on-dark ? #FFFFFF : Theme.accent;
 
     property <string> hint: root.is-done ? "Downloaded"
+        : root.is-elsewhere ? (root.can-toggle ? "Saved through other downloads. Click to link these songs to this " + (root.label == "" ? "collection" : root.label) + "." : "Saved through other downloads")
+        : root.is-partial ? (root.can-toggle ? "\{root.count} songs downloaded. Click to download the rest." : "\{root.count} songs downloaded")
         : root.unavailable ? (root.reason == "" ? "Can't download yet" : "Can't download yet. " + root.reason)
         : root.idle ? (root.label == "" ? "Download" : "Download " + root.label)
         : root.failed ? (root.reason == "" ? "Download failed. Click to retry." : "Download failed. Click to retry. " + root.reason)
@@ -862,7 +897,7 @@ export component DownloadControl inherits Rectangle {
     accessible-action-default => {
         if root.active && root.can-toggle {
             root.toggle();
-        } else if root.idle {
+        } else if root.idle || ((root.is-partial || root.is-elsewhere) && root.can-toggle) {
             root.start();
         }
     }
@@ -893,6 +928,48 @@ export component DownloadControl inherits Rectangle {
         size: root.ring-size;
         tint: root.tertiary;
         opacity: 0.7;
+    }
+
+    // Partly downloaded: a quiet ring filled to the downloaded share, with
+    // the download glyph inside (click downloads the missing songs).
+    if root.is-partial: CircularProgress {
+        ring-size: root.ring-size;
+        stroke-width: root.stroke;
+        track-color: root.on-dark ? #FFFFFF59 : Theme.text-tertiary.with-alpha(0.35);
+        progress: root.fraction;
+        ring-color: partial-touch.has-hover ? root.live : root.tertiary;
+    }
+
+    if root.is-partial: Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        size: root.ring-size * 0.5;
+        source: Icons.download;
+        tint: partial-touch.has-hover ? root.live : root.secondary;
+    }
+
+    partial-touch := TouchArea {
+        enabled: root.is-partial && root.can-toggle;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            root.start();
+        }
+    }
+
+    // Saved through other downloads: a link at full size (click links the
+    // songs to this collection too).
+    if root.is-elsewhere: Icon {
+        source: Icons.linked-elsewhere;
+        size: root.ring-size;
+        tint: elsewhere-touch.has-hover ? root.live : root.tertiary;
+    }
+
+    elsewhere-touch := TouchArea {
+        enabled: root.is-elsewhere && root.can-toggle;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            root.start();
+        }
     }
 
     // Done: check at full size.
@@ -1042,8 +1119,11 @@ export component ListRow inherits HorizontalLayout {
         alignment: center;
         horizontal-stretch: 1;
         spacing: 2px;
+        // Wraps (like the description) so a long title never makes the row,
+        // and with it the page, wider than the window.
         Text {
             text: root.title;
+            wrap: word-wrap;
             font-size: Theme.body;
             color: root.title-color;
         }

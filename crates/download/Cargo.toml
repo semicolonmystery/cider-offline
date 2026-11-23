@@ -1,6 +1,6 @@
 [package]
 name = "cider-offline-download"
-description = "Widevine DRM downloader for Cider Offline"
+description = "Saves Apple Music songs for offline playback in Cider Offline"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
@@ -9,11 +9,11 @@ repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-keywords = ["cider", "apple-music", "widevine", "download", "audio"]
+keywords = ["cider", "apple-music", "offline", "download", "audio"]
 categories = ["multimedia::audio", "network-programming"]
 
 [dependencies]
-cider-offline-core = { version = "0.1.0", path = "../core" }
+cider-offline-core = { version = "0.1.1", path = "../core" }
 async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tokio = { version = "1", features = ["fs", "macros", "rt"] }

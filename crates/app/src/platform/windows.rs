@@ -1,7 +1,7 @@
 //! Windows calls.
 //!
 //! This module holds the one scoped OS-call `unsafe` exception allowed by the
-//! spec: `AllowSetForegroundWindow`.
+//! spec: `AllowSetForegroundWindow`. The `UISettings` call below is safe.
 
 use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
@@ -19,5 +19,19 @@ pub fn allow_foreground(pid: u32) {
             pid,
             "AllowSetForegroundWindow failed"
         );
+    }
+}
+
+/// Whether "Animation effects" is off (Settings > Accessibility > Visual
+/// effects).
+pub fn prefers_reduced_motion() -> bool {
+    match ::windows::UI::ViewManagement::UISettings::new()
+        .and_then(|settings| settings.AnimationsEnabled())
+    {
+        Ok(enabled) => !enabled,
+        Err(error) => {
+            tracing::debug!(%error, "could not read the animation setting");
+            false
+        }
     }
 }

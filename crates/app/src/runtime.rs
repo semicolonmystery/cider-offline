@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cider_offline_core::{
-    AppPaths, AutoCacheMode, Config, DownloadEvent, DownloadQueue, Library, LibrarySync, Mode,
-    ProxyHandle, ProxyStatus, SongsPage, Storage, SyncStatus,
+    AppPaths, AutoCacheMode, CiderSpatial, Config, DownloadEvent, DownloadFormat, DownloadQueue,
+    Library, LibrarySync, Mode, ProxyHandle, ProxyStatus, SongsPage, Storage, SyncStatus,
+    UnlinkedCleanup, queue_kept_collections,
 };
 use cider_offline_download::DrmDownloader;
 use cider_offline_trust::CertificateAuthority;
@@ -23,6 +24,12 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 const STATUS_THROTTLE: Duration = Duration::from_millis(250);
 /// Minimum spacing of per-row download status events forwarded to the UI.
 const DOWNLOAD_STATUS_THROTTLE: Duration = Duration::from_millis(250);
+/// How often Cider's spatial audio setting is read again (it decides which
+/// version of a song Cider asks for; see `cider_offline_core` routing).
+const CIDER_SPATIAL_REFRESH: Duration = Duration::from_secs(30);
+/// How often the actor checks whether an automatic clean-up of unlinked
+/// downloads is due.
+const UNLINKED_CHECK: Duration = Duration::from_mins(10);
 
 /// Services of a running proxy, cloned into UI tasks.
 #[derive(Clone)]
@@ -52,6 +59,8 @@ pub enum ServiceEvent {
     Download(DownloadEvent),
     /// A library sync run finished (successfully or not).
     LibrarySync(SyncStatus),
+    /// Cider's Apple Music tokens were just captured or changed.
+    SessionChanged,
     /// Download events were dropped (the UI fell behind); re-read the rows.
     DownloadsResync,
     /// Starting the proxy failed.
@@ -64,6 +73,9 @@ enum Command {
     SetAutoCacheMode(AutoCacheMode),
     SetSongsPage(SongsPage),
     SetPreferLocalLyrics(bool),
+    SetDownloadFormat(DownloadFormat),
+    SetPlayOtherMix(bool),
+    SetUnlinkedCleanup(UnlinkedCleanup, u32),
     Restart(Box<Config>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -119,6 +131,22 @@ impl ProxyService {
     /// Turns "Always use downloaded lyrics" on or off (no restart).
     pub fn set_prefer_local_lyrics(&self, enabled: bool) {
         self.send(Command::SetPreferLocalLyrics(enabled));
+    }
+
+    /// Switches which mixes downloads fetch (no restart).
+    pub fn set_download_format(&self, format: DownloadFormat) {
+        self.send(Command::SetDownloadFormat(format));
+    }
+
+    /// Turns "Play the other downloaded mix" on or off (no restart).
+    pub fn set_play_other_downloaded_mix(&self, enabled: bool) {
+        self.send(Command::SetPlayOtherMix(enabled));
+    }
+
+    /// Sets what happens to unlinked downloads and how many hours apart the
+    /// automatic check runs (no restart).
+    pub fn set_unlinked_cleanup(&self, mode: UnlinkedCleanup, hours: u32) {
+        self.send(Command::SetUnlinkedCleanup(mode, hours));
     }
 
     /// Restarts the proxy with a new configuration (e.g. a new port).
@@ -191,6 +219,22 @@ impl Actor {
                     proxy.set_prefer_local_lyrics(enabled);
                 }
             }
+            Command::SetDownloadFormat(format) => {
+                self.config.download_format = format;
+                if let Some(proxy) = &self.proxy {
+                    proxy.set_download_format(format);
+                }
+            }
+            Command::SetPlayOtherMix(enabled) => {
+                self.config.play_other_downloaded_mix = enabled;
+                if let Some(proxy) = &self.proxy {
+                    proxy.set_play_other_downloaded_mix(enabled);
+                }
+            }
+            Command::SetUnlinkedCleanup(mode, hours) => {
+                self.config.unlinked_downloads = mode;
+                self.config.unlinked_cleanup_hours = hours;
+            }
             Command::Restart(_) | Command::Shutdown(_) => {}
         }
     }
@@ -200,12 +244,21 @@ impl Actor {
         let mut status = self.proxy.as_ref().map(ProxyHandle::subscribe);
         let mut downloads = self.proxy.as_ref().map(|p| p.downloads().events());
         let mut library_sync = self.proxy.as_ref().map(|p| p.library_sync().subscribe());
+        let mut tokens = self.subscribe_tokens();
         let mut throttle = tokio::time::interval(STATUS_THROTTLE);
         throttle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut download_throttle = tokio::time::interval(DOWNLOAD_STATUS_THROTTLE);
         download_throttle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut dirty = false;
         let mut pending_status: HashMap<String, DownloadEvent> = HashMap::new();
+        // The first tick fires at once: the setting is read right after start.
+        let mut cider_spatial = tokio::time::interval(CIDER_SPATIAL_REFRESH);
+        cider_spatial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut unlinked_check = tokio::time::interval(UNLINKED_CHECK);
+        unlinked_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first automatic clean-up runs one check interval after start,
+        // then every configured number of hours.
+        let mut last_cleanup = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -218,7 +271,9 @@ impl Actor {
                             downloads = self.proxy.as_ref().map(|p| p.downloads().events());
                             library_sync =
                                 self.proxy.as_ref().map(|p| p.library_sync().subscribe());
+                            tokens = self.subscribe_tokens();
                             dirty = true;
+                            self.refresh_cider_spatial().await;
                         }
                         Command::Shutdown(done) => {
                             self.shut_down().await;
@@ -235,8 +290,20 @@ impl Actor {
                         status = None;
                     }
                 }
+                changed = changed(tokens.as_mut()) => {
+                    if changed {
+                        (self.sink)(ServiceEvent::SessionChanged);
+                    } else {
+                        tokens = None;
+                    }
+                }
                 finished = sync_finished(library_sync.as_mut()) => match finished {
-                    Some(status) => (self.sink)(ServiceEvent::LibrarySync(status)),
+                    Some(status) => {
+                        if status.last_error.is_none() {
+                            self.queue_kept_collections();
+                        }
+                        (self.sink)(ServiceEvent::LibrarySync(status));
+                    }
                     None => library_sync = None,
                 },
                 _ = throttle.tick(), if dirty => {
@@ -249,17 +316,8 @@ impl Actor {
                 evt = recv_download(downloads.as_mut()) => {
                     match evt {
                         DownloadRecvOutcome::Event(event) => {
-                            let key = match &*event {
-                                DownloadEvent::StatusChanged { id, .. } => Some(id.clone()),
-                                _ => None,
-                            };
-                            match key {
-                                // Collapse rapid-fire per-row updates into
-                                // the latest one, flushed on the next tick.
-                                Some(id) => {
-                                    pending_status.insert(id, *event);
-                                }
-                                None => (self.sink)(ServiceEvent::Download(*event)),
+                            if let Some(event) = hold_back(&mut pending_status, *event) {
+                                (self.sink)(ServiceEvent::Download(event));
                             }
                         }
                         DownloadRecvOutcome::Closed => {
@@ -278,9 +336,19 @@ impl Actor {
                         (self.sink)(ServiceEvent::Download(event));
                     }
                 }
+                _ = cider_spatial.tick() => self.refresh_cider_spatial().await,
+                _ = unlinked_check.tick() => self.clean_up_unlinked_if_due(&mut last_cleanup),
             }
         }
         self.shut_down().await;
+    }
+
+    /// Watches the running proxy's captured tokens (see
+    /// [`ServiceEvent::SessionChanged`]).
+    fn subscribe_tokens(&self) -> Option<watch::Receiver<u64>> {
+        self.proxy
+            .as_ref()
+            .map(|p| p.library_sync().subscribe_tokens())
     }
 
     /// Stops the proxy for good and withdraws the published [`Backend`]: the
@@ -369,6 +437,71 @@ impl Actor {
         }
     }
 
+    /// "Keep downloaded": queues the songs added to kept collections by the
+    /// sync that just finished. Runs on its own task.
+    fn queue_kept_collections(&self) {
+        let Some(proxy) = &self.proxy else { return };
+        let storage = proxy.storage().clone();
+        let queue = proxy.downloads().clone();
+        tokio::spawn(async move {
+            match queue_kept_collections(&storage, &queue).await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, "queued songs added to kept collections"),
+                Err(error) => tracing::warn!(%error, "could not queue songs of kept collections"),
+            }
+        });
+    }
+
+    /// The automatic clean-up of unlinked downloads, when it is on and due
+    /// (`last` is when it last ran). Runs on its own task.
+    fn clean_up_unlinked_if_due(&self, last: &mut tokio::time::Instant) {
+        let every = Duration::from_hours(u64::from(self.config.unlinked_cleanup_hours()));
+        if self.config.unlinked_downloads != UnlinkedCleanup::Automatic
+            || last.elapsed() + UNLINKED_CHECK < every
+        {
+            return;
+        }
+        *last = tokio::time::Instant::now();
+        let Some(proxy) = &self.proxy else { return };
+        let queue = proxy.downloads().clone();
+        tokio::spawn(async move {
+            match queue.clean_up_unlinked().await {
+                Ok(report) if report.files > 0 => {
+                    tracing::info!(
+                        files = report.files,
+                        bytes = report.bytes,
+                        "automatic clean-up of unlinked downloads"
+                    );
+                }
+                Ok(_) => tracing::debug!("no unlinked downloads"),
+                Err(error) => tracing::warn!(%error, "automatic clean-up failed"),
+            }
+        });
+    }
+
+    /// Reads Cider's spatial audio setting (`audio.atmos.enabled` in its
+    /// `spa-config.yml`) and hands it to the proxy; unknown when no Cider
+    /// config is found.
+    async fn refresh_cider_spatial(&mut self) {
+        if self.proxy.is_none() {
+            return;
+        }
+        let chosen = self.config.cider_config_path.clone();
+        let setting = tokio::task::spawn_blocking(move || {
+            crate::cider::locate(chosen.as_deref())
+                .ok()
+                .and_then(|path| crate::cider::spatial_audio_enabled(&path))
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading Cider's spatial audio setting failed");
+            None
+        });
+        if let Some(proxy) = &self.proxy {
+            proxy.set_cider_spatial(CiderSpatial::from_setting(setting));
+        }
+    }
+
     async fn restart(&mut self, config: Config) {
         let previous = std::mem::replace(&mut self.config, config);
         self.stop().await;
@@ -388,9 +521,34 @@ impl Actor {
     }
 }
 
-/// Resolves when the watched status changes (`true`) or its sender is gone
+/// Collapses rapid-fire per-row status updates: a `StatusChanged` is held in
+/// `pending` (the latest per row, flushed on the next tick) and `None` is
+/// returned; any other event is returned to forward now. A row re-added or
+/// removed drops its held-back status, which belongs to its previous life
+/// and must not be flushed after it.
+fn hold_back(
+    pending: &mut HashMap<String, DownloadEvent>,
+    event: DownloadEvent,
+) -> Option<DownloadEvent> {
+    match &event {
+        DownloadEvent::StatusChanged { id, .. } => {
+            pending.insert(id.clone(), event);
+            return None;
+        }
+        DownloadEvent::Added(record) => {
+            pending.remove(&record.id);
+        }
+        DownloadEvent::Removed(id) => {
+            pending.remove(id);
+        }
+        _ => {}
+    }
+    Some(event)
+}
+
+/// Resolves when the watched value changes (`true`) or its sender is gone
 /// (`false`); never resolves without a receiver.
-async fn changed(rx: Option<&mut watch::Receiver<ProxyStatus>>) -> bool {
+async fn changed<T>(rx: Option<&mut watch::Receiver<T>>) -> bool {
     match rx {
         Some(rx) => rx.changed().await.is_ok(),
         None => std::future::pending().await,
@@ -436,6 +594,27 @@ async fn recv_download(rx: Option<&mut broadcast::Receiver<DownloadEvent>>) -> D
 
 #[cfg(test)]
 mod tests {
+    use cider_offline_core::{DownloadEvent, DownloadStatus};
+
+    fn status(id: &str) -> DownloadEvent {
+        DownloadEvent::StatusChanged {
+            id: id.to_owned(),
+            status: DownloadStatus::Downloading,
+            progress: 0.5,
+            message: None,
+            stage: None,
+            attempt: 1,
+        }
+    }
+
+    #[test]
+    fn a_removed_row_should_drop_its_held_back_status() {
+        let mut pending = std::collections::HashMap::new();
+        assert!(super::hold_back(&mut pending, status("7")).is_none());
+        assert!(super::hold_back(&mut pending, DownloadEvent::Removed("7".to_owned())).is_some());
+        assert_eq!(pending.len(), 0);
+    }
+
     use std::path::Path;
 
     use cider_offline_core::{AppPaths, Config};

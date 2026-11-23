@@ -20,8 +20,11 @@ pub mod catalog;
 pub mod config;
 pub mod connectivity;
 pub mod download;
+pub mod download_cleanup;
+pub mod download_needs;
 pub mod download_queue;
 mod download_target;
+mod hls;
 mod inject;
 pub mod library;
 pub mod library_sync;
@@ -32,6 +35,7 @@ mod offline;
 mod playback;
 pub mod proxy;
 mod respond;
+mod routing;
 pub mod storage;
 
 /// Imports shared by the built-in interceptors.
@@ -44,15 +48,21 @@ mod interceptor_prelude {
 pub use cache::ResponseCacheInterceptor;
 pub use catalog::{Album, CatalogClient, CatalogError, CatalogItem, Playlist, Song, SongCandidate};
 pub use config::{
-    AppPaths, AutoCacheMode, Config, ConfigError, DetailLevel, LibrarySettings, SongsPage,
+    AppPaths, AutoCacheMode, Config, ConfigError, DetailLevel, DownloadFormat, LibrarySettings,
+    SongsPage, UnlinkedCleanup,
 };
 pub use download::{
-    DownloadError, DownloadProgress, DownloadStage, DownloaderCapabilities, MediaKind, PlaybackId,
+    DownloadError, DownloadProgress, DownloadStage, Downloaded, DownloaderCapabilities, MediaKind,
+    PlaybackId,
+};
+pub use download_cleanup::{UnlinkedFile, UnlinkedReport, unlinked_downloads};
+pub use download_needs::{
+    CollectionDownload, CollectionDownloadState, needs_download, track_needs_download,
 };
 pub use download_queue::{
     DEFAULT_CONCURRENCY, DownloadEvent, DownloadProgressUpdate, DownloadQueue, LyricsFetcher,
     MAX_CONCURRENCY, QueueError, clamp_concurrency, enqueue_missing_reference,
-    records_from_catalog,
+    queue_kept_collections, record_from_track, records_from_catalog,
 };
 pub use download_target::{AlbumVersion, album_version};
 pub use inject::LibraryInjectionInterceptor;
@@ -69,10 +79,11 @@ pub use proxy::{
     Counters, Exchange, Interceptor, ProxyError, ProxyHandle, ProxyHandleBuilder, ProxyStatus,
     RequestOutcome,
 };
+pub use routing::CiderSpatial;
 pub use storage::{
-    DownloadRecord, DownloadSourceKind, DownloadStatus, LibraryCollection, LibraryContents,
-    LibraryFilter, LibraryPage, LibraryQuery, LibrarySnapshot, LibraryTrack, Storage, StorageError,
-    SyncedCollection, TrackFilter,
+    DownloadCollection, DownloadRecord, DownloadSourceKind, DownloadStatus, LibraryCollection,
+    LibraryContents, LibraryFilter, LibraryPage, LibraryQuery, LibrarySnapshot, LibraryTrack,
+    RemovalPreview, Storage, StorageError, SyncedCollection, TrackFilter,
 };
 
 /// Re-exports needed to implement an [`Interceptor`].

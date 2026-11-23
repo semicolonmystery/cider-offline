@@ -35,6 +35,16 @@ pub fn bind(ctx: &Rc<AppContext>) {
 
 /// Re-reads Cider's current proxy state and updates the control.
 pub fn refresh(ctx: &Rc<AppContext>) {
+    read_state(ctx, true);
+}
+
+/// [`refresh`] in the background (the window regained focus): the switch is
+/// not disabled while the file is read, so nothing flickers.
+pub fn refresh_quietly(ctx: &Rc<AppContext>) {
+    read_state(ctx, false);
+}
+
+fn read_state(ctx: &Rc<AppContext>, show_busy: bool) {
     // The guide names this proxy's configured listen address, which can
     // change between refreshes.
     let guide = cider::manual_guide(&ctx.config().listen_addr().to_string());
@@ -47,7 +57,9 @@ pub fn refresh(ctx: &Rc<AppContext>) {
         });
         return;
     }
-    set_busy(ctx, true);
+    if show_busy {
+        set_busy(ctx, true);
+    }
     let server = current_server(ctx);
     let chosen = chosen_config(ctx);
     ctx.spawn(
@@ -59,8 +71,10 @@ pub fn refresh(ctx: &Rc<AppContext>) {
             })
             .await
         },
-        |ctx, result| {
-            set_busy(ctx, false);
+        move |ctx, result| {
+            if show_busy {
+                set_busy(ctx, false);
+            }
             match result {
                 Ok(Ok((path, state))) => {
                     let routed = state.use_proxy && state.points_at_us;
@@ -176,7 +190,7 @@ fn apply(ctx: &Rc<AppContext>, enabled: bool, server: String) {
                         "Saved. Cider will start without this proxy next time."
                     };
                     set_message(ctx, message);
-                    super::overview::push_activity(ctx, "info", message);
+                    tracing::info!(message, "Cider proxy setting changed");
                 }
                 Err(error) => set_message(ctx, &format!("Could not update Cider: {error}")),
             }
@@ -200,5 +214,9 @@ fn set_busy(ctx: &AppContext, busy: bool) {
 }
 
 fn set_message(ctx: &AppContext, message: &str) {
-    ctx.with_ui(|ui| ui.global::<CiderState>().set_message(message.into()));
+    // Messages may name a path: let it wrap between folders.
+    ctx.with_ui(|ui| {
+        ui.global::<CiderState>()
+            .set_message(super::format::breakable(message).into());
+    });
 }

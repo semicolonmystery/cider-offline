@@ -14,7 +14,7 @@ reading an advert for it.
 - Adjectives: plain, exact, calm, quietly confident, music-first.
 - It must never look like: a SaaS landing kit (feature-card grid, stat row, logo
   bar, testimonials), a "hacker tool" (dark terminal, neon, monospace), a piracy
-  site (DRM-cracking language, skulls, "free music"), or a copy of Apple's own pages.
+  site (skulls, "free music", anything that hints at getting music without paying), or a copy of Apple's own pages.
 
 Design read: product landing page for Cider users who want offline listening,
 in the app's own visual language, dial **ENERGY 2 / RHYTHM 2 / MOTION 3**. Motion

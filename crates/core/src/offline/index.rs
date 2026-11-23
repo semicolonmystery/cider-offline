@@ -138,7 +138,7 @@ impl LocalIndex {
     pub(crate) async fn load(storage: &Storage) -> Result<Self, StorageError> {
         let synced = storage.synced_library().await?;
         let songs = storage.synced_library_songs().await?;
-        let tracks = storage.list_tracks().await?;
+        let tracks = storage.list_resources().await?;
         let mappings = storage.list_track_mappings().await?;
         let storefront = storage.get_setting(STOREFRONT_SETTING).await?;
         let index = tokio::task::spawn_blocking(move || {
@@ -367,11 +367,11 @@ fn build(
 
     // Downloaded rows first, so an id shared by two rows resolves to the playable one.
     parsed.sort_by_key(|(t, _)| {
-        let downloaded = t.audio_path.as_deref().is_some_and(file_exists);
+        let downloaded = t.audio.iter().any(|(_, path)| file_exists(path));
         !downloaded
     });
     for (track, value) in parsed {
-        let downloaded = track.audio_path.as_deref().is_some_and(file_exists)
+        let downloaded = track.audio.iter().any(|(_, path)| file_exists(path))
             || mapped.contains(track.id.as_str())
             || track
                 .catalog_id

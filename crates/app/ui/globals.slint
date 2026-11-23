@@ -3,12 +3,44 @@
 // Rust writes properties through `app.global::<…>()` and handles the
 // callbacks; pages only read state and invoke callbacks.
 
-/// One line of the live activity feed on the Overview page.
-export struct ActivityRow {
-    time: string,
-    text: string,
-    // "info" | "warn" | "error"
-    level: string,
+/// One drifting music note of the Overview page's magenta layer. Positions
+/// are fractions of the page; Rust fills these once from a fixed seed.
+export struct NoteSeed {
+    // Base position, 0..1 of the page width / height.
+    x: float,
+    y: float,
+    // Edge length in logical px.
+    size: float,
+    // 0 eighth, 1 quarter, 2 beamed pair, 3 sixteenth.
+    glyph: int,
+    // Own drift on top of the shared one, px per second.
+    vx: float,
+    vy: float,
+    // Sideways wobble: amplitude (px), angular speed (rad/s), phase (rad).
+    amp: float,
+    freq: float,
+    phase: float,
+    // Resting tilt (deg); the note sways around it.
+    tilt: float,
+    // Shade: false a touch darker than the magenta, true a touch lighter.
+    light: bool,
+}
+
+/// State of the Overview page's animated background.
+export global OverviewAnim {
+    // The window is shown, focused and not minimized (set by Rust). While
+    // false the note layer is removed and every animation timer stops.
+    in property <bool> live: false;
+    // The OS asks for reduced motion: instant colour change, static notes.
+    in property <bool> reduced-motion: false;
+    in property <[NoteSeed]> notes;
+    // Seconds of note drift so far. Kept here so a rebuilt layer resumes
+    // where it stopped.
+    in-out property <float> time: 0;
+    // Screenshot harness only: freeze the ON ripple / OFF fade at this
+    // progress (0..1); negative = run normally.
+    in property <float> freeze-on: -1;
+    in property <float> freeze-off: -1;
 }
 
 /// An album or playlist cover card in the Library grid (real or custom).
@@ -31,11 +63,24 @@ export struct CollectionRow {
     dl-status: string,
     // Aggregate download progress 0.0 .. 1.0.
     dl-progress: float,
-    // Every track in the collection is available locally.
+    // Every song has every mix the download format wants, counted from the
+    // audio files on disk (never from queue rows or lyrics), and the
+    // collection pins every one of them.
     downloaded: bool,
+    // Some songs have files, but not all of them every wanted mix.
+    partial: bool,
+    // Every song has every wanted mix, but some only through other
+    // downloads (another album, playlist or a single download), not this
+    // collection's own pins.
+    elsewhere: bool,
+    // Songs with every wanted mix, of `dl-total` Apple Music songs.
+    dl-done: int,
+    dl-total: int,
     // The collection was downloaded as a whole (has a download pin), so
     // "Remove download" applies to it.
     pinned: bool,
+    // "Keep downloaded": songs added to it later are downloaded too.
+    keep: bool,
     // Not loaded yet (paged model): draw a skeleton card, not data.
     placeholder: bool,
 }
@@ -52,6 +97,10 @@ export struct TrackRow {
     album: string,
     duration: string,
     has-audio: bool,
+    // Lacks a mix the current download format wants ("Download" applies).
+    missing: bool,
+    // A spatial mix (Dolby Atmos for headphones) is downloaded too.
+    has-spatial: bool,
     // "apple" | "lrclib" | "amll" | "netease" | "kugou" | "musixmatch" | "community" | "none"
     lyrics: string,
     // Timing of the local lyrics: 0 none, 1 plain, 2 line-synced, 3 word-synced.
@@ -100,9 +149,12 @@ export struct DownloadRow {
     // Optional user action offered on a "Can't download yet" row, e.g.
     // "Download album version" for a music video; "" when none.
     alt-action: string,
+    // The song has a downloaded spatial mix (badge next to the done mark).
+    spatial: bool,
 }
 
-/// Proxy state shown on the Overview page and kept in sync with the tray.
+/// Proxy state shown on the Overview and Settings pages and kept in sync
+/// with the tray.
 export global ProxyState {
     in-out property <bool> active: true;
     in-out property <bool> capture: false;
@@ -113,7 +165,9 @@ export global ProxyState {
     in property <string> requests-seen: "0";
     in property <string> served-locally: "0";
     in property <string> last-error;
-    in property <[ActivityRow]> activity;
+    // Cider's Apple Music tokens have been captured (library sync and
+    // downloads can work). Starts true so nothing flashes before the check.
+    in property <bool> session-captured: true;
 
     // "unknown" | "checking" | "trusted" | "untrusted" | "error"
     in property <string> trust-state: "checking";
@@ -133,7 +187,7 @@ export global ProxyState {
     callback dismiss-tray-hint();
 }
 
-/// Cider integration state shown on the Overview page.
+/// Cider integration state shown on the Settings page.
 export global CiderState {
     // Whether the app can change Cider's settings on this OS (false: guide only).
     in property <bool> automatic: false;
@@ -208,8 +262,17 @@ export global LibraryState {
     in property <string> detail-dl-status;
     in property <float> detail-dl-progress;
     in property <bool> detail-downloaded;
+    // Partly downloaded: `detail-dl-done` of `detail-dl-total` songs have
+    // every wanted mix (the same count as the cards).
+    in property <bool> detail-partial;
+    // Saved through other downloads (see `CollectionRow.elsewhere`).
+    in property <bool> detail-elsewhere;
+    in property <int> detail-dl-done;
+    in property <int> detail-dl-total;
     // The open collection has a download pin ("Remove download" applies).
     in property <bool> detail-pinned;
+    // The open collection is set to "Keep downloaded".
+    in property <bool> detail-keep;
 
     callback refresh();
     callback search-changed(string);
@@ -232,17 +295,32 @@ export global LibraryState {
     callback remove-track(string);
     // Delete a song's downloaded audio (after the confirm dialog).
     callback remove-download(string);
-    // Remove a collection's download (after the confirm dialog): drops its
-    // pin and deletes audio no other download still needs.
+    // Remove a collection's downloads (asks first, saying how many shared
+    // songs are kept): drops its pin and deletes audio no other download
+    // still needs.
     callback remove-collection-download(string);
+    // "pause" | "resume" | "retry" | "cancel" (asks first) the queued
+    // downloads of a collection's songs.
+    callback collection-download-action(string, string);
+    // Turn "Keep downloaded" on (also downloads the missing songs) or off.
+    callback set-keep-downloaded(string, bool);
     callback fetch-missing-lyrics();
     // Fetch lyrics for every track of one collection (the detail header action).
     callback fetch-collection-lyrics(string);
+    // "Remove lyrics…" of a collection (asks first; custom lyrics stay).
+    callback remove-collection-lyrics(string);
+    // "Remove lyrics" of one song (custom lyrics too; asks first for those).
+    callback remove-lyrics(string);
     callback download-track(string);
+    // Download a song again in the current download format, replacing its
+    // files when the new ones are complete (asks first).
+    callback redownload-track(string);
     // Enqueue every track of a collection (the "Download all" / card action).
     callback download-collection(string);
     // Pause / resume (or retry, when failed) a collection's in-flight download.
     callback toggle-collection-download(string);
+    // Download every song of a collection again (asks first).
+    callback redownload-collection(string);
     callback download-missing-audio();
     // Add custom album / song — opens the Add/Edit dialog.
     callback add-item();
@@ -373,6 +451,8 @@ export global DownloadsState {
     callback download-album-version(string);
     // Remove all done rows.
     callback clear-finished();
+    // Cancel every unfinished row (asks first).
+    callback cancel-all();
     // Retry every failed row (never the "Can't download yet" ones).
     callback retry-failed();
     callback pause-all();
@@ -401,6 +481,19 @@ export global SettingsState {
     in-out property <int> auto-cache-mode: 0;
     // Simultaneous downloads, 1..=6 (applied live).
     in-out property <int> download-concurrency: 2;
+    // Download format: 0 = stereo only, 1 = spatial where available, 2 = stereo + spatial (applied live).
+    in-out property <int> download-format: 0;
+    // "Play the other downloaded mix" (applied live).
+    in-out property <bool> play-other-mix: false;
+    in-out property <bool> remove-lyrics-with-downloads: false;
+    // Unlinked downloads: 0 = manual, 1 = automatically (applied live).
+    in-out property <int> unlinked-mode: 0;
+    // Hours between automatic clean-ups, 1..=168.
+    in-out property <int> unlinked-hours: 6;
+    // Unlinked downloads found right now, and the line describing them
+    // ("3 songs, 24.1 MB", "None right now").
+    in property <int> unlinked-count: 0;
+    in property <string> unlinked-summary: "Looking…";
     // 0 = Full, 1 = Minimal (how much metadata is stored for observed songs).
     in-out property <int> detail-level: 0;
     // Replace existing audio when importing / downloading instead of skipping.
@@ -428,6 +521,9 @@ export global SettingsState {
     in property <string> data-dir;
     in property <string> captures-dir;
     in property <string> message;
+    // Section to scroll to when the page opens ("proxy", "certificate",
+    // "cider"); cleared once applied.
+    in-out property <string> focus-section;
     // "Remove all data" is running (its button is disabled).
     in property <bool> removing;
 
@@ -436,6 +532,15 @@ export global SettingsState {
     callback set-start-minimized(bool);
     callback set-auto-cache-mode(int);
     callback set-download-concurrency(int);
+    callback set-download-format(int);
+    callback set-play-other-mix(bool);
+    callback set-remove-lyrics-with-downloads(bool);
+    callback set-unlinked-mode(int);
+    callback set-unlinked-hours(int);
+    // Deletes the unlinked downloads (asks first).
+    callback clean-up-unlinked();
+    // Re-counts the unlinked downloads (the page was shown, downloads changed).
+    callback refresh-unlinked();
     callback set-detail-level(int);
     callback set-overwrite-audio(bool);
     callback set-songs-page(int);

@@ -95,6 +95,54 @@ impl CatalogClient {
         })
     }
 
+    /// The `extendedAssetUrls.enhancedHls` master playlist of catalog song
+    /// `id`, but only when the song can have a spatial version: `None` when
+    /// the catalog has no such URL, or when the song's `audioTraits` are
+    /// listed and do not include `atmos` (only Dolby Atmos songs carry the
+    /// binaural variant). Requests the song with `extend=extendedAssetUrls`,
+    /// as Cider does, in the storefront the proxy saw (else asked from Apple).
+    ///
+    /// # Errors
+    ///
+    /// Missing tokens, HTTP and status errors, or an unexpected response.
+    pub async fn spatial_master_url(&self, id: &str) -> Result<Option<String>, CatalogError> {
+        let storefront = self.known_storefront().await?;
+        let url = format!("{API_BASE}/v1/catalog/{storefront}/songs/{id}?extend=extendedAssetUrls");
+        let value = self.fetch_json(&url).await?;
+        Ok(spatial_master_of(first_data(&value)?))
+    }
+
+    /// Whether catalog song `id` is a Dolby Atmos song (its `audioTraits`
+    /// contain `atmos`); `None` when the catalog lists no traits. Uses the
+    /// storefront the proxy saw (else asked from Apple).
+    ///
+    /// # Errors
+    ///
+    /// Missing tokens, HTTP and status errors, or an unexpected response.
+    pub async fn is_atmos(&self, id: &str) -> Result<Option<bool>, CatalogError> {
+        let storefront = self.known_storefront().await?;
+        let url = format!("{API_BASE}/v1/catalog/{storefront}/songs/{id}");
+        let value = self.fetch_json(&url).await?;
+        Ok(atmos_of(first_data(&value)?))
+    }
+
+    /// The storefront the proxy saved from Cider's traffic, else Apple's
+    /// answer to `/v1/me/storefront`.
+    async fn known_storefront(&self) -> Result<String, CatalogError> {
+        if let Some(saved) = self
+            .storage
+            .get_setting(crate::cache::STOREFRONT_SETTING)
+            .await?
+            && let Some(id) = serde_json::from_str::<Value>(&saved)
+                .ok()
+                .as_ref()
+                .and_then(|doc| str_at(doc, "/data/0/id"))
+        {
+            return Ok(id.to_owned());
+        }
+        self.storefront().await
+    }
+
     /// Searches the catalog for playable songs matching `term` (at most
     /// `limit`, Apple caps it at 25).
     pub async fn search_songs(
@@ -322,6 +370,29 @@ fn parse_song(resource: &Value) -> Option<Song> {
     })
 }
 
+/// The `enhancedHls` URL of a song resource when it may have a spatial
+/// version (see [`CatalogClient::spatial_master_url`]).
+fn spatial_master_of(resource: &Value) -> Option<String> {
+    let attrs = resource.pointer("/attributes")?;
+    if let Some(traits) = attrs.get("audioTraits").and_then(Value::as_array)
+        && !traits.iter().any(|t| t.as_str() == Some("atmos"))
+    {
+        return None;
+    }
+    str_at(attrs, "/extendedAssetUrls/enhancedHls")
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+}
+
+/// Whether a song resource's `audioTraits` include `atmos`; `None` when it
+/// lists no traits.
+fn atmos_of(resource: &Value) -> Option<bool> {
+    resource
+        .pointer("/attributes/audioTraits")
+        .and_then(Value::as_array)
+        .map(|traits| traits.iter().any(|t| t.as_str() == Some("atmos")))
+}
+
 /// A search hit as a [`SongCandidate`]; `None` unless it is a playable song.
 fn parse_candidate(resource: &Value) -> Option<SongCandidate> {
     let attrs = resource.pointer("/attributes")?;
@@ -531,6 +602,55 @@ fn classify_api_path(path: &str) -> Result<Resolved, CatalogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MASTER: &str = "https://aod.itunes.apple.com/itunes-assets/x/P1_default.m3u8";
+
+    fn song_with(attrs: &Value) -> Value {
+        serde_json::json!({"id": "1", "type": "songs", "attributes": attrs})
+    }
+
+    #[test]
+    fn spatial_master_should_be_taken_from_an_atmos_song() {
+        let song = song_with(&serde_json::json!({
+            "audioTraits": ["atmos", "lossless", "spatial"],
+            "extendedAssetUrls": {"enhancedHls": MASTER},
+        }));
+        assert_eq!(spatial_master_of(&song).as_deref(), Some(MASTER));
+    }
+
+    #[test]
+    fn spatial_master_should_be_skipped_for_a_song_without_atmos() {
+        let song = song_with(&serde_json::json!({
+            "audioTraits": ["lossless"],
+            "extendedAssetUrls": {"enhancedHls": MASTER},
+        }));
+        assert_eq!(spatial_master_of(&song), None);
+    }
+
+    #[test]
+    fn atmos_should_be_read_from_audio_traits() {
+        let atmos = song_with(&serde_json::json!({"audioTraits": ["atmos", "lossy-stereo"]}));
+        let stereo = song_with(&serde_json::json!({"audioTraits": ["lossless", "lossy-stereo"]}));
+        let unlisted = song_with(&serde_json::json!({"name": "x"}));
+        assert_eq!(
+            (atmos_of(&atmos), atmos_of(&stereo), atmos_of(&unlisted)),
+            (Some(true), Some(false), None)
+        );
+    }
+
+    #[test]
+    fn spatial_master_should_be_kept_when_traits_are_not_listed() {
+        let song = song_with(&serde_json::json!({
+            "extendedAssetUrls": {"enhancedHls": MASTER},
+        }));
+        assert_eq!(spatial_master_of(&song).as_deref(), Some(MASTER));
+    }
+
+    #[test]
+    fn spatial_master_should_be_none_without_enhanced_hls() {
+        let song = song_with(&serde_json::json!({"audioTraits": ["atmos"]}));
+        assert_eq!(spatial_master_of(&song), None);
+    }
 
     #[test]
     fn classify_bare_numeric_id_is_song() {

@@ -20,6 +20,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use super::catalog::{TrackMetadata, get_setting, merge_track, set_setting};
 use super::models::{CollectionKind, Playlist, TokenKind};
 use super::repo::{now_unix, set_auth_token};
+use super::songs::SongRekey;
 
 /// Setting holding the JSON array of the library Songs tab's track ids, in
 /// Apple's `sort=dateAdded` order (see [`LibrarySnapshot::songs`]).
@@ -79,10 +80,14 @@ fn synced_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Playlist, Optio
     ))
 }
 
-fn replace_library(conn: &mut Connection, snapshot: &LibrarySnapshot) -> Result<(), StorageError> {
+fn replace_library(
+    conn: &mut Connection,
+    snapshot: &LibrarySnapshot,
+) -> Result<Vec<SongRekey>, StorageError> {
     let tx = conn.transaction()?;
+    let mut rekeys = Vec::new();
     for track in &snapshot.tracks {
-        merge_track(&tx, track)?;
+        merge_track(&tx, track, &mut rekeys)?;
     }
     // Membership cascades with the collection rows.
     tx.execute("DELETE FROM library_collections", [])?;
@@ -122,7 +127,7 @@ fn replace_library(conn: &mut Connection, snapshot: &LibrarySnapshot) -> Result<
     let songs = serde_json::to_string(&snapshot.songs)?;
     set_setting(&tx, LIBRARY_SONGS_SETTING, &songs)?;
     tx.commit()?;
-    Ok(())
+    Ok(rekeys)
 }
 
 /// Every synced collection in stored (Apple listing) order, with its ordered
@@ -195,7 +200,9 @@ impl Storage {
     ///
     /// Returns database errors; on error nothing is changed.
     pub async fn replace_library(&self, snapshot: LibrarySnapshot) -> Result<(), StorageError> {
-        self.call(move |c| replace_library(c, &snapshot)).await
+        let rekeys = self.call(move |c| replace_library(c, &snapshot)).await?;
+        self.publish_rekeys(rekeys);
+        Ok(())
     }
 
     /// The synced library collections, in Apple's listing order, each with its
@@ -243,8 +250,9 @@ impl Storage {
                 "SELECT
                    (SELECT COUNT(*) || ':' || COALESCE(MAX(synced_at), 0) FROM library_collections)
                    || '|' || (SELECT COUNT(*) FROM library_collection_tracks)
-                   || '|' || (SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), 0) || ':'
-                              || COALESCE(SUM(audio_path IS NOT NULL), 0) FROM tracks)
+                   || '|' || (SELECT COUNT(*) || ':' || COALESCE(MAX(updated_at), 0) FROM tracks)
+                   || '|' || (SELECT COUNT(*) || ':' || COALESCE(MAX(created_at), 0)
+                              FROM track_audio)
                    || '|' || (SELECT COUNT(*) || ':' || COALESCE(MAX(created_at), 0) FROM track_mappings)
                    || '|' || COALESCE((SELECT updated_at FROM settings
                                        WHERE key = 'storefront_response'), 0)

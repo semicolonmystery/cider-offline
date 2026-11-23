@@ -174,9 +174,128 @@ pub fn lyrics_report(r: &LyricsReport, lrclib_only: bool) -> String {
     text
 }
 
+/// A file size for people: "512 KB", "24.1 MB", "1.3 GB".
+#[expect(clippy::cast_precision_loss, reason = "a rounded, display-only size")]
+pub fn bytes(bytes: u64) -> String {
+    const KB: f64 = 1_000.0;
+    let value = bytes as f64;
+    if value < KB * KB {
+        format!(
+            "{:.0} KB",
+            (value / KB).max(if bytes > 0 { 1.0 } else { 0.0 })
+        )
+    } else if value < KB * KB * KB {
+        format!("{:.1} MB", value / (KB * KB))
+    } else {
+        format!("{:.1} GB", value / (KB * KB * KB))
+    }
+}
+
+/// "3 songs, 24.1 MB" (a count of downloaded files and their size).
+pub fn files_and_size(files: usize, size: u64) -> String {
+    let noun = if files == 1 { "song" } else { "songs" };
+    format!("{files} {noun}, {}", bytes(size))
+}
+
+/// The most songs a dialog or message names; more are counted.
+pub const MAX_NAMED_SONGS: usize = 5;
+
+/// `count` songs for a dialog or message: their names ("“A”", "“A” and
+/// “B”", "“A”, “B” and “C”") when there are at most [`MAX_NAMED_SONGS`]
+/// and `titles` names each of them, else a count ("37 songs").
+pub fn songs(count: usize, titles: &[String]) -> String {
+    let named = count <= MAX_NAMED_SONGS
+        && titles.len() == count
+        && titles.iter().all(|title| !title.trim().is_empty());
+    if count == 0 || !named {
+        return counted(count, "song", "songs");
+    }
+    let mut text = String::new();
+    for (i, title) in titles.iter().enumerate() {
+        if i > 0 {
+            text.push_str(if i + 1 == count { " and " } else { ", " });
+        }
+        let _ = write!(text, "“{}”", title.trim());
+    }
+    text
+}
+
+/// "is" for one song, "are" for more.
+pub fn is_are(count: usize) -> &'static str {
+    if count == 1 { "is" } else { "are" }
+}
+
+/// `text` with an invisible line-break opportunity (U+200B) after every
+/// path separator, so a long path in a wrapped label breaks between folders
+/// instead of forcing the label (and the page) wider than the window.
+pub fn breakable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    for c in text.chars() {
+        out.push(c);
+        if matches!(c, '\\' | '/') {
+            out.push('\u{200B}');
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn titles(names: &[&str]) -> Vec<String> {
+        names.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    #[test]
+    fn songs_should_name_up_to_five_songs() {
+        assert_eq!(
+            [
+                songs(1, &titles(&["One"])),
+                songs(2, &titles(&["One", "Two"])),
+                songs(5, &titles(&["A", "B", "C", "D", "E"])),
+            ],
+            [
+                "“One”".to_owned(),
+                "“One” and “Two”".to_owned(),
+                "“A”, “B”, “C”, “D” and “E”".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn songs_should_count_more_than_five_songs() {
+        assert_eq!(
+            songs(6, &titles(&["A", "B", "C", "D", "E", "F"])),
+            "6 songs"
+        );
+    }
+
+    #[test]
+    fn songs_should_count_when_a_title_is_missing() {
+        assert_eq!(
+            [songs(2, &titles(&["One"])), songs(1, &titles(&[" "]))],
+            ["2 songs".to_owned(), "1 song".to_owned()]
+        );
+    }
+
+    #[test]
+    fn bytes_should_pick_a_readable_unit() {
+        assert_eq!(
+            [
+                bytes(0),
+                bytes(700),
+                bytes(24_100_000),
+                bytes(1_300_000_000)
+            ],
+            ["0 KB", "1 KB", "24.1 MB", "1.3 GB"]
+        );
+    }
+
+    #[test]
+    fn files_and_size_should_count_songs() {
+        assert_eq!(files_and_size(1, 5_000_000), "1 song, 5.0 MB");
+    }
 
     #[test]
     fn progress_should_mention_retry_pass() {
@@ -285,5 +404,18 @@ mod tests {
     #[test]
     fn count_should_leave_small_numbers_alone() {
         assert_eq!(count(999), "999");
+    }
+
+    #[test]
+    fn breakable_should_allow_a_break_after_each_path_separator() {
+        assert_eq!(
+            breakable(r"C:\Users\a/b"),
+            "C:\\\u{200B}Users\\\u{200B}a/\u{200B}b"
+        );
+    }
+
+    #[test]
+    fn breakable_should_leave_text_without_separators_alone() {
+        assert_eq!(breakable("No path here."), "No path here.");
     }
 }

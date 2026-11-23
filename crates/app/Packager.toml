@@ -24,7 +24,7 @@
 
 name = "cider-offline"
 product-name = "Cider Offline"
-version = "0.1.0"
+version = "0.1.1"
 identifier = "sh.cider-offline.CiderOffline"
 description = "Local HTTPS proxy that keeps the Cider music client working offline from a local cache."
 authors = ["Lukáš Poddaný"]

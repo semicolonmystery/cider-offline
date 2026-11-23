@@ -48,6 +48,14 @@ fn check(
 /// [`Apple::with_web_playback`] so wiremock can serve canned responses.
 pub(crate) const PLAYBACK_URL: &str =
     "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/webPlayback";
+/// The license endpoint for enhancedHls (spatial) keys: the fixed URL every
+/// webPlayback answer names as `hls-key-server-url`. A spatial download makes
+/// no webPlayback call, so it has no per-song URL to take it from.
+pub(crate) const LICENSE_URL: &str =
+    "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense";
+/// `AUDIO` group of the spatial stream in an enhancedHls master playlist:
+/// the Dolby Atmos mix rendered to binaural stereo, AAC-LC 256 kbps.
+const BINAURAL_AUDIO_GROUP: &str = "audio-stereo-256-binaural";
 const ORIGIN_VALUE: &str = "https://music.apple.com";
 const REFERER_VALUE: &str = "https://music.apple.com/";
 /// Windows Chrome 148 user-agent string, matched byte-for-byte with Cider's
@@ -567,6 +575,146 @@ pub struct HlsInfo {
     pub segments: Vec<SegmentRange>,
 }
 
+/// One Widevine key of a spatial media playlist and the segments it
+/// encrypts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyGroup {
+    /// The `#EXT-X-KEY` `URI="data:…"` value, verbatim (the license `uri`).
+    pub key_uri: String,
+    /// The Widevine PSSH box decoded from that URI.
+    pub pssh: Vec<u8>,
+    /// Indices into [`SpatialHls::segments`] this key encrypts.
+    pub segments: std::ops::Range<usize>,
+}
+
+/// What a spatial (enhancedHls binaural) media playlist tells the
+/// downloader.
+#[derive(Debug, Clone)]
+pub struct SpatialHls {
+    /// `#EXT-X-MAP` init segment.
+    pub init_segment: SegmentRange,
+    /// Ordered media segments.
+    pub segments: Vec<SegmentRange>,
+    /// The Widevine keys in playlist order; together they cover every
+    /// segment exactly once.
+    pub key_groups: Vec<KeyGroup>,
+}
+
+/// Fetches the enhancedHls master at `master_url`, picks the binaural
+/// (spatial) variant and parses its media playlist. `Ok(None)` when the
+/// master has no binaural variant (the song has no Dolby Atmos mix).
+///
+/// Both playlists are public CDN files: sent with browser-only headers, no
+/// tokens.
+pub async fn fetch_spatial_hls(
+    client: &reqwest::Client,
+    master_url: &str,
+) -> Result<Option<SpatialHls>, DrmError> {
+    let headers = minimal_browser_headers();
+    let resp = client
+        .get(master_url)
+        .headers(headers.clone())
+        .send()
+        .await?;
+    check("playlist", &resp, 0)?;
+    let master = resp.text().await?;
+    let Some(variant) = pick_binaural_variant(&master) else {
+        return Ok(None);
+    };
+    let media_url = resolve_url(master_url, variant)?;
+    let resp = client.get(&media_url).headers(headers).send().await?;
+    check("playlist", &resp, 0)?;
+    let media = resp.text().await?;
+    parse_spatial_playlist(&media, &media_url).map(Some)
+}
+
+/// The URI of the `#EXT-X-STREAM-INF` whose `AUDIO` group is
+/// [`BINAURAL_AUDIO_GROUP`]: the line after the tag.
+fn pick_binaural_variant(master: &str) -> Option<&str> {
+    let mut lines = master.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") else {
+            continue;
+        };
+        if parse_attr_list(attrs).get("AUDIO").map(String::as_str) != Some(BINAURAL_AUDIO_GROUP) {
+            continue;
+        }
+        return lines.find(|l| !l.is_empty() && !l.starts_with('#'));
+    }
+    None
+}
+
+/// Parses a spatial media playlist: the segment layout (as for any media
+/// playlist) plus its Widevine key groups.
+///
+/// A Widevine `#EXT-X-KEY` (by `KEYFORMAT`) applies to the segments that
+/// follow it until the next one. `m3u8-rs` keeps only one key per segment,
+/// so the keys are read from the raw text, counting segment URI lines.
+fn parse_spatial_playlist(manifest: &str, base_url: &str) -> Result<SpatialHls, DrmError> {
+    let (init_segment, segments) = parse_segment_layout(manifest, base_url)?;
+    let key_groups = parse_key_groups(manifest, segments.len())?;
+    Ok(SpatialHls {
+        init_segment,
+        segments,
+        key_groups,
+    })
+}
+
+/// The Widevine key groups of a media playlist with `segment_count`
+/// segments.
+///
+/// # Errors
+///
+/// [`DrmError::MissingKeyUri`] when a segment precedes every Widevine key;
+/// [`DrmError::HlsParse`] when the raw segment count disagrees with the
+/// parsed one or a key URI is not base64.
+fn parse_key_groups(manifest: &str, segment_count: usize) -> Result<Vec<KeyGroup>, DrmError> {
+    let mut groups: Vec<KeyGroup> = Vec::new();
+    let mut segment = 0usize;
+    for line in manifest.lines().map(str::trim) {
+        if let Some(attrs) = line.strip_prefix("#EXT-X-KEY:") {
+            let attrs = parse_attr_list(attrs);
+            let is_widevine = attrs
+                .get("KEYFORMAT")
+                .is_some_and(|kf| kf.eq_ignore_ascii_case(WIDEVINE_KEYFORMAT_UUID));
+            let Some(uri) = attrs.get("URI").filter(|_| is_widevine) else {
+                continue;
+            };
+            let (_, b64) = uri
+                .split_once("base64,")
+                .ok_or_else(|| DrmError::HlsParse("Widevine key URI is not base64 data".into()))?;
+            let decoded = BASE64_STANDARD
+                .decode(b64)
+                .map_err(|e| DrmError::HlsParse(format!("bad key data: {e}")))?;
+            // A key line directly followed by another owns no segments.
+            if groups.last().is_some_and(|g| g.segments.is_empty()) {
+                groups.pop();
+            }
+            groups.push(KeyGroup {
+                key_uri: uri.clone(),
+                pssh: ensure_pssh_bytes(&decoded),
+                segments: segment..segment,
+            });
+        } else if !line.is_empty() && !line.starts_with('#') {
+            let group = groups.last_mut().ok_or(DrmError::MissingKeyUri)?;
+            segment += 1;
+            group.segments.end = segment;
+        }
+    }
+    if groups.last().is_some_and(|g| g.segments.is_empty()) {
+        groups.pop();
+    }
+    if segment != segment_count {
+        return Err(DrmError::HlsParse(format!(
+            "counted {segment} segment URIs but parsed {segment_count} segments"
+        )));
+    }
+    if groups.is_empty() {
+        return Err(DrmError::MissingKeyUri);
+    }
+    Ok(groups)
+}
+
 /// Fetches the HLS manifest at `m3u8_url`. If it is a master playlist, follows
 /// the first `#EXT-X-STREAM-INF` into the media playlist before returning.
 ///
@@ -765,6 +913,27 @@ fn parse_media_playlist(
     base_url: &str,
     ctx: &ManifestContext,
 ) -> Result<HlsInfo, DrmError> {
+    let (init_segment, segments) = parse_segment_layout(manifest, base_url)?;
+
+    // m3u8-rs keeps only one Key per segment (the most-recently-seen tag), so
+    // when Apple emits several `#EXT-X-KEY` lines with different KEYFORMATs
+    // only the last wins. Scan the raw text for the Widevine key to be safe.
+    let (pssh_init_data, key_uri) = find_widevine_key(manifest, ctx)?;
+
+    Ok(HlsInfo {
+        pssh_init_data,
+        key_uri,
+        init_segment,
+        segments,
+    })
+}
+
+/// The init segment and the ordered media segments of a media playlist,
+/// with every byte range resolved to an absolute `(offset, length)`.
+fn parse_segment_layout(
+    manifest: &str,
+    base_url: &str,
+) -> Result<(SegmentRange, Vec<SegmentRange>), DrmError> {
     let playlist = m3u8_rs::parse_media_playlist_res(manifest.as_bytes())
         .map_err(|e| DrmError::HlsParse(e.to_string()))?;
 
@@ -780,11 +949,6 @@ fn parse_media_playlist(
         .find_map(|s| s.map.as_ref())
         .ok_or(DrmError::MissingInitSegment)?;
     let init_url = resolve_url(base_url, &map.uri)?;
-
-    // m3u8-rs keeps only one Key per segment (the most-recently-seen tag), so
-    // when Apple emits several `#EXT-X-KEY` lines with different KEYFORMATs
-    // only the last wins. Scan the raw text for the Widevine key to be safe.
-    let (pssh_init_data, key_uri) = find_widevine_key(manifest, ctx)?;
 
     // RFC 8216 §4.3.2.2: `#EXT-X-BYTERANGE:<n>[@<o>]`. When `@o` is omitted,
     // the sub-range begins immediately after the previous `#EXT-X-BYTERANGE`
@@ -818,12 +982,7 @@ fn parse_media_playlist(
         segments.push(SegmentRange { url, byte_range });
     }
 
-    Ok(HlsInfo {
-        pssh_init_data,
-        key_uri,
-        init_segment,
-        segments,
-    })
+    Ok((init_segment, segments))
 }
 
 /// Priority rank for a Widevine `#EXT-X-KEY` match. Higher wins.
@@ -1929,6 +2088,129 @@ https://mvod.example.com/v720p.m3u8?accessKey=video\n";
         );
         assert!(song.widevine_cert_url.is_some());
         assert!(song.hls_key_server_url.is_some());
+    }
+
+    // --- spatial (enhancedHls binaural) ------------------------------------
+
+    /// Excerpt of Creepin's enhancedHls master (public CDN playlist).
+    const SPATIAL_MASTER: &str = r#"#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-stereo-256",AUTOSELECT=YES,CHANNELS="2",NAME="songEnhanced"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-stereo-256-binaural",AUTOSELECT=YES,CHANNELS="2/-/BINAURAL",NAME="songEnhanced"
+
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=259051,BANDWIDTH=271654,CODECS="mp4a.40.2",AUDIO="audio-stereo-256-downmix"
+P1_A2_audio_en_gr256_mp4a-40-2_dm.m3u8
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=258415,BANDWIDTH=276794,CODECS="mp4a.40.2",AUDIO="audio-stereo-256"
+P1_A2_audio_en_gr256_mp4a-40-2.m3u8
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=258466,BANDWIDTH=274228,CODECS="mp4a.40.2",AUDIO="audio-stereo-256-binaural"
+P1_A2_audio_en_gr256_mp4a-40-2_bm.m3u8
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=131604,BANDWIDTH=140887,CODECS="mp4a.40.2",AUDIO="audio-stereo-128-binaural"
+P1_A2_audio_en_gr128_mp4a-40-2_bm.m3u8
+"#;
+
+    /// The binaural media playlist's layout: `s1/e1` for segment 0, `c24`
+    /// for the rest (`FairPlay` and `PlayReady` lines around each).
+    const SPATIAL_MEDIA: &str = r#"#EXTM3U
+#EXT-X-TARGETDURATION:15
+#EXT-X-VERSION:7
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://itunes.apple.com/P000000000/s1/e1",KEYFORMAT="com.apple.streamingkeydelivery",KEYFORMATVERSIONS="1"
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/plain;charset=UTF-16;base64,vgEAAAEAAQC0AQ==",KEYFORMAT="com.microsoft.playready",KEYFORMATVERSIONS="1"
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/plain;base64,AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgSEAAAAAAAAAAAczEvZTEgICBI88aJmwY=",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",KEYFORMATVERSIONS="1"
+#EXT-X-MAP:URI="P1_A2_bm_m.mp4",BYTERANGE="1124@0"
+#EXTINF:14.99733,
+#EXT-X-BYTERANGE:488185@1124
+P1_A2_bm_m.mp4
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://itunes.apple.com/p1/c24",KEYFORMAT="com.apple.streamingkeydelivery",KEYFORMATVERSIONS="1"
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/plain;charset=UTF-16;base64,vgEAAAEAAQC0AQ==",KEYFORMAT="com.microsoft.playready",KEYFORMATVERSIONS="1"
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/plain;base64,AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgSEAAAAABKf/6YYzI0ICAgICBI88aJmwY=",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",KEYFORMATVERSIONS="1"
+#EXTINF:14.99733,
+#EXT-X-BYTERANGE:463771@489309
+P1_A2_bm_m.mp4
+#EXTINF:14.99733,
+#EXT-X-BYTERANGE:474586@953080
+P1_A2_bm_m.mp4
+#EXT-X-ENDLIST
+"#;
+
+    const SPATIAL_BASE: &str = "https://aod.itunes.apple.com/itunes-assets/x/P1_A2_bm.m3u8";
+
+    #[test]
+    fn binaural_variant_should_be_picked_by_audio_group() {
+        assert_eq!(
+            pick_binaural_variant(SPATIAL_MASTER),
+            Some("P1_A2_audio_en_gr256_mp4a-40-2_bm.m3u8")
+        );
+    }
+
+    #[test]
+    fn master_without_binaural_variant_should_yield_none() {
+        let master = SPATIAL_MASTER.replace("audio-stereo-256-binaural", "audio-stereo-256-other");
+        assert_eq!(pick_binaural_variant(&master), None);
+    }
+
+    #[test]
+    fn spatial_playlist_should_split_segments_into_key_groups() {
+        let hls = parse_spatial_playlist(SPATIAL_MEDIA, SPATIAL_BASE).unwrap();
+        let ranges: Vec<_> = hls.key_groups.iter().map(|g| g.segments.clone()).collect();
+        assert_eq!(ranges, [0..1, 1..3]);
+    }
+
+    #[test]
+    fn spatial_key_groups_should_keep_the_widevine_uri_verbatim() {
+        let hls = parse_spatial_playlist(SPATIAL_MEDIA, SPATIAL_BASE).unwrap();
+        assert_eq!(
+            hls.key_groups[1].key_uri,
+            "data:text/plain;base64,AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgSEAAAAABKf/6YYzI0ICAgICBI88aJmwY="
+        );
+    }
+
+    #[test]
+    fn spatial_key_groups_should_carry_the_full_pssh_box() {
+        let hls = parse_spatial_playlist(SPATIAL_MEDIA, SPATIAL_BASE).unwrap();
+        let kids: Vec<Vec<u8>> = hls
+            .key_groups
+            .iter()
+            .map(|g| g.pssh[34..50].to_vec())
+            .collect();
+        assert_eq!(
+            kids,
+            [
+                b"\0\0\0\0\0\0\0\0s1/e1   ".to_vec(),
+                b"\0\0\0\0\x4a\x7f\xfe\x98c24     ".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn spatial_layout_should_resolve_init_and_byte_ranges() {
+        let hls = parse_spatial_playlist(SPATIAL_MEDIA, SPATIAL_BASE).unwrap();
+        let url = "https://aod.itunes.apple.com/itunes-assets/x/P1_A2_bm_m.mp4";
+        assert_eq!(
+            (hls.init_segment.clone(), hls.segments[2].clone()),
+            (
+                SegmentRange {
+                    url: url.to_owned(),
+                    byte_range: Some((0, 1124)),
+                },
+                SegmentRange {
+                    url: url.to_owned(),
+                    byte_range: Some((953_080, 474_586)),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn segment_before_any_widevine_key_should_fail() {
+        let manifest = "#EXTM3U\n#EXT-X-MAP:URI=\"i.mp4\"\n#EXTINF:1,\na.mp4\n#EXT-X-ENDLIST\n";
+        assert!(matches!(
+            parse_key_groups(manifest, 1),
+            Err(DrmError::MissingKeyUri)
+        ));
     }
 }
 

@@ -11,7 +11,9 @@ use tokio_util::task::TaskTracker;
 
 use super::body::{decode_if_supported, is_textual, read_body};
 
-/// Headers whose values are replaced by [`REDACTED`] in capture files.
+/// Headers whose values are replaced by [`REDACTED`] in capture files, in
+/// requests and responses alike: the developer token (`authorization`), the
+/// user token under every name Apple's clients send it, and cookies.
 const SECRET_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -19,6 +21,7 @@ const SECRET_HEADERS: &[&str] = &[
     "set-cookie",
     "media-user-token",
     "music-user-token",
+    "x-apple-music-user-token",
 ];
 const REDACTED: &str = "<redacted>";
 
@@ -227,6 +230,58 @@ mod tests {
         headers.insert("accept", HeaderValue::from_static("*/*"));
         let redacted = redacted_headers(&headers);
         assert!(!redacted.iter().any(|(_, v)| v.contains("secret")));
+    }
+
+    const SECRET: &str = "s3cr3t-token-value";
+
+    #[tokio::test]
+    async fn every_secret_request_header_should_be_redacted() {
+        for name in SECRET_HEADERS {
+            let request = Request::builder()
+                .uri("https://amp-api.music.apple.com/v1/me/library/songs")
+                .header(*name, SECRET)
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let (_, captured) = capture_request(request).await;
+            let json = serde_json::to_string(&captured).unwrap();
+            assert!(!json.contains(SECRET), "{name} leaked: {json}");
+            assert!(json.contains(REDACTED), "{name} not marked: {json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_secret_response_header_should_be_redacted() {
+        for name in SECRET_HEADERS {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(*name, SECRET)
+                .body(Body::empty())
+                .unwrap();
+            let (_, captured) = capture_response(response).await;
+            let json = serde_json::to_string(&captured).unwrap();
+            assert!(!json.contains(SECRET), "{name} leaked: {json}");
+        }
+    }
+
+    #[test]
+    fn apple_music_user_token_header_should_be_redacted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-apple-music-user-token", HeaderValue::from_static(SECRET));
+        assert_eq!(
+            redacted_headers(&headers),
+            [("x-apple-music-user-token".to_owned(), REDACTED.to_owned())]
+        );
+    }
+
+    #[test]
+    fn ordinary_headers_should_be_kept() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("*/*"));
+        assert_eq!(
+            redacted_headers(&headers),
+            [("accept".to_owned(), "*/*".to_owned())]
+        );
     }
 
     #[test]

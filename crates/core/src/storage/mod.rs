@@ -13,27 +13,37 @@ mod migrations;
 pub mod models;
 mod paths;
 mod repo;
+mod songs;
 mod synced;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 
 use paths::PathCodec;
 
 pub use catalog::{ArtworkFile, CatalogUpdate, TrackListUpdate, TrackMetadata, TrackRecord};
-pub use downloads::{DownloadRecord, DownloadSourceKind, DownloadStatus};
+pub use downloads::{
+    DownloadCollection, DownloadRecord, DownloadSourceKind, DownloadStatus, RemovalPreview,
+};
+pub(crate) use downloads::{StoredFile, UnlinkedInputs};
 pub use library::{LibraryCollection, LibraryContents, LibraryFilter};
 pub use library_page::{LibraryPage, LibraryQuery, LibraryTrack, TrackFilter};
 pub use migrations::SCHEMA_VERSION;
 pub use models::{
-    CUSTOM_ALBUM_ID_PREFIX, CUSTOM_ID_PREFIX, CUSTOM_PLAYLIST_ID_PREFIX, CUSTOM_SONG_ID_PREFIX,
-    CacheEntry, CollectionKind, CustomAudio, CustomAudioMode, LyricsQuality, LyricsSource,
-    NewCustomCollection, NewCustomTrack, Playlist, TokenKind, Track, TrackMapping,
+    AudioFile, AudioVariant, CUSTOM_ALBUM_ID_PREFIX, CUSTOM_ID_PREFIX, CUSTOM_PLAYLIST_ID_PREFIX,
+    CUSTOM_SONG_ID_PREFIX, CacheEntry, CollectionKind, CustomAudio, CustomAudioMode, LyricsQuality,
+    LyricsSource, NewCustomCollection, NewCustomTrack, Playlist, TokenKind, Track, TrackAudio,
+    TrackMapping,
 };
+pub(crate) use songs::{DroppedAudio, SongRekey};
 pub use synced::{LIBRARY_SONGS_SETTING, LibrarySnapshot, SyncedCollection};
+
+/// Re-keys and merges buffered for a slow [`Storage::subscribe_rekeys`]
+/// listener before it misses some (it then reconciles everything).
+const REKEY_BUFFER: usize = 256;
 
 /// Errors from the local store.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +90,24 @@ pub enum StorageError {
     /// The blocking task running the operation panicked or was cancelled.
     #[error("database task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
+    /// The database was written by a newer version of the app.
+    #[error(
+        "the database has schema version {found}, but this version of the app supports up to {supported}; update the app"
+    )]
+    SchemaTooNew {
+        /// `user_version` found in the database.
+        found: u32,
+        /// Newest schema version this build knows.
+        supported: u32,
+    },
+    /// A migration left rows that reference missing parents; it was rolled back.
+    #[error("migration {version} broke {violations} foreign key reference(s); rolled back")]
+    ForeignKeyViolation {
+        /// Schema version the failed migration would have produced.
+        version: u32,
+        /// Rows reported by `PRAGMA foreign_key_check`.
+        violations: usize,
+    },
 }
 
 /// Handle to the local store. Cheap to clone; all clones share one connection.
@@ -90,6 +118,8 @@ pub struct Storage {
     views: library_page::ViewCache,
     /// Stored-path codec rooted at the database's folder.
     codec: PathCodec,
+    /// Songs that took another id (see [`Self::subscribe_rekeys`]).
+    rekeys: tokio::sync::broadcast::Sender<SongRekey>,
 }
 
 impl std::fmt::Debug for Storage {
@@ -163,13 +193,31 @@ impl Storage {
         conn.pragma_update(None, "foreign_keys", true)?;
         // WAL is a no-op for in-memory databases; harmless there.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // In WAL mode NORMAL never corrupts the database; a power cut can
+        // only lose the last commits. FULL (the default) syncs every commit.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrations::migrate(&mut conn)?;
         library_page::register_functions(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             views: library_page::ViewCache::default(),
             codec,
+            rekeys: tokio::sync::broadcast::channel(REKEY_BUFFER).0,
         })
+    }
+
+    /// Every song re-keyed to, or merged into, its catalog id from now on,
+    /// sent once the change is committed. The database only moves rows; the
+    /// listener moves what lives in files (see [`crate::Library`]).
+    pub(crate) fn subscribe_rekeys(&self) -> tokio::sync::broadcast::Receiver<SongRekey> {
+        self.rekeys.subscribe()
+    }
+
+    /// Sends committed re-keys to the listeners (none listening is fine).
+    fn publish_rekeys(&self, rekeys: Vec<SongRekey>) {
+        for rekey in rekeys {
+            let _ = self.rekeys.send(rekey);
+        }
     }
 
     /// Runs `f` with exclusive access to the connection on the blocking pool.
@@ -251,8 +299,64 @@ impl Storage {
     /// Returns database errors.
     pub async fn upsert_track(&self, track: Track) -> Result<(), StorageError> {
         let codec = self.codec.clone();
-        self.call(move |c| repo::upsert_track(c, &codec, &track))
-            .await
+        let rekeys = self
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let mut rekeys = Vec::new();
+                repo::upsert_track(&tx, &codec, &track, &mut rekeys)?;
+                tx.commit()?;
+                Ok(rekeys)
+            })
+            .await?;
+        self.publish_rekeys(rekeys);
+        Ok(())
+    }
+
+    /// Whether any audio row records the stored path `stored`.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub(crate) async fn audio_path_recorded(&self, stored: &str) -> Result<bool, StorageError> {
+        let stored = stored.to_owned();
+        self.call(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM track_audio WHERE path = ?1)",
+                [&stored],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
+    /// Records the file a merge dropped (see [`SongRekey::dropped_audio`])
+    /// as song `song`'s mix again, in place of the file it kept, if the song
+    /// still records that one. Returns whether the row changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub(crate) async fn restore_dropped_audio(
+        &self,
+        song: &str,
+        dropped: &DroppedAudio,
+    ) -> Result<bool, StorageError> {
+        let (song, dropped) = (song.to_owned(), dropped.clone());
+        self.call(move |c| {
+            Ok(c.execute(
+                "UPDATE track_audio SET path = ?4, size = ?5, duration_ms = ?6
+                 WHERE track_id = ?1 AND variant = ?2 AND path = ?3",
+                params![
+                    song,
+                    dropped.variant,
+                    dropped.kept,
+                    dropped.dropped,
+                    dropped.size,
+                    dropped.duration_ms
+                ],
+            )? > 0)
+        })
+        .await
     }
 
     /// Fetches a track by id.
@@ -286,7 +390,8 @@ impl Storage {
         self.call(move |c| repo::delete_track(c, &id)).await
     }
 
-    /// Sets or clears a track's local audio file; returns whether the track exists.
+    /// Sets or clears (`None`) the `variant` audio file of track row `id`;
+    /// returns whether the track exists.
     ///
     /// # Errors
     ///
@@ -294,11 +399,25 @@ impl Storage {
     pub async fn set_track_audio(
         &self,
         id: &str,
+        variant: AudioVariant,
         audio_path: Option<PathBuf>,
     ) -> Result<bool, StorageError> {
         let id = id.to_owned();
         let codec = self.codec.clone();
-        self.call(move |c| repo::set_track_audio(c, &codec, &id, audio_path.as_deref()))
+        self.call(move |c| repo::set_track_audio(c, &codec, &id, variant, audio_path.as_deref()))
+            .await
+    }
+
+    /// The audio files recorded for track row `id` (normal first), with their
+    /// size and duration when known. File existence is not checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn track_audio_files(&self, id: &str) -> Result<Vec<AudioFile>, StorageError> {
+        let id = id.to_owned();
+        let codec = self.codec.clone();
+        self.call(move |c| repo::track_audio_files(c, &codec, &id))
             .await
     }
 
@@ -683,7 +802,7 @@ impl Storage {
         track_ids: Vec<String>,
     ) -> Result<(), StorageError> {
         let owner = owner.unwrap_or(downloads::SONG_OWNER).to_owned();
-        self.call(move |c| downloads::pin(c, &owner, &track_ids))
+        self.call(move |c| downloads::pin(c, &owner, &track_ids).map(drop))
             .await
     }
 
@@ -701,6 +820,43 @@ impl Storage {
     ) -> Result<Vec<String>, StorageError> {
         let owner = owner.unwrap_or(downloads::SONG_OWNER).to_owned();
         self.call(move |c| downloads::unpin(c, &owner, &track_ids))
+            .await
+    }
+
+    /// Drops every pin of collection `owner` (its download is removed) and
+    /// returns the songs left with no pin at all, whose audio may therefore
+    /// be deleted: those of `track_ids` (any id of each song) and every
+    /// other song the collection pinned, such as one that left it upstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn release_download_collection(
+        &self,
+        owner: &str,
+        track_ids: Vec<String>,
+    ) -> Result<Vec<String>, StorageError> {
+        let owner = owner.to_owned();
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            let orphans = downloads::release_owner(&tx, &owner, &track_ids)?;
+            tx.commit()?;
+            Ok(orphans)
+        })
+        .await
+    }
+
+    /// Lists every stored Apple resource, one [`Track`] per Apple id: each
+    /// song's own resource and each of its aliases (see
+    /// [`Storage::tracks_by_any_id`]). The offline responder answers from
+    /// these; lists of songs use [`Storage::list_tracks`].
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn list_resources(&self) -> Result<Vec<Track>, StorageError> {
+        let codec = self.codec.clone();
+        self.call(move |c| catalog::resources(c, &codec, None))
             .await
     }
 
@@ -733,8 +889,200 @@ impl Storage {
         self.call(|c| downloads::pinned_owners(c)).await
     }
 
-    /// Records `path` (or clears it with `None`) as the audio file of every
-    /// track whose id or catalog id is `id`; returns how many rows changed.
+    /// Like [`Self::update_download_status`], but only when `guard` (run
+    /// while the database is locked) returns `true`. The download queue's
+    /// workers write through this, so a write of a worker that was paused or
+    /// cancelled meanwhile can never land after the queue's own update.
+    /// Returns whether the row was written.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn update_download_status_if(
+        &self,
+        id: &str,
+        status: DownloadStatus,
+        progress: f32,
+        message: Option<String>,
+        guard: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<bool, StorageError> {
+        let id = id.to_owned();
+        self.call(move |c| {
+            if !guard() {
+                return Ok(false);
+            }
+            downloads::update_status(c, &id, status, progress, message.as_deref())
+        })
+        .await
+    }
+
+    /// Sets a download row's "replace existing files" and "deferred" flags;
+    /// returns whether the row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn set_download_flags(
+        &self,
+        id: &str,
+        replace: bool,
+        deferred: bool,
+    ) -> Result<bool, StorageError> {
+        let id = id.to_owned();
+        self.call(move |c| downloads::set_flags(c, &id, replace, deferred))
+            .await
+    }
+
+    /// Every download pin as `(track_id, owner)`; `owner` is `""` for an
+    /// individual download.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn download_pins(&self) -> Result<Vec<(String, String)>, StorageError> {
+        self.call(|c| downloads::all_pins(c)).await
+    }
+
+    /// Deletes the given `(track_id, owner)` pins; returns how many existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn delete_download_pins(
+        &self,
+        pins: Vec<(String, String)>,
+    ) -> Result<usize, StorageError> {
+        self.call(move |c| downloads::delete_pins(c, &pins)).await
+    }
+
+    /// What removing collection `owner`'s download of `track_ids` would do:
+    /// which downloaded songs would lose their files and which stay because
+    /// another download still needs them.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn download_removal_preview(
+        &self,
+        owner: &str,
+        track_ids: Vec<String>,
+    ) -> Result<RemovalPreview, StorageError> {
+        let owner = owner.to_owned();
+        self.call(move |c| downloads::removal_preview(c, &owner, &track_ids))
+            .await
+    }
+
+    /// Records a collection whose download the user asked for, so its pins
+    /// can later be checked against its current songs. `keep` sets "Keep
+    /// downloaded"; `None` leaves it as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn register_download_collection(
+        &self,
+        collection: DownloadCollection,
+        keep: Option<bool>,
+    ) -> Result<(), StorageError> {
+        self.call(move |c| downloads::register_collection(c, &collection, keep))
+            .await
+    }
+
+    /// Makes `collection` a download link for its songs `track_ids` (any id
+    /// of each song): pins every one of them to the collection, including
+    /// songs already on disk through other downloads, and records the
+    /// collection (see [`Self::register_download_collection`]; `keep` as
+    /// there), in one transaction. Other owners' pins are left alone, so the
+    /// songs stay while any of their downloads wants them. Returns how many
+    /// songs were newly pinned by the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn link_download_collection(
+        &self,
+        collection: DownloadCollection,
+        keep: Option<bool>,
+        track_ids: Vec<String>,
+    ) -> Result<usize, StorageError> {
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            let added = downloads::pin(&tx, &collection.owner, &track_ids)?;
+            downloads::register_collection(&tx, &collection, keep)?;
+            tx.commit()?;
+            Ok(added)
+        })
+        .await
+    }
+
+    /// Forgets a downloaded collection; returns whether it was recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn unregister_download_collection(&self, owner: &str) -> Result<bool, StorageError> {
+        let owner = owner.to_owned();
+        self.call(move |c| downloads::unregister_collection(c, &owner))
+            .await
+    }
+
+    /// Every collection whose download the user asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn download_collections(&self) -> Result<Vec<DownloadCollection>, StorageError> {
+        self.call(|c| downloads::collections(c)).await
+    }
+
+    /// Records whether song `track_id` (a download key, the catalog id) has a
+    /// spatial mix, as a catalog lookup showed.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn set_song_spatial(
+        &self,
+        track_id: &str,
+        has_spatial: bool,
+    ) -> Result<(), StorageError> {
+        let track_id = track_id.to_owned();
+        self.call(move |c| downloads::set_song_spatial(c, &track_id, has_spatial))
+            .await
+    }
+
+    /// Every song whose spatial mix was looked up, by download key: whether
+    /// it has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn song_spatial(
+        &self,
+    ) -> Result<std::collections::HashMap<String, bool>, StorageError> {
+        self.call(|c| downloads::song_spatial(c)).await
+    }
+
+    pub(crate) async fn unlinked_inputs(&self) -> Result<UnlinkedInputs, StorageError> {
+        self.call(|c| downloads::unlinked_inputs(c)).await
+    }
+
+    /// Deletes every non-custom audio row recording the stored path `path`;
+    /// returns the ids of the tracks that lost it.
+    pub(crate) async fn delete_audio_path(&self, path: &str) -> Result<Vec<String>, StorageError> {
+        let path = path.to_owned();
+        self.call(move |c| downloads::delete_audio_path(c, &path))
+            .await
+    }
+
+    /// The absolute path a stored path names.
+    pub(crate) fn resolve_stored_path(&self, stored: &str) -> PathBuf {
+        self.codec.decode(stored)
+    }
+
+    /// Records `path` (or clears it with `None`) as the `variant` audio file
+    /// of the song any of whose ids is `id`; returns how many songs matched
+    /// (0 or 1).
     ///
     /// # Errors
     ///
@@ -742,21 +1090,109 @@ impl Storage {
     pub async fn set_audio_by_any_id(
         &self,
         id: &str,
+        variant: AudioVariant,
         path: Option<PathBuf>,
     ) -> Result<usize, StorageError> {
-        let id = id.to_owned();
-        let codec = self.codec.clone();
-        self.call(move |c| repo::set_audio_any(c, &codec, &id, path.as_deref()))
+        self.put_audio_by_any_id_inner(id, variant, path.map(|p| AudioFile::new(variant, p)))
             .await
     }
 
-    /// Download keys (catalog ids) of real tracks with no recorded audio.
+    /// Records `file` (with its size and duration) as the audio of its
+    /// variant on the song any of whose ids is `id`; returns how many songs
+    /// matched (0 or 1). Replaces a previous file of that variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn put_audio_file_by_any_id(
+        &self,
+        id: &str,
+        file: AudioFile,
+    ) -> Result<usize, StorageError> {
+        self.put_audio_by_any_id_inner(id, file.variant, Some(file))
+            .await
+    }
+
+    async fn put_audio_by_any_id_inner(
+        &self,
+        id: &str,
+        variant: AudioVariant,
+        file: Option<AudioFile>,
+    ) -> Result<usize, StorageError> {
+        let id = id.to_owned();
+        let codec = self.codec.clone();
+        self.call(move |c| repo::put_audio_any(c, &codec, &id, variant, file.as_ref()))
+            .await
+    }
+
+    /// Whether removing downloads must leave the audio of `id` alone: it is a
+    /// custom song's own audio, or a song a custom song plays by reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn audio_removal_exempt(&self, id: &str) -> Result<bool, StorageError> {
+        let id = id.to_owned();
+        self.call(move |c| downloads::audio_removal_exempt(c, &id))
+            .await
+    }
+
+    /// Deletes every audio variant of the non-custom song any of whose ids
+    /// is `id` (the files are the caller's); returns how many audio rows were
+    /// deleted, so `0` means there was nothing to remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn clear_audio_by_any_id(&self, id: &str) -> Result<usize, StorageError> {
+        let id = id.to_owned();
+        self.call(move |c| repo::clear_audio_any(c, &id)).await
+    }
+
+    /// Download keys (catalog ids) of real tracks with no recorded audio
+    /// variant.
     ///
     /// # Errors
     ///
     /// Returns database errors.
     pub async fn ids_missing_audio(&self) -> Result<Vec<String>, StorageError> {
         self.call(|c| repo::ids_missing_audio(c)).await
+    }
+
+    /// The subset of `ids` naming a track with local audio (a recorded file
+    /// of any variant, or a track mapping), matched by track id or catalog id. File existence
+    /// is not checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn ids_with_local_audio(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<std::collections::HashSet<String>, StorageError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.call(move |c| repo::ids_with_local_audio(c, &ids))
+            .await
+    }
+
+    /// Which variants the tracks named by `ids` have locally, keyed by the
+    /// requested id, for the ids that have any (normal first). A track
+    /// mapping counts as the normal variant. Matched by track id or catalog
+    /// id; file existence is not checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors.
+    pub async fn local_variants(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, Vec<AudioVariant>>, StorageError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.call(move |c| repo::local_variants(c, &ids)).await
     }
 
     /// Sets the lyrics source and quality of every track whose id or catalog
@@ -878,11 +1314,15 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         storage.upsert_track(track("1")).await.unwrap();
         storage
-            .set_track_audio("1", Some(PathBuf::from("song.m4a")))
+            .set_track_audio(
+                "1",
+                crate::storage::AudioVariant::Stereo,
+                Some(PathBuf::from("song.m4a")),
+            )
             .await
             .unwrap();
         let stored = storage.get_track("1").await.unwrap().unwrap();
-        assert_eq!(stored.audio_path, Some(PathBuf::from("song.m4a")));
+        assert_eq!(stored.audio.normal, Some(PathBuf::from("song.m4a")));
     }
 
     #[tokio::test]
@@ -978,7 +1418,7 @@ mod tests {
         let track = storage.get_track(&id).await.unwrap().unwrap();
         assert_eq!(track.audio_mode, Some(CustomAudioMode::Reference));
         assert_eq!(track.reference_track_id.as_deref(), Some("1594405597"));
-        assert!(track.audio_path.is_none());
+        assert!(track.audio.is_empty());
     }
 
     #[tokio::test]
@@ -1075,20 +1515,24 @@ mod tests {
         storage.upsert_track(track("1")).await.unwrap();
         let file = data.join("media").join("1.m4a");
         storage
-            .set_track_audio("1", Some(file.clone()))
+            .set_track_audio(
+                "1",
+                crate::storage::AudioVariant::Stereo,
+                Some(file.clone()),
+            )
             .await
             .unwrap();
         let raw = storage
             .call(|c| {
                 Ok(
-                    c.query_row("SELECT audio_path FROM tracks WHERE id='1'", [], |r| {
+                    c.query_row("SELECT path FROM track_audio WHERE track_id='1'", [], |r| {
                         r.get::<_, String>(0)
                     })?,
                 )
             })
             .await
             .unwrap();
-        let read = storage.get_track("1").await.unwrap().unwrap().audio_path;
+        let read = storage.get_track("1").await.unwrap().unwrap().audio.normal;
         assert_eq!((raw.as_str(), read), ("media/1.m4a", Some(file)));
     }
 
@@ -1125,7 +1569,11 @@ mod tests {
             let storage = Storage::open(&data.join("store.sqlite")).unwrap();
             storage.upsert_track(track("1")).await.unwrap();
             storage
-                .set_track_audio("1", Some(data.join("media").join("1.m4a")))
+                .set_track_audio(
+                    "1",
+                    crate::storage::AudioVariant::Stereo,
+                    Some(data.join("media").join("1.m4a")),
+                )
                 .await
                 .unwrap();
             // Fold the WAL into the main file before copying it.
@@ -1142,7 +1590,7 @@ mod tests {
         std::fs::copy(data.join("store.sqlite"), other.join("store.sqlite")).unwrap();
         let storage = Storage::open(&other.join("store.sqlite")).unwrap();
         assert_eq!(
-            storage.get_track("1").await.unwrap().unwrap().audio_path,
+            storage.get_track("1").await.unwrap().unwrap().audio.normal,
             Some(other.join("media").join("1.m4a"))
         );
     }
@@ -1162,5 +1610,363 @@ mod tests {
             .unwrap();
         let mapping = storage.get_track_mapping("9").await.unwrap().unwrap();
         assert_eq!(mapping.file_path, file);
+    }
+
+    // ----- Audio variants -----
+
+    /// A library row `i.1` and its catalog twin `1`.
+    async fn twins() -> Storage {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_track(track("1")).await.unwrap();
+        storage
+            .upsert_track(Track {
+                catalog_id: Some("1".to_owned()),
+                ..track("i.1")
+            })
+            .await
+            .unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    async fn track_should_carry_both_variants() {
+        let storage = twins().await;
+        storage
+            .set_track_audio("1", AudioVariant::Stereo, Some("n.m4a".into()))
+            .await
+            .unwrap();
+        storage
+            .set_track_audio("1", AudioVariant::Spatial, Some("s.m4a".into()))
+            .await
+            .unwrap();
+        let audio = storage.get_track("1").await.unwrap().unwrap().audio;
+        assert_eq!(
+            audio,
+            TrackAudio {
+                normal: Some("n.m4a".into()),
+                spatial: Some("s.m4a".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_track_audio_should_report_a_missing_track() {
+        let storage = Storage::open_in_memory().unwrap();
+        let exists = storage
+            .set_track_audio("nope", AudioVariant::Stereo, Some("n.m4a".into()))
+            .await
+            .unwrap();
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn clearing_one_variant_should_keep_the_other() {
+        let storage = twins().await;
+        for variant in AudioVariant::ALL {
+            storage
+                .set_track_audio("1", variant, Some(format!("{variant:?}.m4a").into()))
+                .await
+                .unwrap();
+        }
+        storage
+            .set_track_audio("1", AudioVariant::Stereo, None)
+            .await
+            .unwrap();
+        let track = storage.get_track("1").await.unwrap().unwrap();
+        assert_eq!(
+            (track.has_audio(), track.audio),
+            (
+                true,
+                TrackAudio {
+                    normal: None,
+                    spatial: Some("Spatial.m4a".into()),
+                }
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn set_audio_by_any_id_should_record_the_one_song_of_both_ids() {
+        let storage = twins().await;
+        let matched = storage
+            .set_audio_by_any_id("i.1", AudioVariant::Spatial, Some("s.m4a".into()))
+            .await
+            .unwrap();
+        let song = storage.get_track("1").await.unwrap().unwrap();
+        assert_eq!((matched, song.audio.spatial), (1, Some("s.m4a".into())));
+    }
+
+    #[tokio::test]
+    async fn clear_audio_by_any_id_should_remove_every_variant_of_every_twin() {
+        let storage = twins().await;
+        for variant in AudioVariant::ALL {
+            storage
+                .set_audio_by_any_id("1", variant, Some("x.m4a".into()))
+                .await
+                .unwrap();
+        }
+        let matched = storage.clear_audio_by_any_id("1").await.unwrap();
+        let catalog = storage.get_track("1").await.unwrap().unwrap();
+        let library = storage.get_track("i.1").await.unwrap().unwrap();
+        assert_eq!(
+            (matched, catalog.has_audio(), library.has_audio()),
+            (2, false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn put_audio_file_should_record_size_and_duration() {
+        let storage = twins().await;
+        storage
+            .put_audio_file_by_any_id(
+                "1",
+                AudioFile {
+                    size: Some(4_096),
+                    duration_ms: Some(180_000),
+                    ..AudioFile::new(AudioVariant::Spatial, "s.m4a")
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .set_track_audio("1", AudioVariant::Stereo, Some("n.m4a".into()))
+            .await
+            .unwrap();
+        let files = storage.track_audio_files("1").await.unwrap();
+        assert_eq!(
+            files,
+            vec![
+                AudioFile::new(AudioVariant::Stereo, "n.m4a"),
+                AudioFile {
+                    size: Some(4_096),
+                    duration_ms: Some(180_000),
+                    ..AudioFile::new(AudioVariant::Spatial, "s.m4a")
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn re_recording_the_same_path_should_keep_its_size() {
+        let storage = twins().await;
+        let file = AudioFile {
+            size: Some(10),
+            ..AudioFile::new(AudioVariant::Stereo, "n.m4a")
+        };
+        storage.put_audio_file_by_any_id("1", file).await.unwrap();
+        storage
+            .set_audio_by_any_id("1", AudioVariant::Stereo, Some("n.m4a".into()))
+            .await
+            .unwrap();
+        let files = storage.track_audio_files("1").await.unwrap();
+        assert_eq!(files[0].size, Some(10));
+    }
+
+    #[tokio::test]
+    async fn recording_a_new_path_should_drop_the_old_size() {
+        let storage = twins().await;
+        let file = AudioFile {
+            size: Some(10),
+            ..AudioFile::new(AudioVariant::Stereo, "n.m4a")
+        };
+        storage.put_audio_file_by_any_id("1", file).await.unwrap();
+        storage
+            .set_audio_by_any_id("1", AudioVariant::Stereo, Some("new.m4a".into()))
+            .await
+            .unwrap();
+        let files = storage.track_audio_files("1").await.unwrap();
+        assert_eq!(files, vec![AudioFile::new(AudioVariant::Stereo, "new.m4a")]);
+    }
+
+    #[tokio::test]
+    async fn upsert_track_should_store_exactly_its_audio() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_track(Track {
+                audio: TrackAudio {
+                    normal: Some("n.m4a".into()),
+                    spatial: Some("s.m4a".into()),
+                },
+                ..track("1")
+            })
+            .await
+            .unwrap();
+        storage
+            .upsert_track(Track {
+                audio: TrackAudio::normal("n.m4a"),
+                ..track("1")
+            })
+            .await
+            .unwrap();
+        let audio = storage.get_track("1").await.unwrap().unwrap().audio;
+        assert_eq!(audio, TrackAudio::normal("n.m4a"));
+    }
+
+    #[tokio::test]
+    async fn spatial_only_track_should_count_as_downloaded() {
+        let storage = twins().await;
+        storage.upsert_track(track("2")).await.unwrap();
+        storage
+            .set_audio_by_any_id("1", AudioVariant::Spatial, Some("s.m4a".into()))
+            .await
+            .unwrap();
+        let missing = storage.ids_missing_audio().await.unwrap();
+        let local = storage
+            .ids_with_local_audio(vec!["1".to_owned(), "i.1".to_owned(), "2".to_owned()])
+            .await
+            .unwrap();
+        let downloaded: Vec<String> = storage
+            .library_contents(LibraryFilter::Downloaded)
+            .await
+            .unwrap()
+            .tracks
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        let mut local: Vec<String> = local.into_iter().collect();
+        local.sort();
+        assert_eq!(
+            (missing, local, downloaded),
+            (
+                vec!["2".to_owned()],
+                vec!["1".to_owned(), "i.1".to_owned()],
+                vec!["1".to_owned()]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn local_variants_should_report_each_variant_by_any_id() {
+        let storage = twins().await;
+        storage.upsert_track(track("2")).await.unwrap();
+        storage.upsert_track(track("3")).await.unwrap();
+        storage
+            .set_audio_by_any_id("1", AudioVariant::Spatial, Some("s.m4a".into()))
+            .await
+            .unwrap();
+        storage
+            .set_track_audio("2", AudioVariant::Stereo, Some("n.m4a".into()))
+            .await
+            .unwrap();
+        storage
+            .set_track_mapping(TrackMapping {
+                track_id: "9".to_owned(),
+                file_path: "m.m4a".into(),
+            })
+            .await
+            .unwrap();
+        let ids = ["1", "i.1", "2", "3", "9"].map(str::to_owned).to_vec();
+        let mut found: Vec<(String, Vec<AudioVariant>)> = storage
+            .local_variants(ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("1".to_owned(), vec![AudioVariant::Spatial]),
+                ("2".to_owned(), vec![AudioVariant::Stereo]),
+                ("9".to_owned(), vec![AudioVariant::Stereo]),
+                ("i.1".to_owned(), vec![AudioVariant::Spatial]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_track_should_delete_its_audio_rows() {
+        let storage = twins().await;
+        storage
+            .set_track_audio("1", AudioVariant::Stereo, Some("n.m4a".into()))
+            .await
+            .unwrap();
+        storage.delete_track("1").await.unwrap();
+        storage.upsert_track(track("1")).await.unwrap();
+        assert_eq!(storage.track_audio_files("1").await.unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn custom_local_copy_should_be_its_normal_variant() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage
+            .create_custom_track(NewCustomTrack {
+                title: "Mine".to_owned(),
+                artist: "Me".to_owned(),
+                audio: CustomAudio::LocalCopy("mine.flac".into()),
+                ..NewCustomTrack::default()
+            })
+            .await
+            .unwrap();
+        let files = storage.track_audio_files(&id).await.unwrap();
+        assert_eq!(
+            files,
+            vec![AudioFile::new(AudioVariant::Stereo, "mine.flac")]
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_reference_audio_should_drop_the_local_copy() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage
+            .create_custom_track(NewCustomTrack {
+                title: "Mine".to_owned(),
+                artist: "Me".to_owned(),
+                audio: CustomAudio::LocalCopy("mine.flac".into()),
+                ..NewCustomTrack::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .set_custom_track_audio(&id, CustomAudio::Reference("123".to_owned()))
+            .await
+            .unwrap();
+        let track = storage.get_track(&id).await.unwrap().unwrap();
+        assert_eq!(
+            (track.audio_mode, track.has_audio()),
+            (Some(CustomAudioMode::Reference), false)
+        );
+    }
+
+    #[test]
+    fn preferred_audio_should_fall_back_to_spatial() {
+        let audio = TrackAudio {
+            normal: None,
+            spatial: Some("s.m4a".into()),
+        };
+        assert_eq!(audio.preferred(), Some(Path::new("s.m4a")));
+    }
+
+    #[tokio::test]
+    async fn clearing_the_lyrics_source_should_clear_its_quality() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_track(track("1")).await.unwrap();
+        storage
+            .set_lyrics_state("1", LyricsSource::Apple, LyricsQuality::Word)
+            .await
+            .unwrap();
+        storage
+            .set_track_lyrics_source("1", LyricsSource::None)
+            .await
+            .unwrap();
+        let track = storage.get_track("1").await.unwrap().unwrap();
+        assert_eq!(
+            (track.lyrics_source, track.lyrics_quality),
+            (LyricsSource::None, LyricsQuality::None)
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_should_drop_a_quality_without_lyrics() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_track(Track {
+                lyrics_quality: LyricsQuality::Line,
+                ..track("1")
+            })
+            .await
+            .unwrap();
+        let track = storage.get_track("1").await.unwrap().unwrap();
+        assert_eq!(track.lyrics_quality, LyricsQuality::None);
     }
 }

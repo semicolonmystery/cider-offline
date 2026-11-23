@@ -9,17 +9,20 @@
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use hudsucker::Body;
 use hudsucker::hyper::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, RANGE,
 };
 use hudsucker::hyper::{HeaderMap, Method, Response, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use crate::respond::{LOCAL_HEADER, add_cors};
-use crate::storage::{CustomAudioMode, Storage, StorageError, TrackRecord};
+use crate::storage::{AudioVariant, CustomAudioMode, Storage, StorageError, TrackRecord};
 
 /// Host serving local media (the playback host, which is always intercepted).
 pub const MEDIA_HOST: &str = "play.itunes.apple.com";
@@ -81,8 +84,8 @@ pub const AUDIO_EXTENSIONS: &[&str] = &[
     "m4a", "mp4", "m4b", "alac", "aac", "mp3", "flac", "ogg", "oga", "opus", "wav", "webm",
 ];
 
-/// Links audio files already in the media directory (`<catalog id>.<ext>`,
-/// as every downloader writes them) to tracks that have no recorded audio,
+/// Links audio files already in the media directory (`<catalog id>.<ext>`
+/// and `<catalog id>.spatial.m4a`, as every downloader writes them) to tracks that have no recorded audio,
 /// so earlier downloads show as downloaded and play offline. Runs when the
 /// download queue starts and after every library sync (a sync into a reset
 /// store creates the track rows only then). Returns how many rows were linked.
@@ -99,12 +102,30 @@ pub(crate) async fn link_existing_media(storage: &Storage, media_dir: &Path) -> 
         if !is_valid_media_id(&id) {
             continue;
         }
-        let Some(path) = existing_media_file(media_dir, &id).await else {
-            continue;
-        };
-        match storage.set_audio_by_any_id(&id, Some(path)).await {
-            Ok(changed) => linked += changed,
-            Err(error) => tracing::warn!(%id, %error, "could not link media file"),
+        let spatial = media_dir.join(crate::download::media_file_name(&id, AudioVariant::Spatial));
+        let files = [
+            (
+                AudioVariant::Stereo,
+                existing_media_file(media_dir, &id).await,
+            ),
+            (
+                AudioVariant::Spatial,
+                is_file(&spatial).await.then_some(spatial),
+            ),
+        ];
+        for (variant, path) in files {
+            let Some(path) = path else {
+                continue;
+            };
+            match storage.set_audio_by_any_id(&id, variant, Some(path)).await {
+                Ok(changed) => {
+                    linked += changed;
+                    if changed > 0 {
+                        pin_linked(storage, &id).await;
+                    }
+                }
+                Err(error) => tracing::warn!(%id, %error, "could not link media file"),
+            }
         }
     }
     if linked > 0 {
@@ -113,18 +134,36 @@ pub(crate) async fn link_existing_media(storage: &Storage, media_dir: &Path) -> 
     linked
 }
 
+/// Gives a song whose file was just linked an individual pin when nothing
+/// pins it yet, so it doesn't count as an unlinked download (after a
+/// database reset every downloaded file is linked this way).
+async fn pin_linked(storage: &Storage, id: &str) {
+    match storage.download_owners(id).await {
+        Ok(owners) if owners.is_empty() => {
+            if let Err(error) = storage.pin_downloads(None, vec![id.to_owned()]).await {
+                tracing::warn!(%id, %error, "could not pin a linked media file");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%id, %error, "could not read the pins of a linked file"),
+    }
+}
+
 /// The first existing `<media_dir>/<id>.<ext>` audio file.
 async fn existing_media_file(media_dir: &Path, id: &str) -> Option<PathBuf> {
     for ext in AUDIO_EXTENSIONS {
         let path = media_dir.join(format!("{id}.{ext}"));
-        if tokio::fs::metadata(&path)
-            .await
-            .is_ok_and(|meta| meta.is_file())
-        {
+        if is_file(&path).await {
             return Some(path);
         }
     }
     None
+}
+
+async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file())
 }
 
 /// A track's playable local file.
@@ -132,6 +171,9 @@ async fn existing_media_file(media_dir: &Path, id: &str) -> Option<PathBuf> {
 pub struct LocalAudio {
     /// Id used in the media URL.
     pub media_id: String,
+    /// Which version of the song the file holds (a mapped or custom file
+    /// counts as [`AudioVariant::Stereo`]).
+    pub variant: AudioVariant,
     /// The file.
     pub path: PathBuf,
     /// Duration, if known.
@@ -144,9 +186,63 @@ pub struct LocalAudio {
     pub album: Option<String>,
 }
 
+impl LocalAudio {
+    /// The media URL serving exactly this file (see [`variant_media_url`]).
+    pub fn url(&self) -> String {
+        variant_media_url(&self.media_id, self.variant)
+    }
+}
+
+/// The media URL of one variant of a track: the plain [`media_url`] for
+/// [`AudioVariant::Stereo`] (unchanged from before variants existed), and
+/// `<media url>/spatial` for [`AudioVariant::Spatial`].
+pub fn variant_media_url(media_id: &str, variant: AudioVariant) -> String {
+    match variant {
+        AudioVariant::Stereo => media_url(media_id),
+        AudioVariant::Spatial => format!("{}/{variant}", media_url(media_id)),
+    }
+}
+
+/// The variant a local media URL path names (`<prefix><id>/normal` or
+/// `<prefix><id>/spatial`); `None` for the plain `<prefix><id>`, which serves
+/// the preferred file.
+pub(crate) fn media_variant_from_path(path: &str) -> Option<AudioVariant> {
+    let rest = path.strip_prefix(MEDIA_URL_PREFIX)?;
+    let mut segments = rest.split('/');
+    segments.next()?;
+    segments.next().and_then(AudioVariant::parse)
+}
+
+/// The local files of one track, per variant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LocalFiles {
+    /// The normal file (a download, a mapping or a custom song's file).
+    pub(crate) normal: Option<LocalAudio>,
+    /// The spatial download.
+    pub(crate) spatial: Option<LocalAudio>,
+}
+
+impl LocalFiles {
+    /// The file of `variant`, if present.
+    pub(crate) fn get(&self, variant: AudioVariant) -> Option<&LocalAudio> {
+        match variant {
+            AudioVariant::Stereo => self.normal.as_ref(),
+            AudioVariant::Spatial => self.spatial.as_ref(),
+        }
+    }
+
+    /// Takes the file of `variant`, if present.
+    pub(crate) fn take(&mut self, variant: AudioVariant) -> Option<LocalAudio> {
+        match variant {
+            AudioVariant::Stereo => self.normal.take(),
+            AudioVariant::Spatial => self.spatial.take(),
+        }
+    }
+}
+
 /// Resolves ids to local audio files: custom songs (`local-<n>`, by audio mode)
 /// first, then real tracks via track mapping (by id or catalog id) and the
-/// track's `audio_path`. Only files that exist are returned.
+/// track's recorded audio, per variant. Only files that exist are returned.
 #[derive(Debug, Clone)]
 pub(crate) struct MediaResolver {
     storage: Storage,
@@ -157,94 +253,134 @@ impl MediaResolver {
         Self { storage }
     }
 
-    /// Resolves a playback / media id to a local file. A custom song
-    /// (`local-<n>`) resolves by its audio mode: a copied local file, or — in
-    /// reference mode — the file of the real catalog track it points at. The
-    /// returned [`LocalAudio::media_id`] stays the requested id, so the media
-    /// URL keeps pointing at the custom song.
+    /// Resolves a playback / media id to its preferred local file: normal,
+    /// else spatial. See [`Self::files`].
     pub(crate) async fn resolve(&self, id: &str) -> Result<Option<LocalAudio>, StorageError> {
-        if custom_song_id(id).is_some() {
-            return self.resolve_custom(id).await;
-        }
-        self.resolve_real(id).await
+        let mut files = self.files(id).await?;
+        Ok(files
+            .take(AudioVariant::Stereo)
+            .or_else(|| files.take(AudioVariant::Spatial)))
     }
 
-    /// Resolves a custom song id (`local-<n>`).
-    async fn resolve_custom(&self, id: &str) -> Result<Option<LocalAudio>, StorageError> {
+    /// Resolves a playback / media id to its local file of `variant`, if
+    /// that file exists.
+    pub(crate) async fn resolve_variant(
+        &self,
+        id: &str,
+        variant: AudioVariant,
+    ) -> Result<Option<LocalAudio>, StorageError> {
+        Ok(self.files(id).await?.take(variant))
+    }
+
+    /// Every existing local file of a playback / media id.
+    ///
+    /// A custom song (`local-<n>`) resolves by its audio mode: a copied local
+    /// file (normal), or (in reference mode) the files of the real catalog
+    /// track it points at. The returned [`LocalAudio::media_id`] stays the
+    /// requested id, so the media URL keeps pointing at the custom song.
+    pub(crate) async fn files(&self, id: &str) -> Result<LocalFiles, StorageError> {
+        if custom_song_id(id).is_some() {
+            return self.files_custom(id).await;
+        }
+        self.files_real(id).await
+    }
+
+    /// Files of a custom song id (`local-<n>`).
+    async fn files_custom(&self, id: &str) -> Result<LocalFiles, StorageError> {
         let Some(track) = self.storage.get_track(id).await? else {
-            return Ok(None);
+            return Ok(LocalFiles::default());
         };
         // A row carrying a `local-<n>` id but somehow not marked custom still
         // resolves through the real path rather than being dropped.
         if !track.is_custom {
-            return self.resolve_real(id).await;
+            return self.files_real(id).await;
         }
-        let path = match track.audio_mode {
+        let [normal, spatial] = match track.audio_mode {
             // Reference mode dereferences the real catalog id and serves that
-            // track's file; the DRM downloader only ever sees that catalog id.
+            // track's files; the DRM downloader only ever sees that catalog id.
             Some(CustomAudioMode::Reference) => match &track.reference_track_id {
                 Some(reference) => {
                     let record = self.storage.find_track(reference).await?;
-                    self.find_file(reference, record.as_ref()).await?
+                    self.find_files(reference, record.as_ref()).await?
                 }
-                None => None,
+                None => [None, None],
             },
-            // Local copy, or no audio chosen yet (no `audio_path`).
-            Some(CustomAudioMode::LocalCopy) | None => match track.audio_path.clone() {
-                Some(path) if exists(&path).await => Some(path),
-                _ => None,
+            // Local copy, or no audio chosen yet (no audio recorded).
+            Some(CustomAudioMode::LocalCopy) | None => match track.audio.preferred() {
+                Some(path) if exists(path).await => [Some(path.to_path_buf()), None],
+                _ => [None, None],
             },
         };
-        Ok(path.map(|path| LocalAudio {
+        let audio = |variant: AudioVariant, path: PathBuf| LocalAudio {
             media_id: id.to_owned(),
+            variant,
             path,
             duration_ms: track.duration_ms,
             title: Some(track.title.clone()),
             artist: Some(track.artist.clone()),
             album: track.album.clone(),
-        }))
+        };
+        Ok(LocalFiles {
+            normal: normal.map(|path| audio(AudioVariant::Stereo, path)),
+            spatial: spatial.map(|path| audio(AudioVariant::Spatial, path)),
+        })
     }
 
-    /// Resolves a real (non-custom) track id to its local file plus metadata.
-    async fn resolve_real(&self, id: &str) -> Result<Option<LocalAudio>, StorageError> {
+    /// Files of a real (non-custom) track id, plus metadata.
+    async fn files_real(&self, id: &str) -> Result<LocalFiles, StorageError> {
         let record = self.storage.find_track(id).await?;
-        let path = self.find_file(id, record.as_ref()).await?;
-        Ok(path.map(|path| LocalAudio {
+        let [normal, spatial] = self.find_files(id, record.as_ref()).await?;
+        let audio = |variant: AudioVariant, path: PathBuf| LocalAudio {
             media_id: id.to_owned(),
+            variant,
             path,
             duration_ms: record.as_ref().and_then(|r| r.track.duration_ms),
             title: record.as_ref().map(|r| r.track.title.clone()),
             artist: record.as_ref().map(|r| r.track.artist.clone()),
             album: record.as_ref().and_then(|r| r.track.album.clone()),
-        }))
+        };
+        Ok(LocalFiles {
+            normal: normal.map(|path| audio(AudioVariant::Stereo, path)),
+            spatial: spatial.map(|path| audio(AudioVariant::Spatial, path)),
+        })
     }
 
-    /// Finds the existing local file for a real track: a track mapping (by id,
-    /// row id or catalog id), then the track row's `audio_path`.
-    async fn find_file(
+    /// Finds the existing local files of a real track, `[normal, spatial]`.
+    /// Normal is a track mapping (by id, row id or catalog id), else the
+    /// track row's recorded normal file; spatial is the recorded spatial file.
+    async fn find_files(
         &self,
         id: &str,
         record: Option<&TrackRecord>,
-    ) -> Result<Option<PathBuf>, StorageError> {
+    ) -> Result<[Option<PathBuf>; 2], StorageError> {
         let mut candidate_ids = vec![id.to_owned()];
         if let Some(record) = record {
             candidate_ids.push(record.track.id.clone());
             candidate_ids.extend(record.catalog_id.clone());
         }
         candidate_ids.dedup();
+        let mut normal = None;
         for candidate in &candidate_ids {
             if let Some(mapping) = self.storage.get_track_mapping(candidate).await?
                 && exists(&mapping.file_path).await
             {
-                return Ok(Some(mapping.file_path));
+                normal = Some(mapping.file_path);
+                break;
             }
         }
-        if let Some(audio) = record.and_then(|r| r.track.audio_path.clone())
-            && exists(&audio).await
-        {
-            return Ok(Some(audio));
+        if normal.is_none() {
+            normal = existing(record.and_then(|r| r.track.audio.get(AudioVariant::Stereo))).await;
         }
-        Ok(None)
+        let spatial = existing(record.and_then(|r| r.track.audio.get(AudioVariant::Spatial))).await;
+        Ok([normal, spatial])
+    }
+}
+
+/// `path` as an owned path when it names an existing file.
+async fn existing(path: Option<&Path>) -> Option<PathBuf> {
+    match path {
+        Some(path) if exists(path).await => Some(path.to_path_buf()),
+        _ => None,
     }
 }
 
@@ -317,6 +453,65 @@ pub(crate) fn parse_range(header: Option<&str>, size: u64) -> RangeRequest {
     RangeRequest::Partial(range)
 }
 
+/// Wraps a media body reader and logs, at debug level, how much of it was
+/// read when the body is dropped. Fewer bytes than expected means the client
+/// closed the request early (players cancel range requests routinely).
+///
+/// The count is what the body stream pulled from disk, which can run up to
+/// one chunk ahead of what actually reached the socket.
+struct LoggedReader<R> {
+    inner: R,
+    file: String,
+    start: u64,
+    expected: u64,
+    sent: u64,
+    opened: Instant,
+}
+
+impl<R> LoggedReader<R> {
+    fn new(inner: R, path: &Path, start: u64, expected: u64) -> Self {
+        Self {
+            inner,
+            file: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            start,
+            expected,
+            sent: 0,
+            opened: Instant::now(),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LoggedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let read = buf.filled().len().saturating_sub(before);
+        self.sent = self.sent.saturating_add(read as u64);
+        result
+    }
+}
+
+impl<R> Drop for LoggedReader<R> {
+    fn drop(&mut self) {
+        tracing::debug!(
+            file = %self.file,
+            start = self.start,
+            expected = self.expected,
+            sent = self.sent,
+            aborted = self.sent < self.expected,
+            elapsed_ms = self.opened.elapsed().as_millis(),
+            "local media body finished"
+        );
+    }
+}
+
 /// Serves a file with `Range` support, streaming from disk.
 ///
 /// `HEAD` returns headers only. Errors opening the file yield `404`.
@@ -375,7 +570,8 @@ async fn serve_file_inner(
         if start > 0 {
             file.seek(SeekFrom::Start(start)).await?;
         }
-        Body::from_stream(ReaderStream::with_capacity(file.take(length), STREAM_CHUNK))
+        let reader = LoggedReader::new(file.take(length), path, start, length);
+        Body::from_stream(ReaderStream::with_capacity(reader, STREAM_CHUNK))
     };
 
     let mut response = status_only(status, request_headers);
@@ -450,6 +646,38 @@ mod tests {
         assert_eq!(
             media_id_from_path("/__cider-offline/media/i.AbC-1"),
             Some("i.AbC-1")
+        );
+    }
+
+    #[test]
+    fn media_variant_should_be_read_from_the_path() {
+        assert_eq!(
+            (
+                media_variant_from_path("/__cider-offline/media/1"),
+                media_variant_from_path("/__cider-offline/media/1/spatial"),
+                media_variant_from_path("/__cider-offline/media/1/stereo"),
+                media_id_from_path("/__cider-offline/media/1/spatial"),
+            ),
+            (
+                None,
+                Some(AudioVariant::Spatial),
+                Some(AudioVariant::Stereo),
+                Some("1")
+            )
+        );
+    }
+
+    #[test]
+    fn variant_media_url_should_keep_the_plain_url_for_normal() {
+        assert_eq!(
+            (
+                variant_media_url("a.1", AudioVariant::Stereo),
+                variant_media_url("a.1", AudioVariant::Spatial),
+            ),
+            (
+                "https://play.itunes.apple.com/__cider-offline/media/a.1".to_owned(),
+                "https://play.itunes.apple.com/__cider-offline/media/a.1/spatial".to_owned()
+            )
         );
     }
 

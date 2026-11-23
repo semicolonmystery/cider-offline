@@ -8,13 +8,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use cider_offline_core::storage::AudioVariant;
 use cider_offline_core::{
     CatalogClient, DownloadEvent, DownloadRecord, DownloadSourceKind, DownloadStage,
     DownloadStatus, album_version, records_from_catalog,
 };
 use slint::{ComponentHandle as _, Model as _, ModelRc, VecModel};
 
-use super::{AppContext, DownloadRow, DownloadsState};
+use super::{AppContext, DownloadRow, DownloadsState, format};
 
 /// Label of the action offered on a music video that can't be downloaded yet.
 const ALBUM_VERSION_ACTION: &str = "Download album version";
@@ -85,6 +86,8 @@ pub fn bind(ctx: &Rc<AppContext>) {
     state.on_download_album_version(move |id| download_album_version(&c, id.as_str()));
     let c = Rc::clone(ctx);
     state.on_clear_finished(move || clear_finished(&c));
+    let c = Rc::clone(ctx);
+    state.on_cancel_all(move || cancel_all(&c));
     let c = Rc::clone(ctx);
     state.on_refresh(move || refresh(&c));
     let c = Rc::clone(ctx);
@@ -262,6 +265,76 @@ fn clear_finished(ctx: &Rc<AppContext>) {
     );
 }
 
+/// The confirmation of cancelling the rows of songs `titles`: names them up
+/// to [`format::MAX_NAMED_SONGS`], counts them beyond (`all` for "Cancel
+/// all": "all 37 unfinished downloads").
+pub(super) fn cancel_message(titles: &[String], all: bool) -> String {
+    let count = titles.len();
+    let what = if count <= format::MAX_NAMED_SONGS {
+        format::songs(count, titles)
+    } else if all {
+        format!("all {count} unfinished downloads")
+    } else {
+        format!("{count} downloads")
+    };
+    format!(
+        "Stop and remove {what} from the download queue? Songs that already finished downloading are kept."
+    )
+}
+
+/// Song titles of the drawer rows `ids`.
+pub(super) fn row_titles(ctx: &AppContext, ids: &[String]) -> Vec<String> {
+    ctx.downloads
+        .all
+        .borrow()
+        .iter()
+        .filter(|row| ids.iter().any(|id| id == row.id.as_str()))
+        .map(|row| row.title.to_string())
+        .collect()
+}
+
+/// "Cancel all…": asks, then cancels every unfinished row. Finished
+/// downloads stay.
+fn cancel_all(ctx: &Rc<AppContext>) {
+    let titles: Vec<String> = ctx
+        .downloads
+        .all
+        .borrow()
+        .iter()
+        .filter(|row| row.status != "done")
+        .map(|row| row.title.to_string())
+        .collect();
+    if titles.is_empty() {
+        return;
+    }
+    let message = cancel_message(&titles, true);
+    let c = Rc::clone(ctx);
+    super::dialogs::confirm(
+        ctx,
+        super::dialogs::Prompt {
+            title: "Cancel all downloads",
+            message: &message,
+            confirm: "Cancel all",
+            destructive: true,
+        },
+        move || {
+            tracing::info!(target: "downloads", "cancel all requested");
+            c.with_backend(
+                move |backend| async move {
+                    backend
+                        .downloads
+                        .cancel_all()
+                        .map_err(|e| format!("Could not cancel the downloads: {e}"))
+                },
+                |ctx, result| {
+                    report_error(ctx, result);
+                    super::library::refresh_pins(ctx);
+                },
+            );
+        },
+    );
+}
+
 /// Drawer-wide queue actions.
 #[derive(Debug, Clone, Copy)]
 enum Bulk {
@@ -323,6 +396,61 @@ fn replace_rows(ctx: &Rc<AppContext>, rows: &[DownloadRecord]) {
     apply_filter(ctx);
     push_summary(ctx);
     offer_alternatives(ctx, unavailable_ids(rows));
+    let done: Vec<String> = rows
+        .iter()
+        .filter(|row| row.status == DownloadStatus::Done)
+        .map(|row| row.track_id.clone())
+        .collect();
+    refresh_variants(ctx, done);
+}
+
+/// Re-reads which mixes the songs named by `keys` (download keys) have on
+/// disk and shows them on the Downloads rows and the Library song rows.
+pub(super) fn refresh_variants(ctx: &Rc<AppContext>, keys: Vec<String>) {
+    if keys.is_empty() {
+        return;
+    }
+    ctx.with_backend(
+        move |backend| async move {
+            let found = backend.storage.local_variants(keys.clone()).await;
+            (keys, found)
+        },
+        |ctx, result| {
+            let Some((keys, Ok(found))) = result else {
+                return;
+            };
+            let spatial = |key: &str| {
+                found
+                    .get(key)
+                    .is_some_and(|variants| variants.contains(&AudioVariant::Spatial))
+            };
+            for key in &keys {
+                set_row_spatial(ctx, key, spatial(key));
+            }
+            super::library::apply_variants(ctx, &keys, &found);
+        },
+    );
+}
+
+/// Sets the spatial badge of every Downloads row of song `track_id`.
+fn set_row_spatial(ctx: &Rc<AppContext>, track_id: &str, spatial: bool) {
+    let data = &ctx.downloads;
+    let mut changed = false;
+    for row in data.all.borrow_mut().iter_mut() {
+        if row.track_id == track_id && row.spatial != spatial {
+            row.spatial = spatial;
+            changed = true;
+        }
+    }
+    if changed {
+        patch_model(&data.rows, |row| {
+            let hit = row.track_id == track_id && row.spatial != spatial;
+            if hit {
+                row.spatial = spatial;
+            }
+            hit
+        });
+    }
 }
 
 /// Routes a [`DownloadEvent`] from the queue to the UI model.
@@ -358,7 +486,8 @@ pub fn on_event(ctx: &Rc<AppContext>, event: DownloadEvent) {
             });
             match (status, track_id) {
                 (DownloadStatus::Done, Some(track_id)) => {
-                    super::library::mark_audio(ctx, &[track_id], true);
+                    super::library::mark_audio(ctx, std::slice::from_ref(&track_id), true);
+                    refresh_variants(ctx, vec![track_id]);
                 }
                 (DownloadStatus::Unavailable, Some(track_id)) => {
                     offer_alternatives(ctx, vec![(id, track_id)]);
@@ -367,7 +496,12 @@ pub fn on_event(ctx: &Rc<AppContext>, event: DownloadEvent) {
             }
         }
         DownloadEvent::Removed(id) => remove_row(ctx, &id),
-        DownloadEvent::AudioRemoved(ids) => super::library::mark_audio(ctx, &ids, false),
+        DownloadEvent::AudioRemoved(ids) => {
+            for id in &ids {
+                set_row_spatial(ctx, id, false);
+            }
+            super::library::mark_audio(ctx, &ids, false);
+        }
         // The UI recomputes its counters from its own rows (`push_summary`),
         // which also covers the batch progress line.
         DownloadEvent::SummaryChanged { .. } => {}
@@ -732,16 +866,19 @@ pub(super) fn collection_progress(ctx: &AppContext) -> HashMap<String, (String, 
         .collect()
 }
 
-/// What a click on a collection's aggregate download ring does to its rows.
+/// A queue command applied to several rows (a collection's songs, or the
+/// click on a collection's aggregate download ring).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CollectionAction {
+pub(super) enum QueueAction {
     Pause,
     Resume,
     Retry,
+    Cancel,
 }
 
-impl CollectionAction {
-    /// The action for an aggregate status, or `None` when nothing is in flight.
+impl QueueAction {
+    /// The ring click's action for an aggregate status, or `None` when
+    /// nothing is in flight.
     fn for_status(status: &str) -> Option<Self> {
         match status {
             "downloading" | "queued" => Some(Self::Pause),
@@ -751,14 +888,57 @@ impl CollectionAction {
         }
     }
 
-    /// Whether a member row in `status` is affected by this action.
+    /// Whether a row in `status` is affected by this action.
     fn applies_to(self, status: &str) -> bool {
         match self {
             Self::Pause => matches!(status, "downloading" | "queued"),
             Self::Resume => status == "paused",
             Self::Retry => status == "failed",
+            Self::Cancel => status != "done",
         }
     }
+}
+
+/// Ids of the drawer rows of songs `keys` (download keys) that `action`
+/// applies to.
+pub(super) fn rows_for(ctx: &AppContext, keys: &[String], action: QueueAction) -> Vec<String> {
+    ctx.downloads
+        .all
+        .borrow()
+        .iter()
+        .filter(|row| {
+            keys.iter()
+                .any(|key| key == row.track_id.as_str() || key == row.id.as_str())
+                && action.applies_to(row.status.as_str())
+        })
+        .map(|row| row.id.to_string())
+        .collect()
+}
+
+/// Sends `action` for every row in `ids`.
+pub(super) fn apply(ctx: &Rc<AppContext>, action: QueueAction, ids: Vec<String>) {
+    tracing::info!(target: "downloads", ?action, count = ids.len(), "queue action requested");
+    ctx.with_backend(
+        move |backend| async move {
+            for id in &ids {
+                match action {
+                    QueueAction::Pause => backend.downloads.pause(id),
+                    QueueAction::Resume => backend.downloads.resume(id),
+                    QueueAction::Retry => backend.downloads.retry(id),
+                    QueueAction::Cancel => backend.downloads.cancel(id),
+                }
+                .map_err(|e| format!("Could not update downloads: {e}"))?;
+            }
+            Ok(())
+        },
+        move |ctx, result| {
+            report_error(ctx, result);
+            if action == QueueAction::Cancel {
+                // Cancelled songs may have released their collection's pin.
+                super::library::refresh_pins(ctx);
+            }
+        },
+    );
 }
 
 /// Click-to-pause / click-to-resume (or retry, when failed) for a whole
@@ -782,7 +962,7 @@ pub(super) fn toggle_collection(ctx: &Rc<AppContext>, collection_id: &str) {
         .collect();
     let pairs: Vec<(String, f32)> = members.iter().map(|(_, s)| (s.clone(), 0.0)).collect();
     let (status, _) = aggregate_status(&pairs);
-    let Some(action) = CollectionAction::for_status(&status) else {
+    let Some(action) = QueueAction::for_status(&status) else {
         return;
     };
     let ids: Vec<String> = members
@@ -791,20 +971,7 @@ pub(super) fn toggle_collection(ctx: &Rc<AppContext>, collection_id: &str) {
         .map(|(id, _)| id)
         .collect();
     tracing::info!(target: "downloads", collection = %collection_id, ?action, count = ids.len(), "collection toggle requested");
-    ctx.with_backend(
-        move |backend| async move {
-            for id in &ids {
-                match action {
-                    CollectionAction::Pause => backend.downloads.pause(id),
-                    CollectionAction::Resume => backend.downloads.resume(id),
-                    CollectionAction::Retry => backend.downloads.retry(id),
-                }
-                .map_err(|e| format!("Could not update downloads: {e}"))?;
-            }
-            Ok(())
-        },
-        report_error,
-    );
+    apply(ctx, action, ids);
 }
 
 /// Collapses a collection's per-track `(status, progress)` pairs into one
@@ -825,7 +992,13 @@ fn aggregate_status(rows: &[(String, f32)]) -> (String, f32) {
     let average = total / rows.len() as f32;
     let has = |want: &str| rows.iter().any(|(status, _)| status == want);
     // Any in-flight / pending / failed work dominates a "done" sibling.
-    let status = if has("downloading") {
+    // Once some songs are done, waiting songs still count as a batch in
+    // progress: between two songs no row is "downloading", and a "queued"
+    // collection would draw its ring at 0 % until the next one starts.
+    let started = rows
+        .iter()
+        .any(|(status, progress)| status == "done" || *progress > 0.0);
+    let status = if has("downloading") || (has("queued") && started) {
         "downloading"
     } else if has("queued") {
         "queued"
@@ -852,6 +1025,68 @@ fn push_summary(ctx: &Rc<AppContext>) {
 
 #[cfg(test)]
 mod tests {
+    fn rows(pairs: &[(&str, f32)]) -> Vec<(String, f32)> {
+        pairs.iter().map(|(s, p)| ((*s).to_owned(), *p)).collect()
+    }
+
+    fn titles(count: usize) -> Vec<String> {
+        (1..=count).map(|n| format!("Song {n}")).collect()
+    }
+
+    #[test]
+    fn cancel_message_should_name_up_to_five_songs() {
+        assert_eq!(
+            super::cancel_message(&titles(2), true),
+            "Stop and remove “Song 1” and “Song 2” from the download queue? Songs that already \
+             finished downloading are kept."
+        );
+    }
+
+    #[test]
+    fn cancel_message_should_count_more_than_five_songs() {
+        assert_eq!(
+            [
+                super::cancel_message(&titles(6), true),
+                super::cancel_message(&titles(6), false)
+            ],
+            [
+                "Stop and remove all 6 unfinished downloads from the download queue? Songs that \
+                 already finished downloading are kept."
+                    .to_owned(),
+                "Stop and remove 6 downloads from the download queue? Songs that already \
+                 finished downloading are kept."
+                    .to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collection_with_done_and_waiting_songs_should_keep_showing_its_progress() {
+        // Between two songs nothing is "downloading"; the ring must not drop
+        // to the queued look (0 %) and back on every song.
+        let between = super::aggregate_status(&rows(&[
+            ("done", 1.0),
+            ("done", 0.0),
+            ("queued", 0.0),
+            ("queued", 0.0),
+        ]));
+        let during = super::aggregate_status(&rows(&[
+            ("done", 1.0),
+            ("done", 0.0),
+            ("downloading", 0.0),
+            ("queued", 0.0),
+        ]));
+        assert_eq!(between, ("downloading".to_owned(), 0.5));
+        assert_eq!(during, between);
+    }
+
+    #[test]
+    fn collection_that_has_not_started_should_be_queued() {
+        let (status, progress) =
+            super::aggregate_status(&rows(&[("queued", 0.0), ("queued", 0.0)]));
+        assert_eq!((status.as_str(), progress), ("queued", 0.0));
+    }
+
     use super::*;
 
     fn row(id: &str, title: &str, status: &str) -> DownloadRow {
@@ -890,22 +1125,19 @@ mod tests {
     #[test]
     fn collection_toggle_should_pause_while_downloading() {
         assert_eq!(
-            CollectionAction::for_status("downloading"),
-            Some(CollectionAction::Pause)
+            QueueAction::for_status("downloading"),
+            Some(QueueAction::Pause)
         );
     }
 
     #[test]
     fn collection_toggle_should_resume_when_paused() {
-        assert_eq!(
-            CollectionAction::for_status("paused"),
-            Some(CollectionAction::Resume)
-        );
+        assert_eq!(QueueAction::for_status("paused"), Some(QueueAction::Resume));
     }
 
     #[test]
     fn collection_toggle_should_do_nothing_when_done() {
-        assert_eq!(CollectionAction::for_status("done"), None);
+        assert_eq!(QueueAction::for_status("done"), None);
     }
 
     #[test]
@@ -934,7 +1166,21 @@ mod tests {
     }
 
     #[test]
+    fn cancel_should_apply_to_every_unfinished_row() {
+        let applies = [
+            "queued",
+            "downloading",
+            "paused",
+            "failed",
+            "unavailable",
+            "done",
+        ]
+        .map(|status| QueueAction::Cancel.applies_to(status));
+        assert_eq!(applies, [true, true, true, true, true, false]);
+    }
+
+    #[test]
     fn collection_pause_should_skip_finished_members() {
-        assert!(!CollectionAction::Pause.applies_to("done"));
+        assert!(!QueueAction::Pause.applies_to("done"));
     }
 }

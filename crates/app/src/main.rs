@@ -100,7 +100,12 @@ fn main() -> anyhow::Result<()> {
 
     let service = {
         let events = events.clone();
-        ProxyService::spawn(rt.handle(), config.clone(), paths.clone(), move |event| {
+        // Always start in Passthrough: the first certificate check switches
+        // to Active when nothing blocks it (see `ui::overview::ModePolicy`),
+        // so Cider never meets an untrusted certificate at startup.
+        let mut start = config.clone();
+        start.mode = cider_offline_core::Mode::Passthrough;
+        ProxyService::spawn(rt.handle(), start, paths.clone(), move |event| {
             // Fails only after the UI is gone, i.e. during shutdown.
             let ui_event = match event {
                 ServiceEvent::Download(e) => UiEvent::Download(e),

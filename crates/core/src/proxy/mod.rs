@@ -36,7 +36,7 @@ use crate::Mode;
 use crate::artwork::ArtworkStore;
 use crate::cache::ResponseCacheInterceptor;
 use crate::catalog::CatalogClient;
-use crate::config::{AppPaths, AutoCacheMode, Config, ConfigError, SongsPage};
+use crate::config::{AppPaths, AutoCacheMode, Config, ConfigError, DownloadFormat, SongsPage};
 use crate::connectivity::{ConnectivityError, ConnectivityMonitor};
 use crate::download::{Downloader, DownloaderRegistry};
 use crate::download_queue::DownloadQueue;
@@ -47,6 +47,7 @@ use crate::lyrics::{LyricsFlagsInterceptor, LyricsInterceptor, LyricsStore};
 use crate::media::MediaResolver;
 use crate::offline::OfflineResponder;
 use crate::playback::{AutoCache, LocalPlaybackInterceptor};
+use crate::routing::{AssetRoutingInterceptor, CiderSpatial, Router};
 use crate::storage::{Storage, StorageError};
 
 /// Number of per-host leaf certificates kept in memory.
@@ -227,17 +228,25 @@ impl ProxyHandleBuilder {
             Some(Arc::new(library.clone())),
         );
         downloads.set_concurrency(config.download_concurrency());
+        downloads.set_download_format(config.download_format);
         let live = LiveSettings {
             auto_cache: Arc::new(AtomicU8::new(config.auto_cache.as_u8())),
             songs_page: Arc::new(AtomicU8::new(config.library.songs_page.as_u8())),
             prefer_local_lyrics: Arc::new(AtomicBool::new(config.lyrics.always_use_downloaded)),
+            play_other: Arc::new(AtomicBool::new(config.play_other_downloaded_mix)),
+            cider_spatial: Router::cider_spatial_cell(CiderSpatial::Unknown),
         };
         let lyrics = library.lyrics_store();
         {
             let lyrics = lyrics.clone();
+            let library = library.clone();
+            // Subscribed before anything can write, so no re-key is missed.
+            let rekeys = storage.subscribe_rekeys();
+            let cancel = cancel.clone();
             tasks.spawn(async move {
                 let count = lyrics.load_index().await;
                 tracing::debug!(count, "indexed local lyrics");
+                follow_rekeys(&library, rekeys, &cancel).await;
             });
         }
         let interceptors = builtin_pipeline(
@@ -316,6 +325,39 @@ struct LiveSettings {
     songs_page: Arc<AtomicU8>,
     /// [`crate::lyrics::LyricsSettings::always_use_downloaded`].
     prefer_local_lyrics: Arc<AtomicBool>,
+    /// [`Config::play_other_downloaded_mix`].
+    play_other: Arc<AtomicBool>,
+    /// Cider's spatial setting ([`CiderSpatial`], as stored by [`Router`]).
+    cider_spatial: Arc<AtomicU8>,
+}
+
+/// Moves what lives in files after songs take their catalog id (see
+/// [`Library::apply_song_rekey`]) until `cancel` fires. First catches up on
+/// re-keys made while nothing listened (an earlier run, a headless check),
+/// and again whenever the listener fell behind and missed some.
+async fn follow_rekeys(
+    library: &Library,
+    mut rekeys: tokio::sync::broadcast::Receiver<crate::storage::SongRekey>,
+    cancel: &CancellationToken,
+) {
+    let moved = library.adopt_all_lyrics().await;
+    if moved > 0 {
+        tracing::info!(moved, "moved lyrics of re-keyed songs");
+    }
+    loop {
+        let received = tokio::select! {
+            () = cancel.cancelled() => return,
+            received = rekeys.recv() => received,
+        };
+        match received {
+            Ok(rekey) => library.apply_song_rekey(&rekey).await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "missed song re-keys; checking every lyrics file");
+                library.adopt_all_lyrics().await;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 /// The built-in interceptors around the user-supplied `extra` ones.
@@ -345,13 +387,23 @@ fn builtin_pipeline(
         CatalogClient::new(storage.clone()),
         last_played_ts,
     );
-    let playback = LocalPlaybackInterceptor::new(MediaResolver::new(storage.clone()))
-        .with_auto_cache(auto)
-        .with_queue(downloads);
+    let router = Router::new(
+        Arc::clone(&live.play_other),
+        Arc::clone(&live.cider_spatial),
+    )
+    .with_catalog(CatalogClient::new(storage.clone()));
+    let playback =
+        LocalPlaybackInterceptor::new(MediaResolver::new(storage.clone()), router.clone())
+            .with_auto_cache(auto)
+            .with_queue(downloads);
     let mut interceptors: Vec<Arc<dyn Interceptor>> = vec![
         // First, so its response hook runs last: it annotates every song
         // resource Cider gets (upstream, injected or offline) with our lyrics.
         Arc::new(LyricsFlagsInterceptor::new(lyrics.clone())),
+        // Also early, so it sees every song resource Cider gets (upstream,
+        // injected or offline): routes Apple's direct stream URLs of songs
+        // that have local audio (see `crate::routing`).
+        Arc::new(AssetRoutingInterceptor::new(router)),
         Arc::new(TokenCaptureInterceptor::new().with_library_sync(library_sync)),
         Arc::new(LibraryInjectionInterceptor),
         Arc::new(ResponseCacheInterceptor::new(artwork.clone())),
@@ -482,6 +534,30 @@ impl ProxyHandle {
         }
     }
 
+    /// Switches which versions of a song downloads fetch. Takes effect for
+    /// the next fetch that starts.
+    pub fn set_download_format(&self, format: DownloadFormat) {
+        self.downloads.set_download_format(format);
+    }
+
+    /// Turns "Play the other downloaded mix" on or off. Takes effect for
+    /// the next playback request.
+    pub fn set_play_other_downloaded_mix(&self, enabled: bool) {
+        let previous = self.live.play_other.swap(enabled, Ordering::Relaxed);
+        if previous != enabled {
+            tracing::info!(enabled, "play the other downloaded mix changed");
+        }
+    }
+
+    /// Tells the proxy Cider's spatial audio (Dolby Atmos) setting, which
+    /// decides whether Cider asks for the spatial version of Atmos songs.
+    /// [`CiderSpatial::Unknown`] (the start value) counts as on.
+    pub fn set_cider_spatial(&self, value: CiderSpatial) {
+        if Router::store_cider_spatial(&self.live.cider_spatial, value) {
+            tracing::info!(cider_spatial = ?value, "Cider spatial audio setting changed");
+        }
+    }
+
     /// Turns "Always use downloaded lyrics" on or off. Takes effect for the
     /// next lyrics request.
     pub fn set_prefer_local_lyrics(&self, enabled: bool) {
@@ -563,9 +639,14 @@ impl ProxyHandle {
             mut server,
             tasks,
             cancel,
+            downloads,
             ..
         } = self;
         drop(cancel); // cancels the token
+        // Stop the download workers too: a restart (a port change) starts a
+        // new queue over the same rows, which must not run a second worker
+        // for a song that is still downloading here.
+        downloads.shutdown(SHUTDOWN_GRACE).await;
 
         let result = if let Ok(joined) = tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
             joined?.map_err(ProxyError::from)

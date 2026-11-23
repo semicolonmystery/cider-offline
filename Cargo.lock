@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "cider-offline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "auto-launch",
@@ -947,6 +947,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tray-icon",
+ "windows",
  "windows-sys 0.61.2",
  "winresource",
  "zbus",
@@ -954,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "cider-offline-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -979,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "cider-offline-download"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "async-trait",
@@ -1008,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "cider-offline-trust"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rcgen",
  "rustls-pki-types",

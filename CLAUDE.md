@@ -61,7 +61,7 @@ If you find yourself fighting a convention, stop and ask.
 | `cider-offline` | `crates/app` | The program: Slint UI (`ui/*.slint` + `src/ui/`), tray, single instance, start at login, Cider integration, cleanup, CLI and headless checks. The only crate that knows about windows and the desktop. |
 | `cider-offline-core` | `crates/core` | The engine: proxy, offline responder, library sync, storage (SQLite), lyrics, download queue, config and folders. No UI. |
 | `cider-offline-trust` | `crates/trust` | The local root CA and installing/removing it in each OS trust store. |
-| `cider-offline-download` | `crates/download` | Downloading and decrypting Apple Music audio; implements core's `Downloader` trait. |
+| `cider-offline-download` | `crates/download` | Saving Apple Music audio for offline playback; implements core's `Downloader` trait. |
 | icon generator | `packaging/icons/gen` | Build-time tool that renders the icons. Not part of the app. |
 | website | `web` | The site at cider-offline.podik.cz (Next.js static export, npm); the book is built into it under `/docs/`. Not part of the app; see `web/CLAUDE.md`. |
 

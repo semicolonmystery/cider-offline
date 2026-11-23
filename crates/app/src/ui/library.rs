@@ -14,19 +14,24 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-use cider_offline_core::storage::{CollectionKind, LyricsSource, Playlist, Track, TrackMapping};
+use cider_offline_core::storage::{
+    AudioVariant, CollectionKind, LyricsSource, Playlist, Track, TrackMapping,
+};
 use cider_offline_core::{
-    DownloadRecord, DownloadSourceKind, DownloadStatus, LibraryCollection, LibraryFilter,
-    LibraryPage, LibraryQuery, LibraryTrack, LyricsProgress, LyricsProviderId, LyricsReport,
-    StorageError, SyncStatus, TrackFilter,
+    CollectionDownload, CollectionDownloadState, DownloadCollection, DownloadFormat,
+    DownloadRecord, DownloadSourceKind, LibraryCollection, LibraryFilter, LibraryPage,
+    LibraryQuery, LibraryTrack, LyricsProgress, LyricsProviderId, LyricsReport, StorageError,
+    SyncStatus, TrackFilter, record_from_track, track_needs_download,
 };
 use slint::{ComponentHandle as _, Image, ModelRc, TimerMode};
 
 use super::artwork::{self, ArtKey, ArtRequest, Bucket, ImageCache};
+use super::downloads::QueueAction;
 use super::paged::{Hooks, PagedModel, Slot};
 use super::{AppContext, CollectionRow, LibraryState, TrackRow, dialogs, format};
 
@@ -44,6 +49,12 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 const ART_CHUNK: usize = 12;
 /// Grid cards wider than this (logical px) decode covers at the large size.
 const LARGE_CARD_WIDTH: f32 = 192.0;
+/// Download events of one burst (a finished song, a removal) are gathered
+/// this long before the collections' download state is read again.
+const DOWNLOAD_STATE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Download summaries of collections, by collection id.
+type DownloadSummaries = HashMap<String, CollectionDownload>;
 
 /// Track-list filter selected in the combo box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -115,8 +126,8 @@ struct OpenDetail {
     name: String,
     /// The header cover (detail bucket).
     hero: Option<ArtRequest>,
-    /// Every member has local audio (computed when opened).
-    members_complete: bool,
+    /// How much of it is downloaded (read when opened and after downloads).
+    download: CollectionDownload,
     /// User-created collection.
     is_custom: bool,
 }
@@ -128,8 +139,8 @@ pub(super) struct MembersInfo {
     pub songs: usize,
     /// Sum of the known song durations.
     pub total_ms: u64,
-    /// Every member has local audio.
-    pub complete: bool,
+    /// How much of the collection is downloaded.
+    pub download: CollectionDownload,
 }
 
 /// Library state owned by the UI thread.
@@ -161,6 +172,11 @@ pub struct LibraryData {
     directory: RefCell<Vec<(String, String, String, bool)>>,
     /// Collections with a download pin (downloaded as a whole).
     pinned: RefCell<HashSet<String>>,
+    /// Collections set to "Keep downloaded".
+    kept: RefCell<HashSet<String>>,
+    /// Re-reads the collections' download state once a burst of download
+    /// events is over (see [`refresh_download_state`]).
+    download_state_timer: slint::Timer,
 }
 
 impl Default for LibraryData {
@@ -181,6 +197,8 @@ impl Default for LibraryData {
             open: RefCell::new(None),
             directory: RefCell::new(Vec::new()),
             pinned: RefCell::new(HashSet::new()),
+            kept: RefCell::new(HashSet::new()),
+            download_state_timer: slint::Timer::default(),
         }
     }
 }
@@ -237,15 +255,30 @@ pub fn bind(ctx: &Rc<AppContext>) {
     let c = Rc::clone(ctx);
     state.on_remove_download(move |id| remove_download(&c, id.into()));
     let c = Rc::clone(ctx);
-    state.on_remove_collection_download(move |id| remove_collection_download(&c, id.into()));
+    state
+        .on_remove_collection_download(move |id| confirm_remove_collection_download(&c, id.into()));
+    let c = Rc::clone(ctx);
+    state.on_collection_download_action(move |id, action| {
+        collection_download_action(&c, id.as_str(), action.as_str());
+    });
+    let c = Rc::clone(ctx);
+    state.on_set_keep_downloaded(move |id, keep| set_keep_downloaded(&c, id.as_str(), keep));
     let c = Rc::clone(ctx);
     state.on_fetch_missing_lyrics(move || fetch_missing_lyrics(&c));
     let c = Rc::clone(ctx);
     state.on_fetch_collection_lyrics(move |id| fetch_collection_lyrics(&c, id.as_str()));
     let c = Rc::clone(ctx);
+    state.on_remove_collection_lyrics(move |id| confirm_remove_collection_lyrics(&c, id.into()));
+    let c = Rc::clone(ctx);
+    state.on_remove_lyrics(move |id| remove_song_lyrics(&c, id.into()));
+    let c = Rc::clone(ctx);
     state.on_download_track(move |id| download_track(&c, id.into()));
     let c = Rc::clone(ctx);
     state.on_download_collection(move |id| download_collection(&c, id.as_str()));
+    let c = Rc::clone(ctx);
+    state.on_redownload_track(move |id| redownload_track(&c, id.into()));
+    let c = Rc::clone(ctx);
+    state.on_redownload_collection(move |id| redownload_collection(&c, id.as_str()));
     let c = Rc::clone(ctx);
     state.on_toggle_collection_download(move |id| {
         super::downloads::toggle_collection(&c, id.as_str());
@@ -377,6 +410,7 @@ pub(super) fn collection_slot(
     bucket: Bucket,
     images: &mut ImageCache,
     downloads: &HashMap<String, (String, f32)>,
+    summaries: &DownloadSummaries,
 ) -> Slot<CollectionRow> {
     let art = entry
         .collection
@@ -386,29 +420,42 @@ pub(super) fn collection_slot(
     let image = art.as_ref().and_then(|art| images.get(&art.key));
     let mut row = collection_row(entry.collection, image);
     set_collection_dl(&mut row, downloads);
+    let summary = summaries.get(row.id.as_str()).copied().unwrap_or_default();
+    apply_collection_download(&mut row, summary);
     Slot { row, art }
 }
 
 fn track_slots(ctx: &AppContext, items: Vec<LibraryTrack>) -> Vec<Slot<TrackRow>> {
     let downloads = super::downloads::track_progress(ctx);
-    let mut images = ctx.library.images.borrow_mut();
-    items
-        .into_iter()
-        .map(|item| track_slot(item, &mut images, &downloads))
-        .collect()
-}
-
-fn collection_slots(ctx: &AppContext, items: Vec<LibraryCollection>) -> Vec<Slot<CollectionRow>> {
-    let downloads = super::downloads::collection_progress(ctx);
-    let bucket = ctx.library.grid_bucket.get();
-    let pinned = ctx.library.pinned.borrow();
+    let format = ctx.config().download_format;
     let mut images = ctx.library.images.borrow_mut();
     items
         .into_iter()
         .map(|item| {
-            let mut slot = collection_slot(item, bucket, &mut images, &downloads);
+            let missing = item.needs_download(format);
+            let mut slot = track_slot(item, &mut images, &downloads);
+            slot.row.missing = missing;
+            slot
+        })
+        .collect()
+}
+
+fn collection_slots(
+    ctx: &AppContext,
+    items: Vec<LibraryCollection>,
+    summaries: &DownloadSummaries,
+) -> Vec<Slot<CollectionRow>> {
+    let downloads = super::downloads::collection_progress(ctx);
+    let bucket = ctx.library.grid_bucket.get();
+    let pinned = ctx.library.pinned.borrow();
+    let kept = ctx.library.kept.borrow();
+    let mut images = ctx.library.images.borrow_mut();
+    items
+        .into_iter()
+        .map(|item| {
+            let mut slot = collection_slot(item, bucket, &mut images, &downloads, summaries);
             slot.row.pinned = pinned.contains(slot.row.id.as_str());
-            set_collection_dl(&mut slot.row, &downloads);
+            slot.row.keep = kept.contains(slot.row.id.as_str());
             slot
         })
         .collect()
@@ -436,17 +483,21 @@ fn fetch_tracks_page(ctx: &Rc<AppContext>, generation: u64, page: usize) {
 fn fetch_collections_page(ctx: &Rc<AppContext>, generation: u64, page: usize) {
     let query = collection_query(ctx);
     let size = ctx.library.collections.page_size();
+    let format = ctx.config().download_format;
     ctx.with_backend(
         move |backend| async move {
-            backend
+            let filter = query.filter;
+            let page = backend
                 .storage
                 .collections_page(query, page * size, size)
-                .await
+                .await?;
+            let summaries = page_summaries(&backend.storage, filter, &page, format).await?;
+            Ok::<_, StorageError>((page, summaries))
         },
         move |ctx, result| match result {
-            Some(Ok(page_rows)) => {
+            Some(Ok((page_rows, summaries))) => {
                 let LibraryPage { items, total, .. } = page_rows;
-                let slots = collection_slots(ctx, items);
+                let slots = collection_slots(ctx, items, &summaries);
                 ctx.library
                     .collections
                     .apply_page(generation, page, total, slots);
@@ -481,16 +532,20 @@ fn requery_tracks(ctx: &Rc<AppContext>) {
 fn requery_collections(ctx: &Rc<AppContext>) {
     let generation = ctx.library.collections.begin();
     let query = collection_query(ctx);
+    let format = ctx.config().download_format;
     ctx.with_backend(
         move |backend| async move {
-            backend
+            let filter = query.filter;
+            let page = backend
                 .storage
                 .collections_page(query, 0, COLLECTION_PAGE)
-                .await
+                .await?;
+            let summaries = page_summaries(&backend.storage, filter, &page, format).await?;
+            Ok::<_, StorageError>((page, summaries))
         },
         move |ctx, result| match result {
-            Some(Ok(page)) => {
-                let slots = collection_slots(ctx, page.items);
+            Some(Ok((page, summaries))) => {
+                let slots = collection_slots(ctx, page.items, &summaries);
                 ctx.library.collections.reset(generation, page.total, slots);
             }
             Some(Err(error)) => {
@@ -499,6 +554,21 @@ fn requery_collections(ctx: &Rc<AppContext>) {
             None => {}
         },
     );
+}
+
+/// The download summaries of the collections of `page`.
+async fn page_summaries(
+    storage: &cider_offline_core::Storage,
+    filter: LibraryFilter,
+    page: &LibraryPage<LibraryCollection>,
+    format: DownloadFormat,
+) -> Result<DownloadSummaries, StorageError> {
+    let ids = page
+        .items
+        .iter()
+        .map(|entry| entry.collection.id.clone())
+        .collect();
+    storage.collection_downloads(filter, ids, format).await
 }
 
 /// Stores the typed search text and re-queries 150 ms after the last
@@ -548,12 +618,16 @@ pub(super) fn on_library_synced(ctx: &Rc<AppContext>, status: &SyncStatus) {
 struct Reloaded {
     tracks: LibraryPage<LibraryTrack>,
     collections: LibraryPage<LibraryCollection>,
+    /// How much of each collection of the first page is downloaded.
+    summaries: DownloadSummaries,
     /// Songs / collections of the source without search or filter.
     source_tracks: usize,
     directory: Vec<LibraryCollection>,
     members: Option<MembersInfo>,
     /// Collections with a download pin.
     pinned: Vec<String>,
+    /// Collections set to "Keep downloaded".
+    kept: Vec<String>,
 }
 
 /// Reloads the library from the store, scoped to the selected source filter:
@@ -567,17 +641,19 @@ pub fn reload(ctx: &Rc<AppContext>) {
     let tracks_query = track_query(ctx);
     let collections_query = collection_query(ctx);
     let filter = collections_query.filter;
+    let format = ctx.config().download_format;
     ctx.with_backend(
         move |backend| async move {
             let storage = backend.storage;
             let members = match &tracks_query.collection {
-                Some(id) => Some(members_info(&storage, filter, id).await?),
+                Some(id) => Some(members_info(&storage, filter, id, format).await?),
                 None => None,
             };
             let tracks = storage.tracks_page(tracks_query, 0, TRACK_PAGE).await?;
             let collections = storage
                 .collections_page(collections_query, 0, COLLECTION_PAGE)
                 .await?;
+            let summaries = page_summaries(&storage, filter, &collections, format).await?;
             let source = LibraryQuery {
                 filter,
                 ..LibraryQuery::default()
@@ -585,13 +661,16 @@ pub fn reload(ctx: &Rc<AppContext>) {
             let source_tracks = storage.tracks_page(source.clone(), 0, 0).await?.total;
             let directory = storage.collections_page(source, 0, usize::MAX).await?.items;
             let pinned = storage.pinned_collections().await?;
+            let kept = kept_collections(&storage).await?;
             Ok::<_, StorageError>(Reloaded {
                 tracks,
                 collections,
+                summaries,
                 source_tracks,
                 directory,
                 members,
                 pinned,
+                kept,
             })
         },
         move |ctx, result| {
@@ -618,12 +697,15 @@ fn show_reloaded(
     let Reloaded {
         tracks,
         collections,
+        summaries,
         source_tracks,
         directory,
         members,
         pinned,
+        kept,
     } = reloaded;
     *ctx.library.pinned.borrow_mut() = pinned.into_iter().collect();
+    *ctx.library.kept.borrow_mut() = kept.into_iter().collect();
     let source_collections = directory.len();
     *ctx.library.directory.borrow_mut() = directory
         .into_iter()
@@ -644,7 +726,7 @@ fn show_reloaded(
     ctx.library
         .tracks
         .reset(tracks_generation, tracks.total, track_slots);
-    let collection_slots = collection_slots(ctx, collections.items);
+    let collection_slots = collection_slots(ctx, collections.items, &summaries);
     ctx.library
         .collections
         .reset(collections_generation, collections.total, collection_slots);
@@ -663,30 +745,54 @@ pub(super) fn refresh_after_change(ctx: &Rc<AppContext>) {
     reload(ctx);
 }
 
-/// Song count, total duration and completeness of a collection's members.
+/// Song count, total duration and download state of a collection's
+/// members. The download state is the cards' own
+/// ([`cider_offline_core::Storage::collection_downloads`]).
 async fn members_info(
     storage: &cider_offline_core::Storage,
     filter: LibraryFilter,
     id: &str,
+    format: DownloadFormat,
 ) -> Result<MembersInfo, StorageError> {
     let members = storage
         .tracks_page(detail_query(filter, id), 0, usize::MAX)
         .await?
         .items;
-    Ok(summarize_members(&members))
+    let mut info = summarize_members(&members, format);
+    if let Some(download) = storage
+        .collection_downloads(filter, vec![id.to_owned()], format)
+        .await?
+        .remove(id)
+    {
+        info.download = download;
+    }
+    Ok(info)
 }
 
-/// Summarizes a collection's member tracks for the detail header.
-pub(super) fn summarize_members(members: &[LibraryTrack]) -> MembersInfo {
+/// Summarizes a collection's member tracks for the detail header: count,
+/// length and how much is downloaded (each song once; a song is complete
+/// when it misses no mix `format` wants, see
+/// [`cider_offline_core::download_needs`]).
+pub(super) fn summarize_members(members: &[LibraryTrack], format: DownloadFormat) -> MembersInfo {
     let total_ms = members
         .iter()
         .filter_map(|m| m.track.duration_ms)
         .map(u64::from)
         .sum();
+    let mut seen = HashSet::new();
+    let download = CollectionDownload::of(
+        members
+            .iter()
+            .filter(|m| seen.insert(m.track.id.as_str()))
+            // The members alone don't say which collection pins them; the
+            // detail takes the links from `collection_downloads`.
+            .map(|m| (&m.track, m.spatial_known, true)),
+        format,
+    );
     MembersInfo {
         songs: members.len(),
         total_ms,
-        complete: !members.is_empty() && members.iter().all(|m| m.track.audio_path.is_some()),
+        download,
     }
 }
 
@@ -695,7 +801,7 @@ fn apply_members_info(ctx: &AppContext, info: MembersInfo) {
     let is_custom = {
         let mut open = ctx.library.open.borrow_mut();
         let Some(open) = open.as_mut() else { return };
-        open.members_complete = info.complete;
+        open.download = info.download;
         open.is_custom
     };
     ctx.with_ui(|ui| {
@@ -707,7 +813,10 @@ fn apply_members_info(ctx: &AppContext, info: MembersInfo) {
 pub(super) fn track_row(track: Track, artwork: Option<Image>, has_mapping: bool) -> TrackRow {
     TrackRow {
         duration: format::duration(track.duration_ms).into(),
-        has_audio: track.audio_path.is_some(),
+        has_audio: track.has_audio(),
+        // Refined for the download format by `track_slots`.
+        missing: !track.has_audio() && !track.is_custom,
+        has_spatial: track.audio.get(AudioVariant::Spatial).is_some(),
         lyrics: format::lyrics(track.lyrics_source).into(),
         lyrics_quality: format::lyrics_quality(track.lyrics_source, track.lyrics_quality),
         has_artwork: artwork.is_some(),
@@ -762,8 +871,14 @@ fn collection_row(playlist: Playlist, artwork: Option<Image>) -> CollectionRow {
         // Populated from the live download aggregate by `set_collection_dl`.
         dl_status: slint::SharedString::default(),
         dl_progress: 0.0,
+        // Populated from the files on disk by `apply_collection_download`.
         downloaded: false,
+        partial: false,
+        elsewhere: false,
+        dl_done: 0,
+        dl_total: 0,
         pinned: false,
+        keep: false,
         placeholder: false,
     }
 }
@@ -866,7 +981,8 @@ fn open_collection(ctx: &Rc<AppContext>, id: &str) {
             .map(|m| m.name.to_string())
             .unwrap_or_default(),
         hero: hero.clone(),
-        members_complete: false,
+        // The card's state until the members are read.
+        download: meta.as_ref().map(row_download).unwrap_or_default(),
         is_custom: meta.as_ref().is_some_and(|m| m.is_custom),
     });
     ctx.with_ui(|ui| {
@@ -911,9 +1027,12 @@ pub(super) fn detail_subtitle(meta: &CollectionRow) -> String {
 /// Recomputes the open collection's song count, length and completeness.
 fn refresh_members_info(ctx: &Rc<AppContext>, id: String) {
     let filter = ctx.library.source.get().filter();
+    let format = ctx.config().download_format;
     let collection = id.clone();
     ctx.with_backend(
-        move |backend| async move { members_info(&backend.storage, filter, &collection).await },
+        move |backend| async move {
+            members_info(&backend.storage, filter, &collection, format).await
+        },
         move |ctx, result| {
             if let Some(Ok(info)) = result {
                 let still_open = ctx
@@ -1119,6 +1238,7 @@ fn refetch_lyrics(ctx: &Rc<AppContext>, id: String) {
             match result {
                 Some(Ok(source)) => {
                     update_track(ctx, &id, |row| row.lyrics = format::lyrics(source).into());
+                    refresh_download_state(ctx);
                     show_message(
                         ctx,
                         match source {
@@ -1185,30 +1305,54 @@ async fn download_key(
         .map(|track| track.catalog_id.unwrap_or(track.id)))
 }
 
+/// The download key of collection member `id`, or `None` for a custom song
+/// (its audio is the user's own and never a download) or an unknown one.
+async fn member_download_key(
+    storage: &cider_offline_core::Storage,
+    id: &str,
+) -> Result<Option<String>, StorageError> {
+    Ok(storage
+        .get_track(id)
+        .await?
+        .filter(|track| !track.is_custom)
+        .map(|track| track.catalog_id.unwrap_or(track.id)))
+}
+
 /// "Remove download" for one Apple Music song: deletes its downloaded audio
 /// (lyrics and metadata stay). The page asks for confirmation first.
 fn remove_download(ctx: &Rc<AppContext>, id: String) {
     update_track(ctx, &id, |row| row.busy = true);
     let track_id = id.clone();
+    let with_lyrics = ctx.config().remove_lyrics_with_downloads;
     ctx.with_backend(
         move |backend| async move {
             let key = download_key(&backend.storage, &track_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .unwrap_or(track_id);
-            backend
+            let removed = backend
                 .downloads
                 .remove_downloads(None, vec![key])
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            let lyrics = if with_lyrics {
+                backend.library.remove_provider_lyrics(&removed).await
+            } else {
+                0
+            };
+            Ok::<_, String>((removed, lyrics))
         },
         move |ctx, result| {
             update_track(ctx, &id, |row| row.busy = false);
             match result {
-                Some(Ok(removed)) if removed.is_empty() => {
+                Some(Ok((removed, _))) if removed.is_empty() => {
                     show_message(ctx, "This song had no downloaded audio.");
                 }
-                Some(Ok(_)) => show_message(ctx, "Download removed."),
+                Some(Ok((_, 0))) => show_message(ctx, "Download removed."),
+                Some(Ok(_)) => {
+                    refresh_track_lyrics(ctx, &id);
+                    show_message(ctx, "Download and lyrics removed.");
+                }
                 Some(Err(error)) => {
                     show_error(ctx, &format!("Could not remove the download: {error}"));
                 }
@@ -1227,46 +1371,310 @@ fn remove_collection_download(ctx: &Rc<AppContext>, id: String) {
     }
     let filter = ctx.library.source.get().filter();
     let collection = id.clone();
+    let with_lyrics = ctx.config().remove_lyrics_with_downloads;
     ctx.with_backend(
         move |backend| async move {
-            let members = backend
+            let keys = collection_keys(&backend.storage, filter, &collection).await?;
+            // Songs another download still needs keep their files.
+            let kept = backend
                 .storage
-                .collection_members(filter, &collection)
+                .download_removal_preview(&collection, keys.clone())
                 .await
                 .map_err(|e| e.to_string())?
-                .unwrap_or_default();
-            let mut keys = Vec::with_capacity(members.len());
-            for member in members {
-                if let Some(key) = download_key(&backend.storage, &member)
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    keys.push(key);
-                }
-            }
-            let total = keys.len();
+                .kept;
+            let kept = NamedSongs::of(&backend.storage, &kept).await;
             let removed = backend
                 .downloads
                 .remove_downloads(Some(&collection), keys)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok::<(usize, usize), String>((removed.len(), total))
+            if with_lyrics {
+                backend.library.remove_provider_lyrics(&removed).await;
+            }
+            let removed = NamedSongs::of(&backend.storage, &removed).await;
+            Ok::<_, String>((removed, kept))
         },
         move |ctx, result| match result {
-            Some(Ok((removed, total))) => {
+            Some(Ok((removed, kept))) => {
                 ctx.library.pinned.borrow_mut().remove(&id);
-                let kept = total.saturating_sub(removed);
-                let text = if kept > 0 && removed > 0 {
-                    format!("Removed {removed} downloaded songs; kept {kept} that other downloads still need.")
-                } else if removed > 0 {
-                    format!("Removed {removed} downloaded songs.")
-                } else {
-                    "Download removed. Its songs are still needed by other downloads.".to_owned()
-                };
-                show_message(ctx, &text);
+                show_message(ctx, &removed_collection_message(&removed, &kept));
                 reload(ctx);
             }
             Some(Err(error)) => show_error(ctx, &format!("Could not remove the download: {error}")),
+            None => show_error(ctx, "The proxy is not running."),
+        },
+    );
+}
+
+/// Records that collection `id` (seen through `filter`) was downloaded, so
+/// its pins can be checked against its songs later ("unlinked downloads")
+/// and "Keep downloaded" can find it. `keep = None` leaves that flag as is.
+async fn register_collection(
+    storage: &cider_offline_core::Storage,
+    id: &str,
+    filter: LibraryFilter,
+    kind: DownloadSourceKind,
+    name: &str,
+    keep: Option<bool>,
+) -> Result<(), String> {
+    storage
+        .register_download_collection(
+            DownloadCollection {
+                owner: id.to_owned(),
+                filter,
+                kind,
+                name: name.to_owned(),
+                keep: false,
+            },
+            keep,
+        )
+        .await
+        .map_err(|e| format!("Could not record the download: {e}"))
+}
+
+/// Download keys (catalog ids) of every song of collection `id`.
+pub(super) async fn collection_keys(
+    storage: &cider_offline_core::Storage,
+    filter: LibraryFilter,
+    id: &str,
+) -> Result<Vec<String>, String> {
+    let members = storage
+        .collection_members(filter, id)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut keys = Vec::with_capacity(members.len());
+    for member in members {
+        if let Some(key) = member_download_key(storage, &member)
+            .await
+            .map_err(|e| e.to_string())?
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// Songs a dialog or message talks about: how many, and their titles when
+/// there are few enough to name (see [`format::songs`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct NamedSongs {
+    /// How many songs.
+    pub count: usize,
+    /// Their titles, or empty when they are counted instead.
+    pub titles: Vec<String>,
+}
+
+impl NamedSongs {
+    /// The songs `keys` (download keys), with their titles when a message
+    /// can name them all.
+    pub(super) async fn of(storage: &cider_offline_core::Storage, keys: &[String]) -> Self {
+        let mut titles = Vec::new();
+        if keys.len() <= format::MAX_NAMED_SONGS {
+            for key in keys {
+                let Ok(Some(track)) = storage.get_track(key).await else {
+                    // A song that cannot be named is counted, with the rest.
+                    titles.clear();
+                    break;
+                };
+                titles.push(track.title);
+            }
+        }
+        Self {
+            count: keys.len(),
+            titles,
+        }
+    }
+
+    /// "“A” and “B”" or "37 songs".
+    fn phrase(&self) -> String {
+        format::songs(self.count, &self.titles)
+    }
+}
+
+/// The confirmation text of removing a collection's downloads: which songs
+/// lose their files and which shared ones are kept (named up to
+/// [`format::MAX_NAMED_SONGS`], counted beyond).
+pub(super) fn remove_collection_message(
+    name: &str,
+    deleted: &NamedSongs,
+    kept: &NamedSongs,
+) -> String {
+    let what = if name.is_empty() {
+        "this collection".to_owned()
+    } else {
+        format!("“{name}”")
+    };
+    let mut text = match deleted.count {
+        0 => format!("Remove the download of {what}? No downloaded file is deleted."),
+        n => format!(
+            "Remove the downloads of {what}? {} {} deleted from this computer.",
+            deleted.phrase(),
+            format::is_are(n)
+        ),
+    };
+    if kept.count > 0 {
+        let _ = write!(
+            text,
+            " {} {} kept because another album, playlist or single download still uses {}.",
+            kept.phrase(),
+            format::is_are(kept.count),
+            if kept.count == 1 { "it" } else { "them" }
+        );
+    }
+    text.push_str(" Lyrics and song details stay.");
+    text
+}
+
+/// The message after removing a collection's downloads.
+pub(super) fn removed_collection_message(removed: &NamedSongs, kept: &NamedSongs) -> String {
+    match (removed.count, kept.count) {
+        (0, 0) => "Download removed.".to_owned(),
+        (0, _) => format!(
+            "Download removed. {} {} kept because other downloads still need {}.",
+            kept.phrase(),
+            format::is_are(kept.count),
+            if kept.count == 1 { "it" } else { "them" }
+        ),
+        (_, 0) => format!("Removed the downloads of {}.", removed.phrase()),
+        _ => format!(
+            "Removed the downloads of {}. {} {} kept because other downloads still need {}.",
+            removed.phrase(),
+            kept.phrase(),
+            format::is_are(kept.count),
+            if kept.count == 1 { "it" } else { "them" }
+        ),
+    }
+}
+/// "Remove downloads…" for a collection: counts what would be deleted and
+/// what is shared, asks, then removes.
+fn confirm_remove_collection_download(ctx: &Rc<AppContext>, id: String) {
+    if id.is_empty() {
+        return;
+    }
+    let filter = ctx.library.source.get().filter();
+    let (_, name) = collection_source(ctx, &id);
+    let collection = id.clone();
+    ctx.with_backend(
+        move |backend| async move {
+            let keys = collection_keys(&backend.storage, filter, &collection).await?;
+            let preview = backend
+                .storage
+                .download_removal_preview(&collection, keys)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((
+                NamedSongs::of(&backend.storage, &preview.deleted).await,
+                NamedSongs::of(&backend.storage, &preview.kept).await,
+            ))
+        },
+        move |ctx, result| match result {
+            Some(Ok((deleted, kept))) => {
+                let message = remove_collection_message(&name, &deleted, &kept);
+                let c = Rc::clone(ctx);
+                dialogs::confirm(
+                    ctx,
+                    dialogs::Prompt {
+                        title: "Remove downloads",
+                        message: &message,
+                        confirm: "Remove downloads",
+                        destructive: true,
+                    },
+                    move || remove_collection_download(&c, id),
+                );
+            }
+            Some(Err(error)) => show_error(ctx, &format!("Could not read the download: {error}")),
+            None => show_error(ctx, "The proxy is not running."),
+        },
+    );
+}
+
+/// Pause / resume / retry / cancel the queued downloads of a collection's
+/// songs. Cancel asks first; downloaded files are never deleted by it.
+fn collection_download_action(ctx: &Rc<AppContext>, id: &str, action: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let action = match action {
+        "pause" => QueueAction::Pause,
+        "resume" => QueueAction::Resume,
+        "retry" => QueueAction::Retry,
+        "cancel" => QueueAction::Cancel,
+        _ => return,
+    };
+    let filter = ctx.library.source.get().filter();
+    let collection = id.to_owned();
+    ctx.with_backend(
+        move |backend| async move { collection_keys(&backend.storage, filter, &collection).await },
+        move |ctx, result| {
+            let keys = match result {
+                Some(Ok(keys)) => keys,
+                Some(Err(error)) => {
+                    show_error(ctx, &format!("Could not load the collection: {error}"));
+                    return;
+                }
+                None => return,
+            };
+            // Only rows the queue holds for these songs, in a state the
+            // action applies to.
+            let rows = super::downloads::rows_for(ctx, &keys, action);
+            if rows.is_empty() {
+                return;
+            }
+            if action == QueueAction::Cancel {
+                let titles = super::downloads::row_titles(ctx, &rows);
+                let message = super::downloads::cancel_message(&titles, false);
+                let c = Rc::clone(ctx);
+                dialogs::confirm(
+                    ctx,
+                    dialogs::Prompt {
+                        title: "Cancel downloads",
+                        message: &message,
+                        confirm: "Cancel downloads",
+                        destructive: true,
+                    },
+                    move || super::downloads::apply(&c, action, rows),
+                );
+            } else {
+                super::downloads::apply(ctx, action, rows);
+            }
+        },
+    );
+}
+
+/// "Keep downloaded" on (registers the collection as kept and downloads its
+/// missing songs) or off (songs added later are no longer downloaded; what
+/// is downloaded stays).
+fn set_keep_downloaded(ctx: &Rc<AppContext>, id: &str, keep: bool) {
+    if id.is_empty() {
+        return;
+    }
+    if keep {
+        ctx.library.kept.borrow_mut().insert(id.to_owned());
+        download_collection_with(ctx, id, Some(true));
+        return;
+    }
+    ctx.library.kept.borrow_mut().remove(id);
+    sync_download_status(ctx);
+    let (source_kind, name) = collection_source(ctx, id);
+    let filter = ctx.library.source.get().filter();
+    let collection = id.to_owned();
+    ctx.with_backend(
+        move |backend| async move {
+            register_collection(
+                &backend.storage,
+                &collection,
+                filter,
+                source_kind,
+                &name,
+                Some(false),
+            )
+            .await
+        },
+        |ctx, result| match result {
+            Some(Ok(())) => show_message(ctx, "Songs added later are no longer downloaded."),
+            Some(Err(message)) => show_error(ctx, &message),
             None => show_error(ctx, "The proxy is not running."),
         },
     );
@@ -1280,25 +1688,77 @@ pub(super) fn mark_audio(ctx: &Rc<AppContext>, keys: &[String], has_audio: bool)
     }
     ctx.library.tracks.update_where(|row| {
         let hit = keys.iter().any(|key| key == row.catalog_id.as_str());
-        let changed = hit && row.has_audio != has_audio;
+        let changed = hit
+            && (row.has_audio != has_audio
+                || row.missing == has_audio
+                || (!has_audio && row.has_spatial));
         if changed {
             row.has_audio = has_audio;
+            // A finished download fetched every mix the format allows.
+            row.missing = !has_audio;
+            if !has_audio {
+                row.has_spatial = false;
+            }
         }
         changed
     });
+    // Collections may have gained or lost files.
+    refresh_download_state(ctx);
     if !has_audio {
-        // Collections may have lost their downloaded state.
         refresh_pins(ctx);
     }
 }
 
-/// Re-reads which collections are pinned and updates the cards / detail.
-fn refresh_pins(ctx: &Rc<AppContext>) {
+/// Shows which mixes the songs named by `keys` (download keys) have on disk,
+/// as read by [`super::downloads::refresh_variants`]: `found` holds the
+/// variants of the keys that have any.
+pub(super) fn apply_variants(
+    ctx: &Rc<AppContext>,
+    keys: &[String],
+    found: &HashMap<String, Vec<AudioVariant>>,
+) {
+    ctx.library.tracks.update_where(|row| {
+        let key = row.catalog_id.as_str();
+        if !keys.iter().any(|k| k == key) {
+            return false;
+        }
+        // Only the spatial badge: `has_audio` follows the download events
+        // (a mapping counts as a stereo mix here but is not a download).
+        let has_spatial = found
+            .get(key)
+            .is_some_and(|v| v.contains(&AudioVariant::Spatial));
+        let changed = row.has_spatial != has_spatial;
+        row.has_spatial = has_spatial;
+        changed
+    });
+}
+
+/// Ids of the collections set to "Keep downloaded".
+async fn kept_collections(
+    storage: &cider_offline_core::Storage,
+) -> Result<Vec<String>, StorageError> {
+    Ok(storage
+        .download_collections()
+        .await?
+        .into_iter()
+        .filter(|collection| collection.keep)
+        .map(|collection| collection.owner)
+        .collect())
+}
+
+/// Re-reads which collections are pinned or kept and updates the cards /
+/// detail.
+pub(super) fn refresh_pins(ctx: &Rc<AppContext>) {
     ctx.with_backend(
-        |backend| async move { backend.storage.pinned_collections().await },
+        |backend| async move {
+            let pinned = backend.storage.pinned_collections().await?;
+            let kept = kept_collections(&backend.storage).await?;
+            Ok::<_, StorageError>((pinned, kept))
+        },
         |ctx, result| {
-            if let Some(Ok(pinned)) = result {
+            if let Some(Ok((pinned, kept))) = result {
                 *ctx.library.pinned.borrow_mut() = pinned.into_iter().collect();
+                *ctx.library.kept.borrow_mut() = kept.into_iter().collect();
                 sync_download_status(ctx);
             }
         },
@@ -1385,6 +1845,143 @@ fn fetch_collection_lyrics(ctx: &Rc<AppContext>, id: &str) {
     );
 }
 
+/// "Remove lyrics" of one song: deletes all of its local lyrics, the
+/// lyrics the user imported included (the user removes them on this song
+/// explicitly). Asks first when the song has imported lyrics.
+fn remove_song_lyrics(ctx: &Rc<AppContext>, id: String) {
+    let custom = ctx
+        .library
+        .tracks
+        .find(|row| row.id.as_str() == id)
+        .is_some_and(|row| row.lyrics.as_str() == format::lyrics(LyricsSource::Custom));
+    if !custom {
+        run_remove_song_lyrics(ctx, id);
+        return;
+    }
+    let c = Rc::clone(ctx);
+    dialogs::confirm(
+        ctx,
+        dialogs::Prompt {
+            title: "Remove lyrics",
+            message: "Remove this song's lyrics? The lyrics file you imported is deleted too.",
+            confirm: "Remove",
+            destructive: true,
+        },
+        move || run_remove_song_lyrics(&c, id),
+    );
+}
+
+fn run_remove_song_lyrics(ctx: &Rc<AppContext>, id: String) {
+    update_track(ctx, &id, |row| row.busy = true);
+    let track_id = id.clone();
+    ctx.with_backend(
+        move |backend| async move { backend.library.remove_lyrics(&track_id, true).await },
+        move |ctx, result| {
+            update_track(ctx, &id, |row| row.busy = false);
+            match result {
+                Some(Ok(true)) => {
+                    refresh_track_lyrics(ctx, &id);
+                    show_message(ctx, "Lyrics removed.");
+                }
+                Some(Ok(false)) => show_message(ctx, "This song had no lyrics."),
+                Some(Err(error)) => {
+                    show_error(ctx, &format!("Could not remove the lyrics: {error}"));
+                }
+                None => show_error(ctx, "The proxy is not running."),
+            }
+        },
+    );
+}
+
+/// Re-reads one song's lyrics state onto its loaded row.
+fn refresh_track_lyrics(ctx: &Rc<AppContext>, id: &str) {
+    let track_id = id.to_owned();
+    let row_id = id.to_owned();
+    ctx.with_backend(
+        move |backend| async move { backend.storage.get_track(&track_id).await },
+        move |ctx, result| {
+            if let Some(Ok(Some(track))) = result {
+                update_track(ctx, &row_id, |row| {
+                    row.lyrics = format::lyrics(track.lyrics_source).into();
+                    row.lyrics_quality =
+                        format::lyrics_quality(track.lyrics_source, track.lyrics_quality);
+                });
+                // Lyrics never count towards a download, but its state is
+                // read again so nothing shown can lag behind a change.
+                refresh_download_state(ctx);
+            }
+        },
+    );
+}
+
+/// The confirmation text of removing a collection's lyrics.
+pub(super) fn remove_collection_lyrics_message(name: &str) -> String {
+    let what = if name.is_empty() {
+        "this collection".to_owned()
+    } else {
+        format!("“{name}”")
+    };
+    format!(
+        "Remove the lyrics of every song in {what}? Lyrics from Apple and lyrics lookups are \
+         deleted from this computer; lyrics you imported are kept. You can fetch them again later."
+    )
+}
+
+/// "Remove lyrics…" for a collection: asks, then removes the fetched lyrics
+/// of its songs. Lyrics the user imported are never removed here.
+fn confirm_remove_collection_lyrics(ctx: &Rc<AppContext>, id: String) {
+    if id.is_empty() {
+        return;
+    }
+    let (_, name) = collection_source(ctx, &id);
+    let message = remove_collection_lyrics_message(&name);
+    let c = Rc::clone(ctx);
+    dialogs::confirm(
+        ctx,
+        dialogs::Prompt {
+            title: "Remove lyrics",
+            message: &message,
+            confirm: "Remove lyrics",
+            destructive: true,
+        },
+        move || remove_collection_lyrics(&c, id),
+    );
+}
+
+fn remove_collection_lyrics(ctx: &Rc<AppContext>, id: String) {
+    let filter = ctx.library.source.get().filter();
+    ctx.with_ui(|ui| ui.global::<LibraryState>().set_bulk_busy(true));
+    ctx.with_backend(
+        move |backend| async move {
+            let ids = backend
+                .storage
+                .collection_members(filter, &id)
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            Ok::<usize, String>(backend.library.remove_provider_lyrics(&ids).await)
+        },
+        |ctx, result| {
+            ctx.with_ui(|ui| ui.global::<LibraryState>().set_bulk_busy(false));
+            match result {
+                Some(Ok(0)) => show_message(ctx, "No song here had lyrics to remove."),
+                Some(Ok(1)) => {
+                    show_message(ctx, "Removed the lyrics of 1 song.");
+                    reload(ctx);
+                }
+                Some(Ok(count)) => {
+                    show_message(ctx, &format!("Removed the lyrics of {count} songs."));
+                    reload(ctx);
+                }
+                Some(Err(error)) => {
+                    show_error(ctx, &format!("Could not remove the lyrics: {error}"));
+                }
+                None => show_error(ctx, "The proxy is not running."),
+            }
+        },
+    );
+}
+
 /// Whether LRCLIB is the only enabled lyrics provider ("not on LRCLIB").
 fn lrclib_only(ctx: &AppContext) -> bool {
     let config = ctx.config();
@@ -1429,32 +2026,16 @@ fn show_lyrics_report(ctx: &AppContext, report: LyricsReport) {
     }
 }
 
-/// Builds a queued [`DownloadRecord`] from a cached library track.
-fn track_to_download_record(track: Track) -> DownloadRecord {
-    // The DRM downloader's webPlayback needs the numeric catalog (adam) id, not
-    // the `i.…` library id. Key the record on the catalog id when known (as the
-    // auto-cache and `Library::download` paths do), falling back to the row id
-    // for catalog-native tracks that have no separate catalog id.
-    let catalog_id = track.catalog_id.clone().unwrap_or_else(|| track.id.clone());
-    DownloadRecord {
-        id: catalog_id.clone(),
-        track_id: catalog_id,
-        title: track.title,
-        artist: track.artist,
-        album: track.album,
-        duration_ms: track.duration_ms.unwrap_or(0),
-        artwork_url: track.artwork_url,
-        source_kind: DownloadSourceKind::Song,
-        source_id: None,
-        source_name: None,
-        status: DownloadStatus::Queued,
-        progress: 0.0,
-        message: None,
-        deferred: false,
-        // `0` lets storage fill both timestamps on insert.
-        created_at: 0,
-        updated_at: 0,
-    }
+/// Builds a queued single-song [`DownloadRecord`] from a cached library
+/// track, keyed on its catalog id (the DRM downloader's webPlayback needs the
+/// numeric catalog id, not the `i.…` library id).
+/// A track's download key: its catalog id, else its own id.
+fn download_key_of(track: &Track) -> String {
+    track.catalog_id.clone().unwrap_or_else(|| track.id.clone())
+}
+
+fn track_to_download_record(track: &Track) -> DownloadRecord {
+    record_from_track(track, None)
 }
 
 fn download_track(ctx: &Rc<AppContext>, id: String) {
@@ -1468,7 +2049,7 @@ fn download_track(ctx: &Rc<AppContext>, id: String) {
                 .await
                 .map_err(|e| format!("Could not load track: {e}"))?
                 .ok_or_else(|| "Track not found in the library.".to_owned())?;
-            let record = track_to_download_record(track);
+            let record = track_to_download_record(&track);
             backend
                 .downloads
                 .enqueue(vec![record])
@@ -1489,17 +2070,25 @@ fn download_track(ctx: &Rc<AppContext>, id: String) {
 fn download_missing_audio(ctx: &Rc<AppContext>) {
     ctx.with_ui(|ui| ui.global::<LibraryState>().set_bulk_busy(true));
     show_message(ctx, "Queuing missing audio downloads…");
+    let format = ctx.config().download_format;
     ctx.with_backend(
-        |backend| async move {
+        move |backend| async move {
             let tracks = backend
                 .storage
                 .list_tracks()
                 .await
                 .map_err(|e| format!("Could not list tracks: {e}"))?;
+            let known = backend
+                .storage
+                .song_spatial()
+                .await
+                .map_err(|e| format!("Could not list tracks: {e}"))?;
             let records: Vec<DownloadRecord> = tracks
                 .into_iter()
-                .filter(|t| t.audio_path.is_none())
-                .map(track_to_download_record)
+                .filter(|t| {
+                    track_needs_download(t, format, known.get(&download_key_of(t)).copied())
+                })
+                .map(|track| track_to_download_record(&track))
                 .collect();
             let count = records.len();
             if count > 0 {
@@ -1529,9 +2118,148 @@ fn download_missing_audio(ctx: &Rc<AppContext>) {
 /// actions. Records are tagged with the collection's source id / name so the
 /// inline card + detail indicators can aggregate their progress.
 fn download_collection(ctx: &Rc<AppContext>, id: &str) {
+    download_collection_with(ctx, id, None);
+}
+
+/// [`download_collection`], also setting "Keep downloaded" when `keep` is
+/// given.
+fn download_collection_with(ctx: &Rc<AppContext>, id: &str, keep: Option<bool>) {
     if id.is_empty() {
         return;
     }
+    let (source_kind, name) = collection_source(ctx, id);
+    let label = match source_kind {
+        DownloadSourceKind::Playlist => "playlist",
+        _ => "album",
+    };
+    let filter = ctx.library.source.get().filter();
+    let format = ctx.config().download_format;
+    let collection_id = id.to_owned();
+    let pin_id = id.to_owned();
+    ctx.with_backend(
+        move |backend| async move {
+            // Member ids from the core's grouped view resolve synthesized
+            // album groups too.
+            let ids = backend
+                .storage
+                .collection_members(filter, &collection_id)
+                .await
+                .map_err(|e| format!("Could not load the collection: {e}"))?
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Err("This collection has no tracks to download.".to_owned());
+            }
+            let known = backend
+                .storage
+                .song_spatial()
+                .await
+                .map_err(|e| format!("Could not load the collection: {e}"))?;
+            let mut tracks = Vec::with_capacity(ids.len());
+            for track_id in ids {
+                if let Some(track) = backend
+                    .storage
+                    .get_track(&track_id)
+                    .await
+                    .map_err(|e| format!("Could not load track: {e}"))?
+                {
+                    tracks.push(track);
+                }
+            }
+            let plan = CollectionPlan::of(&tracks, format, &known);
+            // The collection now owns its songs' downloads, including those
+            // already on disk through other downloads, so they stay while it
+            // wants them and "Remove download" can release them later.
+            let linked = backend
+                .storage
+                .link_download_collection(
+                    DownloadCollection {
+                        owner: collection_id.clone(),
+                        filter,
+                        kind: source_kind,
+                        name: name.clone(),
+                        keep: false,
+                    },
+                    keep,
+                    plan.keys,
+                )
+                .await
+                .map_err(|e| format!("Could not record the download: {e}"))?;
+            let records: Vec<DownloadRecord> = plan
+                .missing
+                .into_iter()
+                .map(|track| {
+                    let mut record = track_to_download_record(track);
+                    record.source_kind = source_kind;
+                    record.source_id = Some(collection_id.clone());
+                    record.source_name = (!name.is_empty()).then(|| name.clone());
+                    record
+                })
+                .collect();
+            let queued = records.len();
+            if queued > 0 {
+                backend
+                    .downloads
+                    .enqueue(records)
+                    .map_err(|e| format!("Could not enqueue: {e}"))?;
+            }
+            Ok::<_, String>((queued, linked))
+        },
+        move |ctx, result| match result {
+            Some(Ok((queued, linked))) => {
+                ctx.library.pinned.borrow_mut().insert(pin_id);
+                refresh_pins(ctx);
+                refresh_download_state(ctx);
+                show_message(ctx, &download_collection_message(queued, linked, label));
+            }
+            Some(Err(message)) => show_error(ctx, &message),
+            None => show_error(ctx, "The proxy is not running."),
+        },
+    );
+}
+
+/// What downloading a collection does with its songs.
+#[derive(Debug, Default)]
+struct CollectionPlan<'a> {
+    /// The download key of every song, which the collection pins (songs
+    /// already on disk through other downloads included).
+    keys: Vec<String>,
+    /// The songs missing a mix the format wants, to be queued.
+    missing: Vec<&'a Track>,
+}
+
+impl<'a> CollectionPlan<'a> {
+    /// The plan for the collection's songs `tracks` under `format`; `known`
+    /// is what the queue learned about spatial mixes, by download key.
+    fn of(tracks: &'a [Track], format: DownloadFormat, known: &HashMap<String, bool>) -> Self {
+        let mut plan = Self::default();
+        for track in tracks {
+            let key = download_key_of(track);
+            if track_needs_download(track, format, known.get(&key).copied()) {
+                plan.missing.push(track);
+            }
+            if !plan.keys.contains(&key) {
+                plan.keys.push(key);
+            }
+        }
+        plan
+    }
+}
+
+/// The toast after downloading collection (`label`: "album" or "playlist"):
+/// `queued` songs were queued and `linked` songs newly linked to it.
+fn download_collection_message(queued: usize, linked: usize, label: &str) -> String {
+    match (queued, linked) {
+        (0, 0) => format!("Every song in this {label} is already downloaded."),
+        (0, 1) => format!("Linked 1 song to this {label}. Nothing had to be downloaded."),
+        (0, n) => format!("Linked {n} songs to this {label}. Nothing had to be downloaded."),
+        (1, _) => "Added 1 song to the download queue.".to_owned(),
+        (n, _) => format!("Added {n} songs to the download queue."),
+    }
+}
+
+/// The download source kind and name of collection `id` (a loaded card or
+/// the open detail), for tagging its queued songs.
+fn collection_source(ctx: &AppContext, id: &str) -> (DownloadSourceKind, String) {
     let (kind_key, name) = ctx
         .library
         .collections
@@ -1551,72 +2279,151 @@ fn download_collection(ctx: &Rc<AppContext>, id: &str) {
     } else {
         DownloadSourceKind::Album
     };
-    let filter = ctx.library.source.get().filter();
-    let collection_id = id.to_owned();
-    let pin_id = id.to_owned();
+    (source_kind, name)
+}
+
+/// The confirmation text of a re-download of `count` songs.
+fn redownload_message(count: usize) -> String {
+    let songs = if count == 1 {
+        "1 song".to_owned()
+    } else {
+        format!("{count} songs")
+    };
+    format!("Re-download {songs}? Existing files are replaced when the new ones finish.")
+}
+
+/// Asks to re-download `records`, then queues them. The queue writes each
+/// new file next to the old one and swaps it in only once it is complete, so
+/// the old file keeps playing until then; lyrics and links to local files
+/// are not touched. `pin` is the collection that owns the downloads, if any.
+fn confirm_redownload(ctx: &Rc<AppContext>, records: Vec<DownloadRecord>, pin: Option<String>) {
+    if records.is_empty() {
+        show_message(ctx, "There is nothing to download again here.");
+        return;
+    }
+    let message = redownload_message(records.len());
+    let c = Rc::clone(ctx);
+    dialogs::confirm(
+        ctx,
+        dialogs::Prompt {
+            title: "Re-download",
+            message: &message,
+            confirm: "Re-download",
+            destructive: false,
+        },
+        move || {
+            let count = records.len();
+            let pin_id = pin.clone();
+            c.with_backend(
+                move |backend| async move {
+                    if let Some(owner) = &pin {
+                        let keys = records.iter().map(|r| r.track_id.clone()).collect();
+                        backend
+                            .storage
+                            .pin_downloads(Some(owner), keys)
+                            .await
+                            .map_err(|e| format!("Could not record the download: {e}"))?;
+                    }
+                    backend
+                        .downloads
+                        .enqueue(records)
+                        .map_err(|e| format!("Could not enqueue: {e}"))
+                },
+                move |ctx, result| match result {
+                    Some(Ok(())) => {
+                        if let Some(pin) = pin_id {
+                            ctx.library.pinned.borrow_mut().insert(pin);
+                        }
+                        sync_download_status(ctx);
+                        show_message(
+                            ctx,
+                            &format!("Added {count} track(s) to the download queue."),
+                        );
+                    }
+                    Some(Err(message)) => show_error(ctx, &message),
+                    None => show_error(ctx, "The proxy is not running."),
+                },
+            );
+        },
+    );
+}
+
+/// "Re-download" for one song: fetches it again in the current download
+/// format (asks first).
+fn redownload_track(ctx: &Rc<AppContext>, id: String) {
     ctx.with_backend(
         move |backend| async move {
-            // Member ids from the core's grouped view resolve synthesized
-            // album groups too.
+            let track = backend
+                .storage
+                .get_track(&id)
+                .await
+                .map_err(|e| format!("Could not load track: {e}"))?
+                .ok_or_else(|| "Track not found in the library.".to_owned())?;
+            if track.is_custom {
+                return Err("Custom songs have no Apple Music download.".to_owned());
+            }
+            let mut record = track_to_download_record(&track);
+            record.replace = true;
+            Ok::<_, String>(record)
+        },
+        |ctx, result| match result {
+            Some(Ok(record)) => confirm_redownload(ctx, vec![record], None),
+            Some(Err(message)) => show_error(ctx, &message),
+            None => show_error(ctx, "The proxy is not running."),
+        },
+    );
+}
+
+/// "Re-download" for an album / playlist: fetches every Apple Music song of
+/// it again in the current download format (asks first). Custom songs are
+/// skipped.
+fn redownload_collection(ctx: &Rc<AppContext>, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let (source_kind, name) = collection_source(ctx, id);
+    let filter = ctx.library.source.get().filter();
+    let collection_id = id.to_owned();
+    ctx.with_backend(
+        move |backend| async move {
             let ids = backend
                 .storage
                 .collection_members(filter, &collection_id)
                 .await
                 .map_err(|e| format!("Could not load the collection: {e}"))?
                 .unwrap_or_default();
-            if ids.is_empty() {
-                return Err("This collection has no tracks to download.".to_owned());
-            }
             let mut records = Vec::with_capacity(ids.len());
-            let mut keys = Vec::with_capacity(ids.len());
             for track_id in ids {
-                if let Some(track) = backend
+                let Some(track) = backend
                     .storage
                     .get_track(&track_id)
                     .await
                     .map_err(|e| format!("Could not load track: {e}"))?
-                {
-                    keys.push(track.catalog_id.clone().unwrap_or_else(|| track.id.clone()));
-                    if track.audio_path.is_some() {
-                        continue; // already available locally
-                    }
-                    let mut record = track_to_download_record(track);
-                    record.source_kind = source_kind;
-                    record.source_id = Some(collection_id.clone());
-                    record.source_name = (!name.is_empty()).then(|| name.clone());
-                    records.push(record);
+                else {
+                    continue;
+                };
+                if track.is_custom {
+                    continue;
                 }
+                let mut record =
+                    record_from_track(&track, Some((source_kind, &collection_id, &name)));
+                record.replace = true;
+                records.push(record);
             }
-            // The collection now owns its songs' downloads, including those
-            // already on disk, so "Remove download" can release them later.
-            backend
-                .storage
-                .pin_downloads(Some(&collection_id), keys)
-                .await
-                .map_err(|e| format!("Could not record the download: {e}"))?;
-            let count = records.len();
-            if count == 0 {
-                return Ok(0);
-            }
-            backend
-                .downloads
-                .enqueue(records)
-                .map_err(|e| format!("Could not enqueue: {e}"))?;
-            Ok::<usize, String>(count)
+            register_collection(
+                &backend.storage,
+                &collection_id,
+                filter,
+                source_kind,
+                &name,
+                None,
+            )
+            .await?;
+            Ok::<_, String>((records, collection_id))
         },
-        move |ctx, result| match result {
-            Some(Ok(0)) => {
-                ctx.library.pinned.borrow_mut().insert(pin_id);
-                sync_download_status(ctx);
-                show_message(ctx, "Every song in this collection is already downloaded.");
-            }
-            Some(Ok(count)) => {
-                ctx.library.pinned.borrow_mut().insert(pin_id);
-                sync_download_status(ctx);
-                show_message(
-                    ctx,
-                    &format!("Added {count} track(s) to the download queue."),
-                );
+        |ctx, result| match result {
+            Some(Ok((records, collection_id))) => {
+                confirm_redownload(ctx, records, Some(collection_id));
             }
             Some(Err(message)) => show_error(ctx, &message),
             None => show_error(ctx, "The proxy is not running."),
@@ -1634,12 +2441,16 @@ pub(super) fn sync_download_status(ctx: &Rc<AppContext>) {
     let data = &ctx.library;
     data.tracks.update_where(|row| set_track_dl(row, &tracks));
     let pinned = data.pinned.borrow();
+    let kept = data.kept.borrow();
     data.collections.update_where(|row| {
         let is_pinned = pinned.contains(row.id.as_str());
-        let pin_changed = row.pinned != is_pinned;
+        let is_kept = kept.contains(row.id.as_str());
+        let pin_changed = row.pinned != is_pinned || row.keep != is_kept;
         row.pinned = is_pinned;
+        row.keep = is_kept;
         set_collection_dl(row, &collections) || pin_changed
     });
+    drop(kept);
     drop(pinned);
     update_detail_download(ctx, &collections);
 }
@@ -1661,31 +2472,165 @@ fn set_track_dl(row: &mut TrackRow, map: &HashMap<String, (String, f32)>) -> boo
     changed
 }
 
-/// Copies the live aggregate download state onto a collection row.
+/// Copies the live aggregate queue state (in flight, paused, failed) onto a
+/// collection row. Whether it is downloaded comes from its files only, see
+/// [`apply_collection_download`].
 fn set_collection_dl(row: &mut CollectionRow, map: &HashMap<String, (String, f32)>) -> bool {
     let (status, progress) = map
         .get(row.id.as_str())
         .map_or(("", 0.0), |(s, p)| (s.as_str(), *p));
-    let downloaded = status == "done" || (status.is_empty() && row.pinned);
-    let changed = row.dl_status.as_str() != status
-        || (row.dl_progress - progress).abs() > f32::EPSILON
-        || row.downloaded != downloaded;
+    let changed =
+        row.dl_status.as_str() != status || (row.dl_progress - progress).abs() > f32::EPSILON;
     if changed {
         row.dl_status = status.into();
         row.dl_progress = progress;
-        row.downloaded = downloaded;
     }
     changed
 }
 
+/// The card and detail fields of a collection's download summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownloadFields {
+    /// Every song complete, and the collection pins them all.
+    downloaded: bool,
+    /// Some songs have files, not all of them every wanted mix.
+    partial: bool,
+    /// Every song complete, some only through other downloads.
+    elsewhere: bool,
+    /// Complete songs, of `total`.
+    done: i32,
+    total: i32,
+}
+
+impl DownloadFields {
+    fn of(summary: CollectionDownload) -> Self {
+        let count = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+        let state = summary.state();
+        Self {
+            downloaded: state == CollectionDownloadState::Downloaded,
+            partial: state == CollectionDownloadState::Partial,
+            elsewhere: state == CollectionDownloadState::SavedElsewhere,
+            done: count(summary.complete),
+            total: count(summary.songs),
+        }
+    }
+}
+
+/// Shows a collection's download summary on its card; returns whether the
+/// card changed.
+pub(super) fn apply_collection_download(
+    row: &mut CollectionRow,
+    summary: CollectionDownload,
+) -> bool {
+    let fields = DownloadFields::of(summary);
+    let changed = row.downloaded != fields.downloaded
+        || row.partial != fields.partial
+        || row.elsewhere != fields.elsewhere
+        || row.dl_done != fields.done
+        || row.dl_total != fields.total;
+    if changed {
+        row.downloaded = fields.downloaded;
+        row.partial = fields.partial;
+        row.elsewhere = fields.elsewhere;
+        row.dl_done = fields.done;
+        row.dl_total = fields.total;
+    }
+    changed
+}
+
+/// The download summary a card shows (to start the detail with).
+fn row_download(row: &CollectionRow) -> CollectionDownload {
+    let count = |n: i32| usize::try_from(n).unwrap_or(0);
+    let songs = count(row.dl_total);
+    let complete = count(row.dl_done);
+    CollectionDownload {
+        songs,
+        complete,
+        with_audio: if row.downloaded || row.partial || row.elsewhere {
+            complete.max(1)
+        } else {
+            0
+        },
+        // Only "saved through other downloads" depends on the links.
+        linked: if row.elsewhere { 0 } else { songs },
+    }
+}
+
+/// Reads the download state of every loaded collection card and of the open
+/// detail again, a moment after the last call (downloads finishing or being
+/// removed, lyrics changing), and shows it.
+pub(super) fn refresh_download_state(ctx: &Rc<AppContext>) {
+    let weak = Rc::downgrade(ctx);
+    ctx.library.download_state_timer.start(
+        TimerMode::SingleShot,
+        DOWNLOAD_STATE_DEBOUNCE,
+        move || {
+            if let Some(ctx) = weak.upgrade() {
+                read_download_state(&ctx);
+            }
+        },
+    );
+}
+
+fn read_download_state(ctx: &Rc<AppContext>) {
+    let mut ids: Vec<String> = Vec::new();
+    ctx.library.collections.update_where(|row| {
+        if !row.placeholder {
+            ids.push(row.id.to_string());
+        }
+        false
+    });
+    if let Some(open) = ctx.library.open.borrow().as_ref()
+        && !ids.contains(&open.id)
+    {
+        ids.push(open.id.clone());
+    }
+    if ids.is_empty() {
+        return;
+    }
+    let filter = ctx.library.source.get().filter();
+    let format = ctx.config().download_format;
+    ctx.with_backend(
+        move |backend| async move {
+            backend
+                .storage
+                .collection_downloads(filter, ids, format)
+                .await
+        },
+        move |ctx, result| {
+            let Some(Ok(summaries)) = result else { return };
+            if ctx.library.source.get().filter() != filter {
+                return; // the view changed meanwhile; its reload read it
+            }
+            ctx.library.collections.update_where(|row| {
+                summaries
+                    .get(row.id.as_str())
+                    .is_some_and(|summary| apply_collection_download(row, *summary))
+            });
+            let open_summary = ctx
+                .library
+                .open
+                .borrow()
+                .as_ref()
+                .and_then(|open| summaries.get(&open.id).copied());
+            if let Some(summary) = open_summary {
+                if let Some(open) = ctx.library.open.borrow_mut().as_mut() {
+                    open.download = summary;
+                }
+                update_detail_download(ctx, &super::downloads::collection_progress(ctx));
+            }
+        },
+    );
+}
+
 /// Updates the open collection detail's aggregate download indicator.
 fn update_detail_download(ctx: &Rc<AppContext>, collections: &HashMap<String, (String, f32)>) {
-    let Some((id, members_complete)) = ctx
+    let Some((id, summary)) = ctx
         .library
         .open
         .borrow()
         .as_ref()
-        .map(|open| (open.id.clone(), open.members_complete))
+        .map(|open| (open.id.clone(), open.download))
     else {
         return;
     };
@@ -1695,11 +2640,19 @@ fn update_detail_download(ctx: &Rc<AppContext>, collections: &HashMap<String, (S
             .get(&id)
             .map_or((String::new(), 0.0), |(s, p)| (s.clone(), *p));
         let pinned = ctx.library.pinned.borrow().contains(&id);
-        let downloaded = status == "done" || members_complete || (status.is_empty() && pinned);
+        // The cards' definition: the members' files under the download
+        // format (see `refresh_download_state`), and its own pins only to
+        // tell "saved through other downloads"; never queue rows.
+        let fields = DownloadFields::of(summary);
         state.set_detail_pinned(pinned);
+        state.set_detail_keep(ctx.library.kept.borrow().contains(&id));
         state.set_detail_dl_status(status.as_str().into());
         state.set_detail_dl_progress(progress);
-        state.set_detail_downloaded(downloaded);
+        state.set_detail_downloaded(fields.downloaded);
+        state.set_detail_partial(fields.partial);
+        state.set_detail_elsewhere(fields.elsewhere);
+        state.set_detail_dl_done(fields.done);
+        state.set_detail_dl_total(fields.total);
     });
 }
 
@@ -1732,6 +2685,78 @@ fn post_message(ctx: &AppContext, message: &str, is_error: bool) {
 mod tests {
     use super::*;
 
+    fn named(titles: &[&str]) -> NamedSongs {
+        NamedSongs {
+            count: titles.len(),
+            titles: titles.iter().map(|&title| title.to_owned()).collect(),
+        }
+    }
+
+    fn counted(count: usize) -> NamedSongs {
+        NamedSongs {
+            count,
+            titles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn remove_collection_message_should_count_more_than_five_songs() {
+        assert_eq!(
+            remove_collection_message("Mix", &counted(37), &counted(3)),
+            "Remove the downloads of “Mix”? 37 songs are deleted from this computer. \
+             3 songs are kept because another album, playlist or single download still uses \
+             them. Lyrics and song details stay."
+        );
+    }
+
+    #[test]
+    fn remove_collection_message_should_name_up_to_five_songs() {
+        assert_eq!(
+            remove_collection_message("Mix", &named(&["One", "Two"]), &named(&["Three"])),
+            "Remove the downloads of “Mix”? “One” and “Two” are deleted from this computer. \
+             “Three” is kept because another album, playlist or single download still uses it. \
+             Lyrics and song details stay."
+        );
+    }
+
+    #[test]
+    fn remove_collection_message_should_say_when_nothing_is_deleted() {
+        assert!(
+            remove_collection_message("Mix", &counted(0), &counted(2))
+                .contains("No downloaded file is deleted")
+        );
+    }
+
+    #[test]
+    fn removed_collection_message_should_count_more_than_five_songs() {
+        assert_eq!(
+            removed_collection_message(&counted(37), &counted(3)),
+            "Removed the downloads of 37 songs. 3 songs are kept because other downloads still \
+             need them."
+        );
+    }
+
+    #[test]
+    fn removed_collection_message_should_name_up_to_five_songs() {
+        assert_eq!(
+            removed_collection_message(&named(&["One"]), &counted(0)),
+            "Removed the downloads of “One”."
+        );
+    }
+
+    #[test]
+    fn redownload_message_should_count_songs() {
+        assert_eq!(
+            [redownload_message(1), redownload_message(12)],
+            [
+                "Re-download 1 song? Existing files are replaced when the new ones finish."
+                    .to_owned(),
+                "Re-download 12 songs? Existing files are replaced when the new ones finish."
+                    .to_owned(),
+            ]
+        );
+    }
+
     fn track(id: &str) -> LibraryTrack {
         LibraryTrack {
             track: Track {
@@ -1743,6 +2768,7 @@ mod tests {
                 ..Track::minimal(id, "Title", "Artist")
             },
             has_mapping: true,
+            spatial_known: None,
         }
     }
 
@@ -1787,19 +2813,286 @@ mod tests {
     }
 
     #[test]
+    fn remove_collection_lyrics_message_should_name_the_collection_and_keep_imports() {
+        let text = remove_collection_lyrics_message("Mix");
+        assert!(text.contains("“Mix”") && text.contains("you imported are kept"));
+    }
+
+    fn mix_card() -> CollectionRow {
+        collection_row(
+            Playlist::minimal("p.1", CollectionKind::Playlist, "Mix"),
+            None,
+        )
+    }
+
+    #[test]
+    fn finished_queue_rows_should_not_make_a_card_downloaded() {
+        // The owner's "Mix 2026": the queue still holds "done" rows (and the
+        // pins remain) after the downloads were cancelled or removed.
+        let mut row = mix_card();
+        row.pinned = true;
+        let progress = HashMap::from([("p.1".to_owned(), ("done".to_owned(), 1.0))]);
+        set_collection_dl(&mut row, &progress);
+        apply_collection_download(
+            &mut row,
+            CollectionDownload {
+                songs: 206,
+                complete: 0,
+                with_audio: 0,
+                linked: 0,
+            },
+        );
+        assert_eq!((row.downloaded, row.partial), (false, false));
+    }
+
+    #[test]
+    fn card_should_show_how_much_of_a_partial_collection_is_downloaded() {
+        let mut row = mix_card();
+        apply_collection_download(
+            &mut row,
+            CollectionDownload {
+                songs: 206,
+                complete: 3,
+                with_audio: 3,
+                linked: 0,
+            },
+        );
+        assert_eq!(
+            (row.downloaded, row.partial, row.dl_done, row.dl_total),
+            (false, true, 3, 206)
+        );
+    }
+
+    #[test]
+    fn card_should_be_downloaded_when_every_song_is_complete() {
+        let mut row = mix_card();
+        let changed = apply_collection_download(
+            &mut row,
+            CollectionDownload {
+                songs: 2,
+                complete: 2,
+                with_audio: 2,
+                linked: 2,
+            },
+        );
+        assert_eq!((changed, row.downloaded, row.partial), (true, true, false));
+    }
+
+    #[test]
+    fn card_should_be_saved_elsewhere_when_others_pin_its_complete_songs() {
+        let mut row = mix_card();
+        apply_collection_download(
+            &mut row,
+            CollectionDownload {
+                songs: 3,
+                complete: 3,
+                with_audio: 3,
+                linked: 1,
+            },
+        );
+        assert_eq!(
+            (row.downloaded, row.partial, row.elsewhere),
+            (false, false, true)
+        );
+    }
+
+    #[test]
+    fn detail_should_start_from_a_saved_elsewhere_card() {
+        let mut row = mix_card();
+        apply_collection_download(
+            &mut row,
+            CollectionDownload {
+                songs: 3,
+                complete: 3,
+                with_audio: 3,
+                linked: 0,
+            },
+        );
+        assert_eq!(
+            row_download(&row).state(),
+            CollectionDownloadState::SavedElsewhere
+        );
+    }
+
+    fn on_disk(id: &str, catalog: &str) -> Track {
+        Track {
+            catalog_id: Some(catalog.to_owned()),
+            audio: cider_offline_core::storage::TrackAudio::normal(format!("media/{catalog}.m4a")),
+            ..Track::minimal(id, "Title", "Artist")
+        }
+    }
+
+    fn not_on_disk(id: &str, catalog: &str) -> Track {
+        Track {
+            catalog_id: Some(catalog.to_owned()),
+            ..Track::minimal(id, "Title", "Artist")
+        }
+    }
+
+    #[test]
+    fn collection_plan_should_link_songs_already_on_disk() {
+        let tracks = [on_disk("i.1", "1"), not_on_disk("i.2", "2")];
+        let plan = CollectionPlan::of(&tracks, DownloadFormat::Stereo, &HashMap::new());
+        assert_eq!(plan.keys, ["1", "2"]);
+    }
+
+    #[test]
+    fn collection_plan_should_queue_only_songs_missing_a_mix() {
+        let tracks = [on_disk("i.1", "1"), not_on_disk("i.2", "2")];
+        let plan = CollectionPlan::of(&tracks, DownloadFormat::Stereo, &HashMap::new());
+        let missing: Vec<&str> = plan.missing.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(missing, ["i.2"]);
+    }
+
+    #[test]
+    fn collection_plan_should_queue_nothing_when_every_file_exists() {
+        let tracks = [on_disk("i.1", "1"), on_disk("i.2", "2")];
+        let plan = CollectionPlan::of(&tracks, DownloadFormat::Stereo, &HashMap::new());
+        assert_eq!(plan.missing.len(), 0);
+    }
+
+    #[test]
+    fn link_message_should_count_the_linked_songs() {
+        assert_eq!(
+            download_collection_message(0, 11, "album"),
+            "Linked 11 songs to this album. Nothing had to be downloaded."
+        );
+    }
+
+    #[test]
+    fn link_message_should_name_one_song_in_the_singular() {
+        assert_eq!(
+            download_collection_message(0, 1, "playlist"),
+            "Linked 1 song to this playlist. Nothing had to be downloaded."
+        );
+    }
+
+    #[test]
+    fn download_message_should_count_the_queued_songs() {
+        assert_eq!(
+            download_collection_message(3, 8, "album"),
+            "Added 3 songs to the download queue."
+        );
+    }
+
+    #[test]
+    fn download_message_should_say_when_nothing_changed() {
+        assert_eq!(
+            download_collection_message(0, 0, "playlist"),
+            "Every song in this playlist is already downloaded."
+        );
+    }
+
+    #[test]
+    fn unchanged_summary_should_not_notify_the_card() {
+        let mut row = mix_card();
+        let summary = CollectionDownload {
+            songs: 2,
+            complete: 1,
+            with_audio: 1,
+            linked: 2,
+        };
+        apply_collection_download(&mut row, summary);
+        assert!(!apply_collection_download(&mut row, summary));
+    }
+
+    #[test]
+    fn detail_should_start_from_the_card_state() {
+        let mut row = mix_card();
+        let summary = CollectionDownload {
+            songs: 5,
+            complete: 2,
+            with_audio: 2,
+            linked: 5,
+        };
+        apply_collection_download(&mut row, summary);
+        assert_eq!(row_download(&row).state(), summary.state());
+    }
+
+    #[test]
+    fn summarize_members_should_count_a_song_listed_twice_once() {
+        let mut a = track("i.1");
+        a.track.audio = cider_offline_core::storage::TrackAudio::normal("a.m4a");
+        let info = summarize_members(&[a.clone(), a, track("i.2")], DownloadFormat::Stereo);
+        assert_eq!(
+            (info.songs, info.download.songs, info.download.complete),
+            (3, 2, 1)
+        );
+    }
+
+    #[test]
     fn summarize_members_should_sum_known_durations() {
         let mut a = track("i.1");
         a.track.duration_ms = Some(60_000);
         let b = track("i.2");
-        assert_eq!(summarize_members(&[a, b]).total_ms, 60_000);
+        assert_eq!(
+            summarize_members(&[a, b], DownloadFormat::Stereo).total_ms,
+            60_000
+        );
     }
 
     #[test]
     fn summarize_members_should_be_complete_only_with_all_audio() {
         let mut a = track("i.1");
-        a.track.audio_path = Some("a.m4a".into());
+        a.track.audio = cider_offline_core::storage::TrackAudio::normal("a.m4a");
         let b = track("i.2");
-        assert!(!summarize_members(&[a, b]).complete);
+        assert_eq!(
+            summarize_members(&[a, b], DownloadFormat::Stereo)
+                .download
+                .state(),
+            CollectionDownloadState::Partial
+        );
+    }
+
+    fn stereo_only(id: &str, spatial_known: Option<bool>) -> LibraryTrack {
+        let mut track = track(id);
+        track.track.audio = cider_offline_core::storage::TrackAudio::normal("a.m4a");
+        track.spatial_known = spatial_known;
+        track
+    }
+
+    #[test]
+    fn stereo_only_atmos_song_should_be_incomplete_for_stereo_and_spatial() {
+        let info = summarize_members(&[stereo_only("i.1", Some(true))], DownloadFormat::Both);
+        assert_eq!(info.download.complete, 0);
+    }
+
+    #[test]
+    fn stereo_only_song_without_spatial_should_be_complete_for_stereo_and_spatial() {
+        let info = summarize_members(&[stereo_only("i.1", Some(false))], DownloadFormat::Both);
+        assert_eq!(info.download.state(), CollectionDownloadState::Downloaded);
+    }
+
+    #[test]
+    fn stereo_only_atmos_song_should_be_incomplete_for_spatial_where_available() {
+        let info = summarize_members(
+            &[stereo_only("i.1", Some(true))],
+            DownloadFormat::SpatialWhereAvailable,
+        );
+        assert_eq!(info.download.complete, 0);
+    }
+
+    #[test]
+    fn stereo_only_song_should_be_complete_for_stereo_only() {
+        let info = summarize_members(&[stereo_only("i.1", None)], DownloadFormat::Stereo);
+        assert_eq!(info.download.state(), CollectionDownloadState::Downloaded);
+    }
+
+    #[test]
+    fn track_row_should_mark_a_spatial_mix() {
+        let mut a = track("i.1");
+        a.track
+            .audio
+            .set(AudioVariant::Spatial, Some("a.spatial.m4a".into()));
+        let row = track_row(a.track, None, false);
+        assert_eq!((row.has_audio, row.has_spatial), (true, true));
+    }
+
+    #[test]
+    fn track_row_should_not_mark_a_stereo_only_song_spatial() {
+        let mut a = track("i.1");
+        a.track.audio = cider_offline_core::storage::TrackAudio::normal("a.m4a");
+        assert!(!track_row(a.track, None, false).has_spatial);
     }
 
     #[test]

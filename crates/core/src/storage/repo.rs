@@ -9,10 +9,12 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::StorageError;
 use super::models::{
-    CUSTOM_SONG_ID_PREFIX, CacheEntry, CollectionKind, CustomAudio, CustomAudioMode, LyricsQuality,
-    LyricsSource, NewCustomCollection, NewCustomTrack, Playlist, TokenKind, Track, TrackMapping,
+    AudioFile, AudioVariant, CUSTOM_SONG_ID_PREFIX, CacheEntry, CollectionKind, CustomAudio,
+    CustomAudioMode, LyricsQuality, LyricsSource, NewCustomCollection, NewCustomTrack, Playlist,
+    TokenKind, Track, TrackAudio, TrackMapping,
 };
 use super::paths::PathCodec;
+use super::songs::{self, SONG_OF_P1};
 
 pub(super) fn now_unix() -> i64 {
     SystemTime::now()
@@ -118,14 +120,33 @@ pub(super) fn clear_http_cache(conn: &Connection) -> Result<usize, StorageError>
 
 // ----- Tracks -----------------------------------------------------------------
 
-/// Columns of [`Track`], in `track_from_row` order. `catalog_id` is last so the
-/// first columns keep their indices.
-pub(super) const TRACK_COLUMNS: &str = "id, title, artist, album, duration_ms, artwork_url, \
-     metadata, album_artist, composer, genre, track_number, disc_number, release_date, isrc, url, \
-     has_lyrics, has_time_synced_lyrics, content_rating, is_custom, real_album_id, audio_mode, \
-     reference_track_id, audio_path, lyrics_source, catalog_id, in_library, lyrics_quality";
+/// Columns of [`Track`], in `track_from_row` order, over a `tracks` row
+/// aliased `t` (every query selecting them must say `FROM tracks t`, or name
+/// an equivalent subquery `t`). The audio variants come from `track_audio`.
+///
+/// `metadata` is the song's own resource (the catalog one), else the resource
+/// of one of its aliases (a saved library copy first), so callers always see
+/// what Apple said about the song. `catalog_id` is the song id when that is a
+/// catalog id: all digits, like [`super::songs::is_catalog_id`].
+pub(super) const TRACK_COLUMNS: &str = "t.id, t.title, t.artist, t.album, t.duration_ms, \
+     t.artwork_url, COALESCE(t.metadata, (SELECT ta.metadata FROM track_aliases ta \
+       WHERE ta.track_id = t.id AND ta.metadata IS NOT NULL \
+       ORDER BY ta.in_library DESC, ta.alias LIMIT 1)), \
+     t.album_artist, t.composer, t.genre, t.track_number, \
+     t.disc_number, t.release_date, t.isrc, t.url, t.has_lyrics, t.has_time_synced_lyrics, \
+     t.content_rating, t.is_custom, t.real_album_id, t.audio_mode, t.reference_track_id, \
+     (SELECT a.path FROM track_audio a WHERE a.track_id = t.id AND a.variant = 'stereo'), \
+     t.lyrics_source, CASE WHEN t.id <> '' AND t.id NOT GLOB '*[^0-9]*' THEN t.id END, \
+     t.in_library, t.lyrics_quality, \
+     (SELECT a.path FROM track_audio a WHERE a.track_id = t.id AND a.variant = 'spatial')";
 
-/// Row mapper for [`TRACK_COLUMNS`], resolving `audio_path` through `codec`.
+/// Number of [`TRACK_COLUMNS`]; a query may append its own columns after them.
+pub(super) const TRACK_COLUMN_COUNT: usize = 28;
+
+/// SQL predicate: the track row `t` has at least one audio variant.
+pub(super) const HAS_AUDIO: &str = "EXISTS (SELECT 1 FROM track_audio a WHERE a.track_id = t.id)";
+
+/// Row mapper for [`TRACK_COLUMNS`], resolving audio paths through `codec`.
 pub(super) fn track_from_row(
     codec: &PathCodec,
 ) -> impl Fn(&Row<'_>) -> rusqlite::Result<Track> + '_ {
@@ -165,9 +186,14 @@ fn track_from_row_with(codec: &PathCodec, row: &Row<'_>) -> rusqlite::Result<Tra
         real_album_id: row.get(19)?,
         audio_mode,
         reference_track_id: row.get(21)?,
-        audio_path: row
-            .get::<_, Option<String>>(22)?
-            .map(|stored| codec.decode(&stored)),
+        audio: TrackAudio {
+            normal: row
+                .get::<_, Option<String>>(22)?
+                .map(|stored| codec.decode(&stored)),
+            spatial: row
+                .get::<_, Option<String>>(27)?
+                .map(|stored| codec.decode(&stored)),
+        },
         lyrics_source: LyricsSource::parse(&lyrics)
             .ok_or_else(|| conversion_error(23, format!("unknown lyrics source {lyrics:?}")))?,
         in_library: row.get(25)?,
@@ -184,25 +210,36 @@ pub(super) fn upsert_track(
     conn: &Connection,
     codec: &PathCodec,
     track: &Track,
+    rekeys: &mut Vec<songs::SongRekey>,
 ) -> Result<(), StorageError> {
-    let audio_path = track
-        .audio_path
-        .as_deref()
-        .map(|path| codec.encode(path))
-        .transpose()?;
+    // No lyrics means no quality (a CHECK on `tracks`).
+    let lyrics_quality = if track.lyrics_source == LyricsSource::None {
+        LyricsQuality::None
+    } else {
+        track.lyrics_quality
+    };
+    // `track.id` may be any id of the song; its columns land on the song row.
+    let song = songs::claim(conn, &track.id, track.catalog_id.as_deref(), rekeys)?;
+    let own_resource = song == track.id;
+    // `metadata` is the resource under `track.id`. On the song row it is
+    // stored only when it describes the song itself: a `Track` read back
+    // carries an alias's resource when the song has none of its own.
+    let song_metadata = track.metadata.as_deref().filter(|metadata| {
+        own_resource && songs::resource_id(metadata).is_none_or(|id| id == song)
+    });
     conn.execute(
         "INSERT INTO tracks
            (id, title, artist, album, duration_ms, artwork_url, metadata, album_artist, composer,
             genre, track_number, disc_number, release_date, isrc, url, has_lyrics,
             has_time_synced_lyrics, content_rating, is_custom, real_album_id, audio_mode,
-            reference_track_id, audio_path, lyrics_source, catalog_id, in_library, updated_at,
-            lyrics_quality)
+            reference_track_id, lyrics_source, in_library, updated_at, lyrics_quality)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
          ON CONFLICT(id) DO UPDATE SET
            title = excluded.title, artist = excluded.artist, album = excluded.album,
            duration_ms = excluded.duration_ms, artwork_url = excluded.artwork_url,
-           metadata = excluded.metadata, album_artist = excluded.album_artist,
+           metadata = CASE WHEN ?27 THEN excluded.metadata ELSE tracks.metadata END,
+           album_artist = excluded.album_artist,
            composer = excluded.composer, genre = excluded.genre,
            track_number = excluded.track_number, disc_number = excluded.disc_number,
            release_date = excluded.release_date, isrc = excluded.isrc, url = excluded.url,
@@ -210,21 +247,20 @@ pub(super) fn upsert_track(
            has_time_synced_lyrics = excluded.has_time_synced_lyrics,
            content_rating = excluded.content_rating, is_custom = excluded.is_custom,
            real_album_id = excluded.real_album_id, audio_mode = excluded.audio_mode,
-           reference_track_id = excluded.reference_track_id, audio_path = excluded.audio_path,
+           reference_track_id = excluded.reference_track_id,
            lyrics_source = excluded.lyrics_source,
            lyrics_quality = excluded.lyrics_quality,
-           catalog_id = COALESCE(excluded.catalog_id, tracks.catalog_id),
            -- Sticky: a later leaner capture never clears a proven membership.
            in_library = MAX(tracks.in_library, excluded.in_library),
            updated_at = excluded.updated_at",
         params![
-            track.id,
+            song,
             track.title,
             track.artist,
             track.album,
             track.duration_ms,
             track.artwork_url,
-            track.metadata,
+            song_metadata,
             track.album_artist,
             track.composer,
             track.genre,
@@ -240,14 +276,30 @@ pub(super) fn upsert_track(
             track.real_album_id,
             track.audio_mode.map(CustomAudioMode::as_str),
             track.reference_track_id,
-            audio_path,
             track.lyrics_source.as_str(),
-            track.catalog_id,
             track.in_library,
             now_unix(),
-            track.lyrics_quality.as_str(),
+            lyrics_quality.as_str(),
+            song_metadata.is_some() || (own_resource && track.metadata.is_none()),
         ],
     )?;
+    if !own_resource {
+        songs::put_alias(
+            conn,
+            &track.id,
+            &song,
+            track.metadata.as_deref(),
+            track.in_library,
+        )?;
+    }
+    // The song's audio is exactly `track.audio`, as when it was a column.
+    for variant in AudioVariant::ALL {
+        let file = track
+            .audio
+            .get(variant)
+            .map(|path| AudioFile::new(variant, path));
+        put_audio(conn, codec, &song, variant, file.as_ref())?;
+    }
     Ok(())
 }
 
@@ -258,7 +310,7 @@ pub(super) fn get_track(
 ) -> Result<Option<Track>, StorageError> {
     Ok(conn
         .query_row(
-            &format!("SELECT {TRACK_COLUMNS} FROM tracks WHERE id = ?1"),
+            &format!("SELECT {TRACK_COLUMNS} FROM tracks t WHERE t.id = {SONG_OF_P1}"),
             [id],
             track_from_row(codec),
         )
@@ -270,27 +322,146 @@ pub(super) fn list_tracks(
     codec: &PathCodec,
 ) -> Result<Vec<Track>, StorageError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {TRACK_COLUMNS} FROM tracks ORDER BY artist, album, title"
+        "SELECT {TRACK_COLUMNS} FROM tracks t ORDER BY t.artist, t.album, t.title"
     ))?;
     let rows = stmt.query_map([], track_from_row(codec))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub(super) fn delete_track(conn: &Connection, id: &str) -> Result<bool, StorageError> {
-    Ok(conn.execute("DELETE FROM tracks WHERE id = ?1", [id])? > 0)
+    Ok(conn.execute(&format!("DELETE FROM tracks WHERE id = {SONG_OF_P1}"), [id])? > 0)
 }
 
 pub(super) fn set_track_audio(
     conn: &Connection,
     codec: &PathCodec,
     id: &str,
+    variant: AudioVariant,
     audio_path: Option<&Path>,
 ) -> Result<bool, StorageError> {
-    let audio_path = audio_path.map(|path| codec.encode(path)).transpose()?;
-    Ok(conn.execute(
-        "UPDATE tracks SET audio_path = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, audio_path, now_unix()],
-    )? > 0)
+    let Some(song) = songs::song_of(conn, id)? else {
+        return Ok(false);
+    };
+    conn.execute(
+        "UPDATE tracks SET updated_at = ?2 WHERE id = ?1",
+        params![song, now_unix()],
+    )?;
+    let file = audio_path.map(|path| AudioFile::new(variant, path));
+    put_audio(conn, codec, &song, variant, file.as_ref())?;
+    Ok(true)
+}
+
+/// Records `file` as the `variant` audio of track row `track_id`, or deletes
+/// that variant with `None`. Re-recording the same path keeps its size,
+/// duration and timestamp unless new ones are given.
+fn put_audio(
+    conn: &Connection,
+    codec: &PathCodec,
+    track_id: &str,
+    variant: AudioVariant,
+    file: Option<&AudioFile>,
+) -> Result<(), StorageError> {
+    let Some(file) = file else {
+        conn.prepare_cached("DELETE FROM track_audio WHERE track_id = ?1 AND variant = ?2")?
+            .execute(params![track_id, variant.as_str()])?;
+        return Ok(());
+    };
+    // A size past i64::MAX cannot exist; record it as unknown.
+    let size = file.size.and_then(|size| i64::try_from(size).ok());
+    conn.prepare_cached(
+        "INSERT INTO track_audio (track_id, variant, path, size, duration_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (track_id, variant) DO UPDATE SET
+           path = excluded.path,
+           size = CASE WHEN excluded.path = track_audio.path
+                       THEN COALESCE(excluded.size, track_audio.size) ELSE excluded.size END,
+           duration_ms = CASE WHEN excluded.path = track_audio.path
+                              THEN COALESCE(excluded.duration_ms, track_audio.duration_ms)
+                              ELSE excluded.duration_ms END,
+           created_at = CASE WHEN excluded.path = track_audio.path
+                             THEN track_audio.created_at ELSE excluded.created_at END",
+    )?
+    .execute(params![
+        track_id,
+        variant.as_str(),
+        codec.encode(&file.path)?,
+        size,
+        file.duration_ms,
+        now_unix()
+    ])?;
+    Ok(())
+}
+
+/// The song `id` names (as a one-element list, empty when unknown), after
+/// bumping its `updated_at` (an audio change is a change of the track).
+fn touch_any(conn: &Connection, id: &str) -> Result<Vec<String>, StorageError> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "UPDATE tracks SET updated_at = ?2 WHERE id = {SONG_OF_P1} RETURNING id"
+    ))?;
+    let rows = stmt.query_map(params![id, now_unix()], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Records `file` (or deletes `variant` with `None`) on the song any of whose
+/// ids is `id`; returns how many songs matched (0 or 1).
+pub(super) fn put_audio_any(
+    conn: &Connection,
+    codec: &PathCodec,
+    id: &str,
+    variant: AudioVariant,
+    file: Option<&AudioFile>,
+) -> Result<usize, StorageError> {
+    let rows = touch_any(conn, id)?;
+    for track_id in &rows {
+        put_audio(conn, codec, track_id, variant, file)?;
+    }
+    Ok(rows.len())
+}
+
+/// Deletes every audio variant of the non-custom song any of whose ids is
+/// `id`; returns how many audio rows were deleted. A custom song's audio is
+/// the user's own and is never cleared here.
+pub(super) fn clear_audio_any(conn: &Connection, id: &str) -> Result<usize, StorageError> {
+    let deleted = conn
+        .prepare_cached(&format!(
+            "DELETE FROM track_audio WHERE track_id IN
+           (SELECT t.id FROM tracks t WHERE t.id = {SONG_OF_P1} AND t.is_custom = 0)"
+        ))?
+        .execute([id])?;
+    if deleted > 0 {
+        conn.prepare_cached(&format!(
+            "UPDATE tracks SET updated_at = ?2 WHERE id = {SONG_OF_P1}"
+        ))?
+        .execute(params![id, now_unix()])?;
+    }
+    Ok(deleted)
+}
+
+/// The audio files recorded for track row `track_id`, normal first.
+pub(super) fn track_audio_files(
+    conn: &Connection,
+    codec: &PathCodec,
+    track_id: &str,
+) -> Result<Vec<AudioFile>, StorageError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT variant, path, size, duration_ms FROM track_audio
+         WHERE track_id = (SELECT COALESCE((SELECT sa.track_id FROM track_aliases sa
+                                           WHERE sa.alias = ?1), ?1))
+         ORDER BY variant = 'spatial', variant",
+    )?;
+    let rows = stmt.query_map([track_id], |row| {
+        let variant: String = row.get(0)?;
+        Ok(AudioFile {
+            variant: AudioVariant::parse(&variant)
+                .ok_or_else(|| conversion_error(0, format!("unknown audio variant {variant:?}")))?,
+            path: codec.decode(&row.get::<_, String>(1)?),
+            size: row
+                .get::<_, Option<i64>>(2)?
+                .and_then(|size| u64::try_from(size).ok()),
+            duration_ms: row.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub(super) fn set_track_lyrics_source(
@@ -299,13 +470,18 @@ pub(super) fn set_track_lyrics_source(
     source: LyricsSource,
 ) -> Result<bool, StorageError> {
     Ok(conn.execute(
-        "UPDATE tracks SET lyrics_source = ?2, updated_at = ?3 WHERE id = ?1",
+        // No lyrics means no quality (a CHECK on `tracks`).
+        "UPDATE tracks SET lyrics_source = ?2,
+           lyrics_quality = CASE WHEN ?2 = 'none' THEN 'none' ELSE lyrics_quality END,
+           updated_at = ?3
+         WHERE id = (SELECT COALESCE((SELECT sa.track_id FROM track_aliases sa
+                                      WHERE sa.alias = ?1), ?1))",
         params![id, source.as_str(), now_unix()],
     )? > 0)
 }
 
-/// Sets the lyrics source and timing of every track whose id or catalog id is
-/// `id`; returns how many rows changed.
+/// Sets the lyrics source and timing of the song any of whose ids is `id`;
+/// returns how many rows changed (0 or 1).
 pub(super) fn set_lyrics_state_any(
     conn: &Connection,
     id: &str,
@@ -318,34 +494,86 @@ pub(super) fn set_lyrics_state_any(
         quality
     };
     Ok(conn.execute(
-        "UPDATE tracks SET lyrics_source = ?2, lyrics_quality = ?3, updated_at = ?4          WHERE id = ?1 OR catalog_id = ?1",
+        "UPDATE tracks SET lyrics_source = ?2, lyrics_quality = ?3, updated_at = ?4
+         WHERE id = COALESCE((SELECT sa.track_id FROM track_aliases sa WHERE sa.alias = ?1), ?1)",
         params![id, source.as_str(), quality.as_str(), now_unix()],
     )?)
 }
 
-/// Sets `audio_path` on every track whose id or catalog id is `id`; returns
-/// how many rows changed.
-pub(super) fn set_audio_any(
-    conn: &Connection,
-    codec: &PathCodec,
-    id: &str,
-    audio_path: Option<&Path>,
-) -> Result<usize, StorageError> {
-    let audio_path = audio_path.map(|path| codec.encode(path)).transpose()?;
-    Ok(conn.execute(
-        "UPDATE tracks SET audio_path = ?2, updated_at = ?3 WHERE id = ?1 OR catalog_id = ?1",
-        params![id, audio_path, now_unix()],
-    )?)
-}
-
-/// Catalog ids (or ids of catalog-native rows) of real tracks without a
-/// recorded audio file, deduplicated.
+/// Song ids (download keys) of real songs without any recorded audio variant.
 pub(super) fn ids_missing_audio(conn: &Connection) -> Result<Vec<String>, StorageError> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT COALESCE(catalog_id, id) FROM tracks          WHERE audio_path IS NULL AND is_custom = 0",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.id FROM tracks t
+         WHERE t.is_custom = 0 AND NOT {HAS_AUDIO}"
+    ))?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The subset of `ids` that name a song with local audio: a recorded audio
+/// file (any variant) or a track mapping. Any id of the song counts (its
+/// catalog id, a library id, an `a.…` id). File existence is not checked.
+pub(super) fn ids_with_local_audio(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>, StorageError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM track_audio a
+                        WHERE a.track_id = COALESCE((SELECT sa.track_id FROM track_aliases sa
+                                                     WHERE sa.alias = ?1), ?1))
+             OR EXISTS (SELECT 1 FROM track_mappings m
+                        WHERE m.track_id IN (?1, COALESCE((SELECT sa.track_id
+                                                           FROM track_aliases sa
+                                                           WHERE sa.alias = ?1), ?1)))",
+    )?;
+    let mut found = std::collections::HashSet::new();
+    for id in ids {
+        if stmt.query_row([id], |row| row.get::<_, bool>(0))? {
+            found.insert(id.clone());
+        }
+    }
+    Ok(found)
+}
+
+/// Which variants the songs named by `ids` have locally, for the ids that
+/// have any: a track mapping counts as the normal variant. Any id of a song
+/// counts; file existence is not checked.
+pub(super) fn local_variants(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<AudioVariant>>, StorageError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT
+           EXISTS (SELECT 1 FROM track_audio a
+                   WHERE a.track_id = COALESCE((SELECT sa.track_id FROM track_aliases sa
+                                                WHERE sa.alias = ?1), ?1)
+                     AND a.variant = 'stereo')
+             OR EXISTS (SELECT 1 FROM track_mappings m
+                        WHERE m.track_id IN (?1, COALESCE((SELECT sa.track_id
+                                                           FROM track_aliases sa
+                                                           WHERE sa.alias = ?1), ?1))),
+           EXISTS (SELECT 1 FROM track_audio a
+                   WHERE a.track_id = COALESCE((SELECT sa.track_id FROM track_aliases sa
+                                                WHERE sa.alias = ?1), ?1)
+                     AND a.variant = 'spatial')",
+    )?;
+    let mut found = std::collections::HashMap::new();
+    for id in ids {
+        let (normal, spatial) = stmt.query_row([id], |row| {
+            Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?))
+        })?;
+        let variants: Vec<AudioVariant> = [
+            (normal, AudioVariant::Stereo),
+            (spatial, AudioVariant::Spatial),
+        ]
+        .into_iter()
+        .filter_map(|(present, variant)| present.then_some(variant))
+        .collect();
+        if !variants.is_empty() {
+            found.insert(id.clone(), variants);
+        }
+    }
+    Ok(found)
 }
 
 // ----- Playlists / albums -----------------------------------------------------
@@ -498,8 +726,12 @@ pub(super) fn set_track_mapping(
     mapping: &TrackMapping,
 ) -> Result<(), StorageError> {
     conn.execute(
-        "INSERT INTO track_mappings (track_id, file_path, created_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(track_id) DO UPDATE SET file_path = excluded.file_path",
+        // Keyed on the song id, whichever id of the song is given.
+        &format!(
+            "INSERT INTO track_mappings (track_id, file_path, created_at)
+             VALUES ({SONG_OF_P1}, ?2, ?3)
+             ON CONFLICT(track_id) DO UPDATE SET file_path = excluded.file_path"
+        ),
         params![
             mapping.track_id,
             codec.encode(&mapping.file_path)?,
@@ -525,7 +757,10 @@ pub(super) fn get_track_mapping(
 ) -> Result<Option<TrackMapping>, StorageError> {
     Ok(conn
         .query_row(
-            "SELECT track_id, file_path FROM track_mappings WHERE track_id = ?1",
+            &format!(
+                "SELECT track_id, file_path FROM track_mappings
+                 WHERE track_id IN (?1, {SONG_OF_P1}) ORDER BY track_id = ?1 DESC LIMIT 1"
+            ),
             [track_id],
             mapping_from_row(codec),
         )
@@ -546,33 +781,43 @@ pub(super) fn delete_track_mapping(
     conn: &Connection,
     track_id: &str,
 ) -> Result<bool, StorageError> {
-    Ok(conn.execute("DELETE FROM track_mappings WHERE track_id = ?1", [track_id])? > 0)
+    Ok(conn.execute(
+        &format!("DELETE FROM track_mappings WHERE track_id IN (?1, {SONG_OF_P1})"),
+        [track_id],
+    )? > 0)
 }
 
 // ----- Custom items (rich API over the unified `tracks` / `playlists` model) ---
 
-type AudioColumns<'a> = (Option<&'static str>, Option<String>, Option<&'a str>);
+/// `(audio_mode, reference_track_id)` of a custom song's audio provenance.
+fn audio_columns(audio: &CustomAudio) -> (Option<&'static str>, Option<&str>) {
+    match audio {
+        CustomAudio::None => (None, None),
+        CustomAudio::LocalCopy(_) => (Some(CustomAudioMode::LocalCopy.as_str()), None),
+        CustomAudio::Reference(id) => (Some(CustomAudioMode::Reference.as_str()), Some(id)),
+    }
+}
 
-fn audio_columns<'a>(
+/// Makes a custom song's audio rows match `audio`: a local copy is its only
+/// (normal) variant; reference mode and no audio record no file.
+fn put_custom_audio(
+    conn: &Connection,
     codec: &PathCodec,
-    audio: &'a CustomAudio,
-) -> Result<AudioColumns<'a>, StorageError> {
-    // (audio_mode, audio_path, reference_track_id)
-    Ok(match audio {
-        CustomAudio::None => (None, None, None),
-        CustomAudio::LocalCopy(path) => (
-            Some(CustomAudioMode::LocalCopy.as_str()),
-            Some(codec.encode(path)?),
-            None,
-        ),
-        CustomAudio::Reference(id) => (Some(CustomAudioMode::Reference.as_str()), None, Some(id)),
-    })
+    id: &str,
+    audio: &CustomAudio,
+) -> Result<(), StorageError> {
+    let normal = match audio {
+        CustomAudio::LocalCopy(path) => Some(AudioFile::new(AudioVariant::Stereo, path)),
+        CustomAudio::None | CustomAudio::Reference(_) => None,
+    };
+    put_audio(conn, codec, id, AudioVariant::Stereo, normal.as_ref())?;
+    put_audio(conn, codec, id, AudioVariant::Spatial, None)
 }
 
 fn custom_track_to_track(id: String, new: &NewCustomTrack) -> Result<Track, StorageError> {
-    let audio_path = match &new.audio {
-        CustomAudio::LocalCopy(path) => Some(PathBuf::from(path_str(path)?)),
-        CustomAudio::None | CustomAudio::Reference(_) => None,
+    let audio = match &new.audio {
+        CustomAudio::LocalCopy(path) => TrackAudio::normal(PathBuf::from(path_str(path)?)),
+        CustomAudio::None | CustomAudio::Reference(_) => TrackAudio::default(),
     };
     let (audio_mode, reference_track_id) = match &new.audio {
         CustomAudio::None => (None, None),
@@ -605,7 +850,7 @@ fn custom_track_to_track(id: String, new: &NewCustomTrack) -> Result<Track, Stor
         real_album_id: new.real_album_id.clone(),
         audio_mode,
         reference_track_id,
-        audio_path,
+        audio,
         lyrics_source: LyricsSource::None,
         lyrics_quality: LyricsQuality::None,
         in_library: false,
@@ -622,7 +867,8 @@ pub(super) fn create_custom_track(
     let n = next_seq(conn, "song")?;
     let id = format!("{CUSTOM_SONG_ID_PREFIX}{n}");
     let track = custom_track_to_track(id.clone(), new)?;
-    upsert_track(conn, codec, &track)?;
+    // A custom song has no catalog id, so nothing is re-keyed.
+    upsert_track(conn, codec, &track, &mut Vec::new())?;
     Ok(id)
 }
 
@@ -634,15 +880,14 @@ pub(super) fn update_custom_track(
     id: &str,
     new: &NewCustomTrack,
 ) -> Result<bool, StorageError> {
-    let (audio_mode, audio_path, reference_track_id) = audio_columns(codec, &new.audio)?;
-    Ok(conn.execute(
+    let (audio_mode, reference_track_id) = audio_columns(&new.audio);
+    let updated = conn.execute(
         "UPDATE tracks SET
            title = ?2, artist = ?3, album = ?4, duration_ms = ?5, artwork_url = ?6,
            metadata = COALESCE(?7, metadata), album_artist = ?8, composer = ?9, genre = ?10,
            track_number = ?11, disc_number = ?12, release_date = ?13, isrc = ?14, url = ?15,
            has_lyrics = ?16, has_time_synced_lyrics = ?17, content_rating = ?18,
-           real_album_id = ?19, audio_mode = ?20, audio_path = ?21, reference_track_id = ?22,
-           updated_at = ?23
+           real_album_id = ?19, audio_mode = ?20, reference_track_id = ?21, updated_at = ?22
          WHERE id = ?1 AND is_custom = 1",
         params![
             id,
@@ -665,11 +910,14 @@ pub(super) fn update_custom_track(
             new.content_rating,
             new.real_album_id,
             audio_mode,
-            audio_path,
             reference_track_id,
             now_unix()
         ],
-    )? > 0)
+    )? > 0;
+    if updated {
+        put_custom_audio(conn, codec, id, &new.audio)?;
+    }
+    Ok(updated)
 }
 
 /// Sets a custom song's audio provenance; returns whether a custom row existed.
@@ -679,13 +927,16 @@ pub(super) fn set_custom_track_audio(
     id: &str,
     audio: &CustomAudio,
 ) -> Result<bool, StorageError> {
-    let (audio_mode, audio_path, reference_track_id) = audio_columns(codec, audio)?;
-    Ok(conn.execute(
-        "UPDATE tracks SET audio_mode = ?2, audio_path = ?3, reference_track_id = ?4,
-           updated_at = ?5
+    let (audio_mode, reference_track_id) = audio_columns(audio);
+    let updated = conn.execute(
+        "UPDATE tracks SET audio_mode = ?2, reference_track_id = ?3, updated_at = ?4
          WHERE id = ?1 AND is_custom = 1",
-        params![id, audio_mode, audio_path, reference_track_id, now_unix()],
-    )? > 0)
+        params![id, audio_mode, reference_track_id, now_unix()],
+    )? > 0;
+    if updated {
+        put_custom_audio(conn, codec, id, audio)?;
+    }
+    Ok(updated)
 }
 
 /// Lists every custom song (ordered by allocation).
@@ -694,8 +945,8 @@ pub(super) fn list_custom_tracks(
     codec: &PathCodec,
 ) -> Result<Vec<Track>, StorageError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {TRACK_COLUMNS} FROM tracks WHERE is_custom = 1
-         ORDER BY CAST(substr(id, length('{CUSTOM_SONG_ID_PREFIX}') + 1) AS INTEGER)"
+        "SELECT {TRACK_COLUMNS} FROM tracks t WHERE t.is_custom = 1
+         ORDER BY CAST(substr(t.id, length('{CUSTOM_SONG_ID_PREFIX}') + 1) AS INTEGER)"
     ))?;
     let rows = stmt.query_map([], track_from_row(codec))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -708,8 +959,8 @@ pub(super) fn tracks_in_real_album(
     real_album_id: &str,
 ) -> Result<Vec<Track>, StorageError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {TRACK_COLUMNS} FROM tracks WHERE real_album_id = ?1
-         ORDER BY disc_number, track_number, title"
+        "SELECT {TRACK_COLUMNS} FROM tracks t WHERE t.real_album_id = ?1
+         ORDER BY t.disc_number, t.track_number, t.title"
     ))?;
     let rows = stmt.query_map([real_album_id], track_from_row(codec))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

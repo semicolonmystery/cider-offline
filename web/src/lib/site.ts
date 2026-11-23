@@ -6,7 +6,7 @@ export const SITE_NAME = "Cider Offline";
 export const SITE_TAGLINE = "Use Cider (Apple Music client) offline";
 export const SITE_TITLE = `${SITE_NAME}: ${SITE_TAGLINE}`;
 export const SITE_DESCRIPTION =
-  "A local proxy that caches your Apple Music library, downloads songs and lyrics, and serves them to Cider when you're offline.";
+  "A local proxy that keeps a copy of your Apple Music library, saves songs and lyrics for offline playback, and plays them in Cider when you're offline.";
 export const SITE_HOST = new URL(SITE_URL).host;
 export const REPO_URL = "https://github.com/semicolonmystery/cider-offline";
 export const SPONSOR_URL = "https://github.com/sponsors/semicolonmystery";

@@ -214,6 +214,7 @@ impl AppContext {
                 tracing::debug!(%error, "could not hide the window");
             }
         });
+        super::overview::window_hidden(self);
         platform::set_dock_visible(false);
     }
 

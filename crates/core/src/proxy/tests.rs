@@ -344,6 +344,10 @@ async fn local_media_should_be_served_with_range() {
 async fn web_playback_for_local_track_should_point_to_media_url() {
     let dir = tempfile::tempdir().unwrap();
     let handle = start(&dir, Mode::Active, None).await;
+    // Whether 555 is a Dolby Atmos song is unknown and can't be looked up
+    // (no tokens); with Cider's spatial audio off only normal is wanted, so
+    // the local file answers (see `crate::routing`).
+    handle.set_cider_spatial(crate::routing::CiderSpatial::Off);
     let file = dir.path().join("song.m4a");
     std::fs::write(&file, b"m4a").unwrap();
     handle
@@ -547,6 +551,10 @@ async fn custom_song_audio_should_be_served_online() {
 async fn audio_override_should_win_over_downloaded_file_online() {
     let dir = tempfile::tempdir().unwrap();
     let handle = start(&dir, Mode::Active, None).await;
+    // Whether 555 is a Dolby Atmos song is unknown and can't be looked up
+    // (no tokens); with Cider's spatial audio off only normal is wanted, so
+    // the local file answers (see `crate::routing`).
+    handle.set_cider_spatial(crate::routing::CiderSpatial::Off);
     let downloaded = dir.path().join("downloaded.m4a");
     let mine = dir.path().join("mine.m4a");
     std::fs::write(&downloaded, b"downloaded").unwrap();
@@ -557,7 +565,11 @@ async fn audio_override_should_win_over_downloaded_file_online() {
         .await
         .unwrap();
     storage
-        .set_track_audio("555", Some(downloaded))
+        .set_track_audio(
+            "555",
+            crate::storage::AudioVariant::Stereo,
+            Some(downloaded),
+        )
         .await
         .unwrap();
     storage

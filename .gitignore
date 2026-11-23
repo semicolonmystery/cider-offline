@@ -18,7 +18,7 @@ web/*.tsbuildinfo
 captures/
 data/
 
-# Keys and certificates (the bundled default Widevine device is the only exception)
+# Keys and certificates (the bundled default device file is the only exception)
 *.pem
 *.key
 *.p12

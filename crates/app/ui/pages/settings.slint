@@ -1,9 +1,9 @@
 import { SpinBox, Switch, ScrollView, ComboBox, CheckBox } from "std-widgets.slint";
 import {
     Theme, Icons, Icon, IconButton, ActionButton, Group, GroupHeading, ListRow, RowSeparator,
-    PageTitle,
+    PageTitle, Dot,
 } from "../components.slint";
-import { SettingsState } from "../globals.slint";
+import { SettingsState, ProxyState, CiderState } from "../globals.slint";
 
 /// A heading plus its grouped inset list.
 component Section inherits VerticalLayout {
@@ -22,6 +22,41 @@ component Section inherits VerticalLayout {
 /// Settings page: grouped inset lists.
 export component SettingsPage inherits Rectangle {
     property <length> pad: root.width >= 1100px ? 32px : 24px;
+    // Certificate row status line (dot + text under the row title). States
+    // come from `TrustState::ui_key`: trusted, untrusted, error; plus checking.
+    property <string> trust-status: ProxyState.trust-busy ? "Working…"
+        : ProxyState.trust-state == "trusted"
+        ? (ProxyState.trust-message != "" ? ProxyState.trust-message : "Trusted by this computer")
+        : ProxyState.trust-state == "untrusted" ? "Not installed"
+        : ProxyState.trust-state == "checking" ? "Checking…" : "Needs attention";
+    property <color> trust-tone: ProxyState.trust-busy || ProxyState.trust-state == "checking" ? Theme.text-tertiary
+        : ProxyState.trust-state == "trusted" ? Theme.ok
+        : ProxyState.trust-state == "untrusted" ? Theme.warn : Theme.error;
+
+    // Mounted each time the page opens: re-count the unlinked downloads, and
+    // scroll to the section the Overview's issue line asked for.
+    init => {
+        SettingsState.refresh-unlinked();
+        root.reveal(SettingsState.focus-section);
+        SettingsState.focus-section = "";
+    }
+
+    function reveal(section: string) {
+        if section == "" {
+            return;
+        }
+        // Put the section's heading at the top, as far as the page scrolls.
+        scroll.content-y = min(0px, max(
+            -(section == "certificate" ? certificate.y
+                : section == "cider" ? cider.y
+                : section == "startup" ? startup.y
+                : section == "downloads" ? downloads.y
+                : section == "library" ? library.y
+                : section == "lyrics" ? lyrics.y
+                : section == "storage" ? storage.y
+                : proxy.y),
+            scroll.visible-height - scroll.content-height));
+    }
 
     VerticalLayout {
         padding-left: root.pad;
@@ -35,7 +70,7 @@ export component SettingsPage inherits Rectangle {
             subtitle: SettingsState.message;
         }
 
-        ScrollView {
+        scroll := ScrollView {
             vertical-stretch: 1;
             VerticalLayout {
                 alignment: start;
@@ -44,8 +79,43 @@ export component SettingsPage inherits Rectangle {
                 // Keep clear of the scrollbar.
                 padding-right: 12px;
 
-                Section {
+                proxy := Section {
                     title: "Proxy";
+                    ListRow {
+                        title: ProxyState.starting ? "Starting…"
+                            : !ProxyState.running ? "Proxy stopped"
+                            : ProxyState.online ? "Online" : "Offline, serving from this computer";
+                        description: ProxyState.last-error != "" ? ProxyState.last-error
+                            : ProxyState.running && ProxyState.online ? "Apple Music is reachable." : "";
+                        Dot {
+                            tone: !ProxyState.running ? Theme.error : ProxyState.online ? Theme.ok : Theme.warn;
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Address";
+                        description: ProxyState.address;
+                        address := TextInput {
+                            width: 0px;
+                            height: 0px;
+                            read-only: true;
+                            text: ProxyState.address;
+                        }
+
+                        ActionButton {
+                            text: "Copy";
+                            clicked => {
+                                address.select-all();
+                                address.copy();
+                                address.clear-selection();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
                     ListRow {
                         title: "Port";
                         description: "Cider must use 127.0.0.1 and this port as its HTTP and HTTPS proxy. Changing it restarts the proxy.";
@@ -65,9 +135,133 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
                     }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Apple Music session";
+                        status: ProxyState.session-captured ? "Captured" : "Not captured yet";
+                        status-tone: ProxyState.session-captured ? Theme.ok : Theme.warn;
+                        description: ProxyState.session-captured
+                            ? "Taken from Cider's requests. Library sync and downloads use it."
+                            : "Play a song in Cider while it uses the proxy in Active mode. Library sync and downloads need it.";
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Requests seen";
+                        Text {
+                            text: ProxyState.requests-seen;
+                            font-size: Theme.body;
+                            color: Theme.text-secondary;
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Served from this computer";
+                        Text {
+                            text: ProxyState.served-locally;
+                            font-size: Theme.body;
+                            color: Theme.text-secondary;
+                        }
+                    }
                 }
 
-                Section {
+                certificate := Section {
+                    title: "Certificate";
+                    ListRow {
+                        title: "Certificate";
+                        status: root.trust-status;
+                        status-tone: root.trust-tone;
+                        // A trusted CA's note (if any) is the status itself.
+                        description: ProxyState.trust-state == "trusted" ? "" : ProxyState.trust-message;
+
+                        if ProxyState.trust-state != "trusted" && ProxyState.trust-state != "checking": ActionButton {
+                            text: ProxyState.trust-state == "untrusted" ? "Install" : "Fix";
+                            kind: "primary";
+                            enabled: !ProxyState.trust-busy;
+                            clicked => {
+                                ProxyState.install-ca();
+                            }
+                        }
+
+                        ActionButton {
+                            text: "Check again";
+                            enabled: !ProxyState.trust-busy;
+                            clicked => {
+                                ProxyState.recheck-ca();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Uninstall certificate";
+                        description: "Remove the local certificate authority from the system. Cider stops working through the proxy in Active mode.";
+                        ActionButton {
+                            text: "Uninstall";
+                            kind: "plain";
+                            clicked => {
+                                SettingsState.uninstall-ca();
+                            }
+                        }
+                    }
+                }
+
+                cider := Section {
+                    title: "Cider";
+                    if CiderState.automatic: VerticalLayout {
+                        ListRow {
+                            title: "Route Cider through this proxy";
+                            description: !CiderState.available
+                                ? (CiderState.message != "" ? CiderState.message : "Cider's settings file was not found. Choose it to continue.")
+                                : CiderState.message != "" ? CiderState.message
+                                : CiderState.routed ? "Changing this restarts Cider." : "Turning this on edits Cider's settings and restarts it.";
+                            Switch {
+                                checked <=> CiderState.routed;
+                                enabled: CiderState.available && !CiderState.busy;
+                                toggled => {
+                                    CiderState.set-routed(self.checked);
+                                }
+                            }
+                        }
+
+                        // The settings file in use and the picker, each on its
+                        // own line: the path can be long and wraps anywhere.
+                        VerticalLayout {
+                            padding-bottom: 12px;
+                            spacing: 8px;
+                            if CiderState.config-path != "": Text {
+                                text: "Settings file: " + CiderState.config-path;
+                                wrap: char-wrap;
+                                font-size: Theme.callout;
+                                color: Theme.text-secondary;
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                ActionButton {
+                                    text: "Choose config file…";
+                                    enabled: !CiderState.busy;
+                                    clicked => {
+                                        CiderState.choose-config();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !CiderState.automatic: ListRow {
+                        title: "Use Cider with this proxy";
+                        description: CiderState.guide;
+                    }
+                }
+
+                startup := Section {
                     title: "Startup";
                     ListRow {
                         title: "Start with the system";
@@ -95,8 +289,49 @@ export component SettingsPage inherits Rectangle {
                     }
                 }
 
-                Section {
-                    title: "Library";
+                downloads := Section {
+                    title: "Downloads";
+                    ListRow {
+                        title: "Download format";
+                        description: "Which mix of a song a download saves. Spatial = the Dolby Atmos mix rendered for headphones.";
+                        ComboBox {
+                            width: 190px;
+                            model: ["Stereo only", "Spatial where available", "Stereo + Spatial"];
+                            current-index <=> SettingsState.download-format;
+                            selected => {
+                                SettingsState.set-download-format(self.current-index);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Play the other downloaded mix";
+                        description: "When Cider asks for a mix you haven't downloaded (stereo or spatial), play the one you did download instead of streaming from Apple. Offline, this always happens.";
+                        Switch {
+                            checked <=> SettingsState.play-other-mix;
+                            toggled => {
+                                SettingsState.set-play-other-mix(self.checked);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Remove lyrics when removing downloads";
+                        description: "Removing a song's download also deletes the lyrics the app fetched for it. Lyrics you imported are kept.";
+                        Switch {
+                            checked <=> SettingsState.remove-lyrics-with-downloads;
+                            toggled => {
+                                SettingsState.set-remove-lyrics-with-downloads(self.checked);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
                     ListRow {
                         title: "Download played songs";
                         description: "Off, right away, or once playback has been idle for 30 seconds.";
@@ -127,6 +362,53 @@ export component SettingsPage inherits Rectangle {
 
                     RowSeparator { }
 
+                    ListRow {
+                        title: "Unlinked downloads";
+                        description: "Downloaded songs no album, playlist or single download needs any more, for example after a song left a playlist or a playlist was deleted. Custom audio and links to local files are never touched.";
+                        ComboBox {
+                            width: 150px;
+                            model: ["Manual", "Automatically"];
+                            current-index <=> SettingsState.unlinked-mode;
+                            selected => {
+                                SettingsState.set-unlinked-mode(self.current-index);
+                            }
+                        }
+                    }
+
+                    if SettingsState.unlinked-mode == 1: RowSeparator { }
+
+                    if SettingsState.unlinked-mode == 1: ListRow {
+                        title: "Check every";
+                        description: "Hours between automatic clean-ups (1 to 168). The first one runs about 10 minutes after the app starts.";
+                        SpinBox {
+                            width: 120px;
+                            minimum: 1;
+                            maximum: 168;
+                            value <=> SettingsState.unlinked-hours;
+                            edited(value) => {
+                                SettingsState.set-unlinked-hours(value);
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Clean up now";
+                        description: SettingsState.unlinked-summary;
+                        ActionButton {
+                            text: "Clean up now…";
+                            kind: "plain";
+                            enabled: SettingsState.unlinked-count > 0;
+                            clicked => {
+                                SettingsState.clean-up-unlinked();
+                            }
+                        }
+                    }
+                }
+
+                library := Section {
+                    title: "Library";
                     ListRow {
                         title: "Detail level";
                         description: "Full keeps every song attribute for a rich library, search and lyrics. Minimal keeps only the core fields.";
@@ -170,7 +452,7 @@ export component SettingsPage inherits Rectangle {
 
                 }
 
-                Section {
+                lyrics := Section {
                     title: "Lyrics";
                     for provider[index] in SettingsState.lyrics-providers: VerticalLayout {
                         if index > 0: RowSeparator { }
@@ -320,14 +602,40 @@ export component SettingsPage inherits Rectangle {
 
                     if SettingsState.lyrics-more-open: VerticalLayout {
                         RowSeparator { }
-                        ListRow {
-                            title: "Apply the failure rule to";
-                            description: "Providers left unticked always wait and retry.";
-                            for provider in SettingsState.lyrics-providers: CheckBox {
-                                text: provider.name;
-                                checked: provider.policy;
-                                toggled => {
-                                    SettingsState.set-lyrics-policy-provider(provider.id, self.checked);
+                        // One checkbox per provider, stacked under the text:
+                        // side by side they made the page wider than the
+                        // window.
+                        VerticalLayout {
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 2px;
+                            Text {
+                                text: "Apply the failure rule to";
+                                wrap: word-wrap;
+                                font-size: Theme.body;
+                                color: Theme.text-primary;
+                            }
+
+                            Text {
+                                text: "Providers left unticked always wait and retry.";
+                                wrap: word-wrap;
+                                font-size: Theme.callout;
+                                color: Theme.text-secondary;
+                            }
+
+                            VerticalLayout {
+                                padding-top: 6px;
+                                spacing: 6px;
+                                alignment: start;
+                                for provider in SettingsState.lyrics-providers: HorizontalLayout {
+                                    alignment: start;
+                                    CheckBox {
+                                        text: provider.name;
+                                        checked: provider.policy;
+                                        toggled => {
+                                            SettingsState.set-lyrics-policy-provider(provider.id, self.checked);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -370,7 +678,7 @@ export component SettingsPage inherits Rectangle {
                     }
                 }
 
-                Section {
+                storage := Section {
                     title: "Storage";
                     ListRow {
                         title: "Data folder";
@@ -380,6 +688,20 @@ export component SettingsPage inherits Rectangle {
                             tooltip: "Open the data folder";
                             clicked => {
                                 SettingsState.open-data-dir();
+                            }
+                        }
+                    }
+
+                    RowSeparator { }
+
+                    ListRow {
+                        title: "Capture Apple traffic to disk";
+                        description: "For troubleshooting. Saved in the capture folder.";
+                        Switch {
+                            checked <=> ProxyState.capture;
+                            enabled: ProxyState.running;
+                            toggled => {
+                                ProxyState.set-capture(self.checked);
                             }
                         }
                     }
@@ -408,20 +730,6 @@ export component SettingsPage inherits Rectangle {
                             kind: "plain";
                             clicked => {
                                 SettingsState.clear-cache();
-                            }
-                        }
-                    }
-
-                    RowSeparator { }
-
-                    ListRow {
-                        title: "Uninstall certificate";
-                        description: "Remove the local certificate authority from the system. Cider stops working through the proxy in Active mode.";
-                        ActionButton {
-                            text: "Uninstall";
-                            kind: "plain";
-                            clicked => {
-                                SettingsState.uninstall-ca();
                             }
                         }
                     }

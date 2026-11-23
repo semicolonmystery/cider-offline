@@ -7,9 +7,15 @@
 //! cider-offline --screenshot out.png [--width 900] [--height 700]
 //!     [--page library|songs|detail|overview|settings] [--collection NAME]
 //!     [--search TEXT] [--dl-state idle|downloading|paused|failed|done]
-//!     [--hover X,Y] [--right-click X,Y] [--overlay add|drawer|confirm]
-//!     [--toast TEXT [--toast-error]] [--expand]
+//!     [--hover X,Y] [--click X,Y] [--right-click X,Y] [--overlay add|drawer|confirm]
+//!     [--toast TEXT [--toast-error]] [--expand] [--unlinked-auto]
 //! ```
+//!
+//! `--overlay remove` shows the "Remove downloads" confirmation of
+//! `--collection` (or the first collection) with its real counts;
+//! `--overlay cancel-all` shows the "Cancel all" confirmation of the demo
+//! drawer rows. The Settings page counts the store's unlinked downloads;
+//! `--unlinked-auto` shows them set to "Automatically".
 //!
 //! `--page detail` opens `--collection`, or the first collection of the
 //! Apple Music library when it is not given.
@@ -17,10 +23,28 @@
 //! `--expand` opens the Settings page's "More options" disclosures; the
 //! Settings page shows the lyrics settings of `config.toml`.
 //!
-//! `--page overview` shows the Overview page with demo counters and activity,
-//! with "Route Cider through this proxy" on. The settings file shown is
-//! `cider_config_path` of `config.toml`; Cider's real settings file is never
-//! located or read.
+//! `--page overview` shows the Overview page with demo counters, with "Route
+//! Cider through this proxy" on. The settings file shown (there and on the
+//! Settings page) is `cider_config_path` of `config.toml`; Cider's real
+//! settings file is never located or read. Overview options:
+//!
+//! ```text
+//!     [--mode active|passthrough] [--issue certificate|cider|session|error]
+//!     [--anim on:P|off:P] [--notes-time SECONDS]
+//!     [--sequence on|off --frames N]
+//! ```
+//!
+//! `--anim on:0.3` freezes the ON ripple at 30 % (`off:P` the OFF fade;
+//! `--mode` is set to match). `--sequence` saves `N` frames of the whole
+//! animation as `<out>-000.png`, `<out>-001.png`, … (a 30 fps timeline: the
+//! notes drift by 1/30 s per frame) instead of one shot.
+//!
+//! `--hold SECONDS` keeps the window open that long before the shot (with
+//! the Overview's notes drifting as in the app), to measure CPU and memory.
+//!
+//! `--section proxy|certificate|cider|startup|downloads|library|lyrics|storage`
+//! opens the Settings page scrolled to that section, as the Overview's "Go
+//! to Settings" link does.
 //!
 //! `--right-click` opens a native context menu, whose modal loop blocks
 //! until the menu is dismissed; capture it from the screen instead.
@@ -38,13 +62,14 @@ use slint::{ComponentHandle as _, LogicalPosition, ModelRc};
 
 use super::artwork::{self, ArtRequest, Bucket, ImageCache};
 use super::library::{
-    COLLECTION_PAGE, TRACK_PAGE, collection_slot, detail_subtitle, grid_bucket_for,
+    COLLECTION_PAGE, NamedSongs, TRACK_PAGE, collection_slot, detail_subtitle, grid_bucket_for,
     summarize_members, track_slot,
 };
 use super::paged::{Hooks, PagedModel, Slot};
 use super::{
-    ActivityRow, AppWindow, CiderState, CollectionRow, DownloadRow, DownloadsState,
-    LibraryAddState, LibraryState, LibraryUi, ProxyState, SettingsState, TrackRow, format,
+    AppWindow, CiderState, CollectionRow, DialogState, DownloadRow, DownloadsState,
+    LibraryAddState, LibraryState, LibraryUi, OverviewAnim, ProxyState, SettingsState, TrackRow,
+    format,
 };
 
 /// The flag that selects this mode.
@@ -62,10 +87,25 @@ pub struct Options {
     dl_state: Option<String>,
     hover: Option<(f32, f32)>,
     right_click: Option<(f32, f32)>,
+    click: Option<(f32, f32)>,
     overlay: String,
     toast: Option<String>,
     toast_error: bool,
     expand: bool,
+    unlinked_auto: bool,
+    /// Overview: "active" (default) or "passthrough".
+    mode: String,
+    issue: String,
+    /// Overview: a frozen animation frame, `(on, progress)`.
+    anim: Option<(bool, f32)>,
+    notes_time: f32,
+    /// Overview: save a frame sequence of the ON (`true`) or OFF animation.
+    sequence: Option<bool>,
+    frames: u32,
+    section: String,
+    /// Keep the window open (and the notes drifting) this many seconds
+    /// before the shot, so its CPU and memory can be measured.
+    hold: u32,
 }
 
 /// Returns the options when `--screenshot <out.png>` is present.
@@ -97,10 +137,25 @@ pub fn parse(args: &[String]) -> Option<Options> {
         dl_state: value("--dl-state"),
         hover: point("--hover"),
         right_click: point("--right-click"),
+        click: point("--click"),
         overlay: value("--overlay").unwrap_or_default(),
         toast: value("--toast"),
         toast_error: args.iter().any(|a| a == "--toast-error"),
         expand: args.iter().any(|a| a == "--expand"),
+        unlinked_auto: args.iter().any(|a| a == "--unlinked-auto"),
+        mode: value("--mode").unwrap_or_default(),
+        issue: value("--issue").unwrap_or_default(),
+        anim: value("--anim").and_then(|v| {
+            let (kind, progress) = v.split_once(':')?;
+            Some((kind == "on", progress.trim().parse().ok()?))
+        }),
+        notes_time: value("--notes-time")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12.0),
+        sequence: value("--sequence").map(|kind| kind == "on"),
+        frames: value("--frames").and_then(|v| v.parse().ok()).unwrap_or(48),
+        section: value("--section").unwrap_or_default(),
+        hold: value("--hold").and_then(|v| v.parse().ok()).unwrap_or(0),
     })
 }
 
@@ -111,6 +166,11 @@ struct Loaded {
     total_tracks: usize,
     total_collections: usize,
     detail: Option<cider_offline_core::LibraryCollection>,
+    /// Collections with a download pin, and those set to "Keep downloaded".
+    pinned: Vec<String>,
+    kept: Vec<String>,
+    /// How much of each shown collection (and the detail) is downloaded.
+    summaries: HashMap<String, cider_offline_core::CollectionDownload>,
 }
 
 /// Renders the view and writes the PNG.
@@ -133,15 +193,7 @@ pub fn run(options: &Options) -> anyhow::Result<()> {
     let ui = Ui::new(&app, &loaded, options);
     let config = cider_offline_core::Config::load_or_default(&paths.config_file())
         .context("reading config.toml")?;
-    match options.page.as_str() {
-        "settings" => {
-            let state = app.global::<SettingsState>();
-            super::settings_page::fill_lyrics(&state, &config);
-            state.set_lyrics_more_open(options.expand);
-        }
-        "overview" => demo_overview(&app, &config),
-        _ => {}
-    }
+    prepare(&app, options, &rt, &storage, &paths, &config, &loaded)?;
     let images = Rc::new(RefCell::new(ImageCache::default()));
     let wanted: Rc<RefCell<Vec<ArtRequest>>> = Rc::default();
     let tracks = paged_tracks(&loaded, &images, &wanted, options);
@@ -179,8 +231,12 @@ pub fn run(options: &Options) -> anyhow::Result<()> {
                 collections.apply_images(&created);
             }
             interact(&app, &options, round);
-            if round >= 8 {
-                if let Err(error) = save(&app, &options.out) {
+            if round >= 8 + options.hold * 4 {
+                let saved = match options.sequence {
+                    Some(on) => save_sequence(&app, &options, on),
+                    None => save(&app, &options.out),
+                };
+                if let Err(error) = saved {
                     *failure_out.borrow_mut() = Some(error);
                 }
                 let _ = slint::quit_event_loop();
@@ -209,13 +265,23 @@ fn interact(app: &AppWindow, options: &Options, round: u32) {
             }
         }
         // Again just before the snapshot, unless the shot hovers on purpose.
-        7 if options.hover.is_none() && options.right_click.is_none() => {
+        7 if options.hover.is_none()
+            && options.right_click.is_none()
+            && options.click.is_none() =>
+        {
             pointer(app, WindowEvent::PointerExited);
         }
         4 => {
             if let Some((x, y)) = options.hover {
                 let position = LogicalPosition::new(x, y);
                 pointer(app, WindowEvent::PointerMoved { position });
+            }
+            if let Some((x, y)) = options.click {
+                let position = LogicalPosition::new(x, y);
+                let button = PointerEventButton::Left;
+                pointer(app, WindowEvent::PointerMoved { position });
+                pointer(app, WindowEvent::PointerPressed { position, button });
+                pointer(app, WindowEvent::PointerReleased { position, button });
             }
             if let Some((x, y)) = options.right_click {
                 let position = LogicalPosition::new(x, y);
@@ -229,10 +295,119 @@ fn interact(app: &AppWindow, options: &Options, round: u32) {
     }
 }
 
+/// Page and overlay state that needs the store: the Settings page's
+/// lyrics and unlinked downloads, the Overview demo, and the dialogs.
+fn prepare(
+    app: &AppWindow,
+    options: &Options,
+    rt: &tokio::runtime::Runtime,
+    storage: &Storage,
+    paths: &cider_offline_core::AppPaths,
+    config: &cider_offline_core::Config,
+    loaded: &Loaded,
+) -> anyhow::Result<()> {
+    match options.page.as_str() {
+        "settings" => {
+            let state = app.global::<SettingsState>();
+            super::settings_page::fill_lyrics(&state, config);
+            super::settings_page::show_folders(&state, paths);
+            state.set_lyrics_more_open(options.expand);
+            let (_, report) = rt.block_on(cider_offline_core::unlinked_downloads(
+                storage,
+                &paths.media_dir(),
+            ))?;
+            super::settings_page::set_unlinked(&state, &report);
+            state.set_unlinked_mode(i32::from(options.unlinked_auto));
+            state.set_unlinked_hours(i32::try_from(config.unlinked_cleanup_hours()).unwrap_or(6));
+            demo_proxy(app, config);
+        }
+        "overview" => demo_overview(app, config, options),
+        _ => {}
+    }
+    match options.overlay.as_str() {
+        "remove" => {
+            let collection = loaded.detail.as_ref().or(loaded.collections.first());
+            if let Some(collection) = collection {
+                let id = collection.collection.id.clone();
+                let (deleted, kept) = rt.block_on(async {
+                    let keys =
+                        super::library::collection_keys(storage, LibraryFilter::AppleMusic, &id)
+                            .await
+                            .map_err(anyhow::Error::msg)?;
+                    let preview = storage.download_removal_preview(&id, keys).await?;
+                    anyhow::Ok((
+                        NamedSongs::of(storage, &preview.deleted).await,
+                        NamedSongs::of(storage, &preview.kept).await,
+                    ))
+                })?;
+                show_dialog(
+                    app,
+                    "Remove downloads",
+                    &super::library::remove_collection_message(
+                        &collection.collection.name,
+                        &deleted,
+                        &kept,
+                    ),
+                    "Remove downloads",
+                );
+            }
+        }
+        "cancel-all" => {
+            // The unfinished demo drawer rows (see `--overlay drawer`).
+            let titles: Vec<String> = demo_rows(loaded)
+                .into_iter()
+                .filter(|row| row.status != "done")
+                .map(|row| row.title.to_string())
+                .collect();
+            show_dialog(
+                app,
+                "Cancel all downloads",
+                &super::downloads::cancel_message(&titles, true),
+                "Cancel all",
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Opens the app's confirmation dialog with a destructive confirm button.
+fn show_dialog(app: &AppWindow, title: &str, message: &str, confirm: &str) {
+    let state = app.global::<DialogState>();
+    state.set_title(title.into());
+    state.set_message(message.into());
+    state.set_confirm_label(confirm.into());
+    state.set_destructive(true);
+    state.set_open(true);
+}
+
 fn pointer(app: &AppWindow, event: WindowEvent) {
     if let Err(error) = app.window().dispatch_event_with_result(event) {
         tracing::warn!(%error, "could not dispatch a pointer event");
     }
+}
+
+/// Saves `options.frames` frames of the ON or OFF animation, numbered after
+/// `options.out`.
+fn save_sequence(app: &AppWindow, options: &Options, on: bool) -> anyhow::Result<()> {
+    let anim = app.global::<OverviewAnim>();
+    app.global::<ProxyState>().set_active(on);
+    let frames = options.frames.max(2);
+    let stem = options.out.with_extension("");
+    for frame in 0..frames {
+        #[expect(clippy::cast_precision_loss, reason = "frame counts are small")]
+        let progress = frame as f32 / (frames - 1) as f32;
+        if on {
+            anim.set_freeze_on(progress);
+        } else {
+            anim.set_freeze_off(progress);
+        }
+        #[expect(clippy::cast_precision_loss, reason = "frame counts are small")]
+        anim.set_time(options.notes_time + frame as f32 / 30.0);
+        let path = PathBuf::from(format!("{}-{frame:03}.png", stem.display()));
+        save(app, &path)?;
+    }
+    Ok(())
 }
 
 fn save(app: &AppWindow, out: &std::path::Path) -> anyhow::Result<()> {
@@ -292,12 +467,32 @@ async fn load(storage: &Storage, options: &Options) -> anyhow::Result<Loaded> {
     } else {
         storage.tracks_page(search, 0, TRACK_PAGE).await?.items
     };
+    let mut ids: Vec<String> = collections
+        .iter()
+        .chain(detail.as_ref())
+        .map(|entry| entry.collection.id.clone())
+        .collect();
+    ids.dedup();
+    let summaries = storage
+        .collection_downloads(filter, ids, cider_offline_core::DownloadFormat::default())
+        .await?;
+    let pinned = storage.pinned_collections().await?;
+    let kept = storage
+        .download_collections()
+        .await?
+        .into_iter()
+        .filter(|collection| collection.keep)
+        .map(|collection| collection.owner)
+        .collect();
     Ok(Loaded {
         collections,
         tracks,
         total_tracks,
         total_collections,
         detail,
+        pinned,
+        kept,
+        summaries,
     })
 }
 
@@ -372,7 +567,19 @@ fn paged_collections(
             .collections
             .iter()
             .cloned()
-            .map(|item| collection_slot(item, bucket, &mut images, &HashMap::new()))
+            .map(|item| {
+                let mut slot = collection_slot(
+                    item,
+                    bucket,
+                    &mut images,
+                    &HashMap::new(),
+                    &loaded.summaries,
+                );
+                let id = slot.row.id.to_string();
+                slot.row.pinned = loaded.pinned.contains(&id);
+                slot.row.keep = loaded.kept.contains(&id);
+                slot
+            })
             .collect()
     };
     if options.dl_state.is_some() {
@@ -409,6 +616,8 @@ impl Ui {
             "settings" => 2,
             _ => 1,
         };
+        app.global::<SettingsState>()
+            .set_focus_section(options.section.as_str().into());
         app.set_page(page_index);
         let proxy = app.global::<ProxyState>();
         proxy.set_running(true);
@@ -446,30 +655,56 @@ impl Ui {
     }
 }
 
-/// Demo proxy counters, activity feed and Cider row of the Overview shots
-/// (`--page overview`), with Cider routed through the proxy.
-fn demo_overview(app: &AppWindow, config: &cider_offline_core::Config) {
-    const ACTIVITY: [(&str, &str, &str); 5] = [
-        ("21:14:05", "info", "412 requests, 96 served locally"),
-        ("21:09:41", "info", "Apple Music is reachable again"),
-        ("20:52:17", "warn", "Offline: serving from the local cache"),
-        ("20:31:02", "info", "1184 requests, 23 served locally"),
-        ("20:30:48", "info", "Certificate installed"),
-    ];
+/// The Overview shot (`--page overview`): demo counters and Cider row, the
+/// mode, an optional issue and a frozen animation frame.
+fn demo_overview(app: &AppWindow, config: &cider_offline_core::Config, options: &Options) {
+    demo_proxy(app, config);
+    let proxy = app.global::<ProxyState>();
+    let cider = app.global::<CiderState>();
+    match options.issue.as_str() {
+        "certificate" => {
+            proxy.set_trust_state("untrusted".into());
+            proxy.set_trust_message(
+                "Cider will reject the proxy's HTTPS traffic until the certificate is trusted."
+                    .into(),
+            );
+        }
+        "cider" => cider.set_routed(false),
+        "session" => proxy.set_session_captured(false),
+        "error" => proxy.set_last_error(
+            "Could not start the proxy: address 127.0.0.1:8000 is already in use".into(),
+        ),
+        _ => {}
+    }
+    let anim = app.global::<OverviewAnim>();
+    anim.set_live(true);
+    anim.set_notes(ModelRc::new(slint::VecModel::from(
+        super::overview::note_seeds(),
+    )));
+    anim.set_time(options.notes_time);
+    let mut active = options.mode != "passthrough";
+    match options.anim {
+        Some((true, progress)) => {
+            active = true;
+            anim.set_freeze_on(progress);
+        }
+        Some((false, progress)) => {
+            active = false;
+            anim.set_freeze_off(progress);
+        }
+        None => {}
+    }
+    proxy.set_active(active);
+}
+
+/// Demo proxy counters and Cider row, shared by the Overview and Settings
+/// shots, with Cider routed through the proxy.
+fn demo_proxy(app: &AppWindow, config: &cider_offline_core::Config) {
     let listen = config.listen_addr().to_string();
     let proxy = app.global::<ProxyState>();
     proxy.set_address(listen.as_str().into());
     proxy.set_requests_seen(format::count(1_596).into());
     proxy.set_served_locally(format::count(119).into());
-    let rows: Vec<ActivityRow> = ACTIVITY
-        .iter()
-        .map(|(time, level, text)| ActivityRow {
-            time: (*time).into(),
-            level: (*level).into(),
-            text: (*text).into(),
-        })
-        .collect();
-    proxy.set_activity(ModelRc::new(slint::VecModel::from(rows)));
 
     let cider = app.global::<CiderState>();
     cider.set_automatic(crate::cider::SUPPORT == crate::cider::Support::Automatic);
@@ -488,6 +723,15 @@ fn demo_overview(app: &AppWindow, config: &cider_offline_core::Config) {
 /// from the first loaded songs: downloading, queued with a retry note,
 /// failed, can't download yet, paused and done.
 fn demo_downloads(app: &AppWindow, loaded: &Loaded) {
+    let rows = demo_rows(loaded);
+    let summary = super::downloads::Summary::of(&rows);
+    super::downloads::set_summary(app, summary);
+    app.global::<DownloadsState>()
+        .set_rows(ModelRc::new(slint::VecModel::from(rows)));
+}
+
+/// The demo drawer rows of [`demo_downloads`].
+fn demo_rows(loaded: &Loaded) -> Vec<DownloadRow> {
     const STATES: [(&str, f32, &str, &str); 7] = [
         ("downloading", 0.42, "Downloading, 42%", ""),
         ("downloading", 0.09, "License, 9%", ""),
@@ -524,6 +768,11 @@ fn demo_downloads(app: &AppWindow, loaded: &Loaded) {
             message: (*message).into(),
             source: "playlist:demo".into(),
             source_name: "Demo playlist".into(),
+            spatial: item
+                .track
+                .audio
+                .get(cider_offline_core::storage::AudioVariant::Spatial)
+                .is_some(),
             ..DownloadRow::default()
         })
         .collect();
@@ -533,10 +782,7 @@ fn demo_downloads(app: &AppWindow, loaded: &Loaded) {
         row.progress = 1.0;
         row.detail = "Downloaded".into();
     }
-    let summary = super::downloads::Summary::of(&rows);
-    super::downloads::set_summary(app, summary);
-    app.global::<DownloadsState>()
-        .set_rows(ModelRc::new(slint::VecModel::from(rows)));
+    rows
 }
 
 /// Opens the detail view of `loaded.detail` (if any) with its hero cover.
@@ -555,8 +801,12 @@ fn show_detail(
         Bucket::Grid,
         &mut images.borrow_mut(),
         &HashMap::new(),
+        &loaded.summaries,
     );
-    let info = summarize_members(&loaded.tracks);
+    let info = summarize_members(
+        &loaded.tracks,
+        cider_offline_core::DownloadFormat::default(),
+    );
     state.set_collection(row.row.id.clone());
     state.set_detail_open(true);
     state.set_detail_title(row.row.name.clone());
@@ -571,11 +821,15 @@ fn show_detail(
         Some("paused") => ("paused", 0.4, false),
         Some("failed") => ("failed", 0.0, false),
         Some("done") => ("", 0.0, true),
-        _ => ("", 0.0, info.complete),
+        _ => ("", 0.0, row.row.downloaded),
     };
     state.set_detail_dl_status(status.into());
     state.set_detail_dl_progress(progress);
     state.set_detail_downloaded(downloaded);
+    state.set_detail_partial(row.row.partial && options.dl_state.is_none());
+    state.set_detail_elsewhere(row.row.elsewhere && options.dl_state.is_none());
+    state.set_detail_dl_done(row.row.dl_done);
+    state.set_detail_dl_total(row.row.dl_total);
     if let Some(url) = detail.collection.artwork_url.clone() {
         let request = ArtRequest::new(url, Bucket::Hero);
         let decoded = rt.block_on(artwork::load(library.clone(), vec![request]));

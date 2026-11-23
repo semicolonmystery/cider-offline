@@ -1,6 +1,6 @@
 //! Row types of the repository API.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Id prefix shared by every custom (user-created) item. Cheap to detect in
 /// interceptors and playback (`id.starts_with(CUSTOM_ID_PREFIX)`).
@@ -143,7 +143,8 @@ impl LyricsQuality {
 /// How a custom song's audio is provided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CustomAudioMode {
-    /// A file copied into the media directory (path in [`Track::audio_path`]).
+    /// A file copied into the media directory (the [`AudioVariant::Stereo`]
+    /// file in [`Track::audio`]).
     LocalCopy,
     /// Audio fetched via the downloader for a referenced catalog id (in
     /// [`Track::reference_track_id`]).
@@ -232,8 +233,8 @@ pub struct Track {
     /// Referenced catalog id when [`Track::audio_mode`] is
     /// [`CustomAudioMode::Reference`].
     pub reference_track_id: Option<String>,
-    /// Local audio file, if available.
-    pub audio_path: Option<PathBuf>,
+    /// Downloaded audio files, one per variant (the `track_audio` rows).
+    pub audio: TrackAudio,
     /// Lyrics availability.
     pub lyrics_source: LyricsSource,
     /// How finely the local lyrics are timed (`None` without lyrics).
@@ -279,10 +280,134 @@ impl Track {
             real_album_id: None,
             audio_mode: None,
             reference_track_id: None,
-            audio_path: None,
+            audio: TrackAudio::default(),
             lyrics_source: LyricsSource::None,
             lyrics_quality: LyricsQuality::None,
             in_library: false,
+        }
+    }
+}
+
+impl Track {
+    /// Whether any audio variant is recorded for this row ("downloaded").
+    /// File existence is not checked.
+    pub fn has_audio(&self) -> bool {
+        !self.audio.is_empty()
+    }
+}
+
+/// Which downloaded version of a song an audio file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AudioVariant {
+    /// The stereo stream Cider plays by default (`ctrp256`); also a custom
+    /// song's copied local file.
+    Stereo,
+    /// The Dolby Atmos mix rendered for headphones (binaural stereo).
+    Spatial,
+}
+
+impl AudioVariant {
+    /// Every variant, in preference order for playback fallback.
+    pub const ALL: [Self; 2] = [Self::Stereo, Self::Spatial];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::Spatial => "spatial",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "stereo" => Some(Self::Stereo),
+            "spatial" => Some(Self::Spatial),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AudioVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The downloaded audio files of one track row, by variant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackAudio {
+    /// The [`AudioVariant::Stereo`] file.
+    pub normal: Option<PathBuf>,
+    /// The [`AudioVariant::Spatial`] file.
+    pub spatial: Option<PathBuf>,
+}
+
+impl TrackAudio {
+    /// Only a normal file.
+    #[must_use]
+    pub fn normal(path: impl Into<PathBuf>) -> Self {
+        Self {
+            normal: Some(path.into()),
+            spatial: None,
+        }
+    }
+
+    /// The file of `variant`, if recorded.
+    pub fn get(&self, variant: AudioVariant) -> Option<&Path> {
+        match variant {
+            AudioVariant::Stereo => self.normal.as_deref(),
+            AudioVariant::Spatial => self.spatial.as_deref(),
+        }
+    }
+
+    /// Records (or clears with `None`) the file of `variant`.
+    pub fn set(&mut self, variant: AudioVariant, path: Option<PathBuf>) {
+        match variant {
+            AudioVariant::Stereo => self.normal = path,
+            AudioVariant::Spatial => self.spatial = path,
+        }
+    }
+
+    /// Whether no variant is recorded.
+    pub fn is_empty(&self) -> bool {
+        self.normal.is_none() && self.spatial.is_none()
+    }
+
+    /// The recorded variants and their files, normal first.
+    pub fn iter(&self) -> impl Iterator<Item = (AudioVariant, &Path)> {
+        AudioVariant::ALL
+            .into_iter()
+            .filter_map(|variant| self.get(variant).map(|path| (variant, path)))
+    }
+
+    /// The file to play when the caller has no variant preference: normal,
+    /// else spatial.
+    pub fn preferred(&self) -> Option<&Path> {
+        self.iter().next().map(|(_, path)| path)
+    }
+}
+
+/// One downloaded audio file of a track, with what is known about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioFile {
+    /// Which version of the song the file holds.
+    pub variant: AudioVariant,
+    /// The file (absolute when read back).
+    pub path: PathBuf,
+    /// File size in bytes, if known.
+    pub size: Option<u64>,
+    /// Playback duration in milliseconds, if known.
+    pub duration_ms: Option<u32>,
+}
+
+impl AudioFile {
+    /// A file of `variant` with no size or duration recorded.
+    #[must_use]
+    pub fn new(variant: AudioVariant, path: impl Into<PathBuf>) -> Self {
+        Self {
+            variant,
+            path: path.into(),
+            size: None,
+            duration_ms: None,
         }
     }
 }

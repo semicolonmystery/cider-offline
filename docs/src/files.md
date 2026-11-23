@@ -19,7 +19,7 @@ On Linux the `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` variables m
 | Folder | Contents |
 | --- | --- |
 | Config | `config.toml` (see [Configuration](configuration.md)) |
-| Data | `store.sqlite` (the library database, with its `-wal` and `-shm` files while the app runs), `media/` (downloaded audio), `lyrics/` (saved lyrics), `ca/` (the local certificate and its private key), `captures/` (only if capture was turned on), `instance.lock` (makes sure only one copy runs), and `device.wvd` if you added one |
+| Data | `store.sqlite` (the library database, with its `-wal` and `-shm` files while the app runs), `media/` (downloaded audio: `<id>.m4a` for the stereo mix, `<id>.spatial.m4a` for the spatial mix), `lyrics/` (saved lyrics), `ca/` (the local certificate and its private key), `captures/` (only if capture was turned on), and `instance.lock` (makes sure only one copy runs) |
 | Cache | `artwork/` (cover art), `logs/` (log files) |
 
 The database stores the paths of files in the data folder relative to it (for example `media/123.m4a`), so you can move the data folder, or plug a portable drive in under a different drive letter, without breaking the library. Files you picked from elsewhere, such as a linked audio file, are stored with their full path and stay where they are.
@@ -43,17 +43,6 @@ If a folder named `data` sits next to the program, the app runs in portable mode
 The portable archives come with an empty `data` folder (holding a `.keep` file so unzip tools don't drop it). The installers never create one. To switch a copy back to the normal folders, remove its `data` folder.
 
 On macOS a quarantined app is run from a hidden read-only location where `data` can't be found; see [Installation](installation.md#portable-build-on-macos).
-
-## Custom Widevine device
-
-A file named `device.wvd` in the data folder replaces the Widevine device built into the app:
-
-- Windows: `%LOCALAPPDATA%\cider-offline\CiderOffline\data\device.wvd`
-- macOS: `~/Library/Application Support/sh.cider-offline.CiderOffline/device.wvd`
-- Linux: `~/.local/share/cideroffline/device.wvd`
-- Portable: `data/device.wvd` next to the program
-
-The app reads it when it starts, so restart the app after adding or replacing it.
 
 ## Logs
 

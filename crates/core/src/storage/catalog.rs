@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use super::models::{LyricsSource, Playlist, Track};
 use super::paths::PathCodec;
 use super::repo::{TRACK_COLUMNS, now_unix, track_from_row, upsert_playlist};
+use super::songs::{self, SONG_OF_P1};
 use super::{Storage, StorageError};
 
 /// Track metadata observed in an Apple Music API response.
@@ -126,20 +127,27 @@ pub struct ArtworkFile {
 
 // ----- Catalog ----------------------------------------------------------------
 
-pub(super) fn merge_track(conn: &Connection, track: &TrackMetadata) -> Result<(), StorageError> {
+pub(super) fn merge_track(
+    conn: &Connection,
+    track: &TrackMetadata,
+    rekeys: &mut Vec<songs::SongRekey>,
+) -> Result<(), StorageError> {
+    // The resource may name the song by any of its ids; its columns land on
+    // the one song row, and the resource itself is kept under its own id.
+    let song = songs::claim(conn, &track.id, track.catalog_id.as_deref(), rekeys)?;
+    let own_resource = song == track.id;
     // Rich columns are filled when the observed resource carries them (Detail =
     // Full); each is preserved when a later, leaner observation omits it. The
     // NOT NULL boolean flags reference their parameter directly (not `excluded`,
     // which the INSERT coalesces to 0) so a `None` keeps the stored value.
     conn.execute(
         "INSERT INTO tracks
-           (id, catalog_id, title, artist, album, duration_ms, artwork_url, metadata,
+           (id, title, artist, album, duration_ms, artwork_url, metadata,
             album_artist, composer, genre, track_number, disc_number, release_date, isrc, url,
             has_lyrics, has_time_synced_lyrics, content_rating, in_library, lyrics_source, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 COALESCE(?17, 0), COALESCE(?18, 0), ?19, ?20, 'none', ?21)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 COALESCE(?16, 0), COALESCE(?17, 0), ?18, ?19, 'none', ?20)
          ON CONFLICT(id) DO UPDATE SET
-           catalog_id = COALESCE(excluded.catalog_id, tracks.catalog_id),
            title = excluded.title, artist = excluded.artist,
            album = COALESCE(excluded.album, tracks.album),
            duration_ms = COALESCE(excluded.duration_ms, tracks.duration_ms),
@@ -153,22 +161,21 @@ pub(super) fn merge_track(conn: &Connection, track: &TrackMetadata) -> Result<()
            release_date = COALESCE(excluded.release_date, tracks.release_date),
            isrc = COALESCE(excluded.isrc, tracks.isrc),
            url = COALESCE(excluded.url, tracks.url),
-           has_lyrics = COALESCE(?17, tracks.has_lyrics),
-           has_time_synced_lyrics = COALESCE(?18, tracks.has_time_synced_lyrics),
+           has_lyrics = COALESCE(?16, tracks.has_lyrics),
+           has_time_synced_lyrics = COALESCE(?17, tracks.has_time_synced_lyrics),
            content_rating = COALESCE(excluded.content_rating, tracks.content_rating),
            -- Sticky: a later playlist capture of the same song (in_library = 0)
            -- never clears a previously-proven library membership.
            in_library = MAX(tracks.in_library, excluded.in_library),
            updated_at = excluded.updated_at",
         params![
-            track.id,
-            track.catalog_id,
+            song,
             track.title,
             track.artist,
             track.album,
             track.duration_ms,
             track.artwork_url,
-            track.metadata,
+            track.metadata.as_deref().filter(|_| own_resource),
             track.album_artist,
             track.composer,
             track.genre,
@@ -184,6 +191,15 @@ pub(super) fn merge_track(conn: &Connection, track: &TrackMetadata) -> Result<()
             now_unix()
         ],
     )?;
+    if !own_resource {
+        songs::put_alias(
+            conn,
+            &track.id,
+            &song,
+            track.metadata.as_deref(),
+            track.in_library,
+        )?;
+    }
     Ok(())
 }
 
@@ -238,10 +254,14 @@ fn apply_track_list(conn: &Connection, update: &TrackListUpdate) -> Result<(), S
     Ok(())
 }
 
-fn apply_catalog(conn: &mut Connection, update: &CatalogUpdate) -> Result<(), StorageError> {
+fn apply_catalog(
+    conn: &mut Connection,
+    update: &CatalogUpdate,
+) -> Result<Vec<songs::SongRekey>, StorageError> {
     let tx = conn.transaction()?;
+    let mut rekeys = Vec::new();
     for track in &update.tracks {
-        merge_track(&tx, track)?;
+        merge_track(&tx, track, &mut rekeys)?;
     }
     for collection in &update.collections {
         upsert_playlist(&tx, collection)?;
@@ -250,7 +270,7 @@ fn apply_catalog(conn: &mut Connection, update: &CatalogUpdate) -> Result<(), St
         apply_track_list(&tx, list)?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(rekeys)
 }
 
 /// Columns for building a [`TrackRecord`]. `catalog_id` is now one of
@@ -273,32 +293,74 @@ fn find_track(
     codec: &PathCodec,
     id: &str,
 ) -> Result<Option<TrackRecord>, StorageError> {
-    // Exact id first, then a library track whose catalog id matches.
     let columns = record_columns();
     Ok(conn
         .query_row(
-            &format!(
-                "SELECT {columns} FROM tracks WHERE id = ?1 OR catalog_id = ?1
-                 ORDER BY (id = ?1) DESC, (audio_path IS NOT NULL) DESC LIMIT 1"
-            ),
+            &format!("SELECT {columns} FROM tracks t WHERE t.id = {SONG_OF_P1}"),
             [id],
             record_from_row(codec),
         )
         .optional()?)
 }
 
-/// Every track row whose id or catalog id is `id`, catalog-native rows first.
+/// Every stored resource of the song `id` names, one record per Apple id:
+/// the song's own resource (its row, `metadata` as stored under the song id)
+/// first, then each alias with the resource stored under it, saved-library
+/// ones first. All share the song's columns and audio.
 fn tracks_by_any_id(
     conn: &Connection,
     codec: &PathCodec,
     id: &str,
 ) -> Result<Vec<TrackRecord>, StorageError> {
-    let columns = record_columns();
+    let Some(song) = songs::song_of(conn, id)? else {
+        return Ok(Vec::new());
+    };
+    Ok(resources(conn, codec, Some(&song))?
+        .into_iter()
+        .map(|track| {
+            let catalog_id = track.catalog_id.clone();
+            TrackRecord { track, catalog_id }
+        })
+        .collect())
+}
+
+/// Every stored Apple resource as a [`Track`] (all songs with `song = None`,
+/// else that song's): a song row stands for the resource under its id, and
+/// each alias for the resource under the alias, carrying the song's columns
+/// and audio. `catalog_id` is the song's catalog id. A song row's library
+/// flag is left to its aliases when it has any (they are the library
+/// copies). Ordered by song, own resource first.
+pub(super) fn resources(
+    conn: &Connection,
+    codec: &PathCodec,
+    song: Option<&str>,
+) -> Result<Vec<Track>, StorageError> {
+    let filter = if song.is_some() {
+        "t.id = ?1"
+    } else {
+        "?1 IS NULL"
+    };
+    let extra = super::repo::TRACK_COLUMN_COUNT;
     let mut stmt = conn.prepare(&format!(
-        "SELECT {columns} FROM tracks WHERE id = ?1 OR catalog_id = ?1
-         ORDER BY (id = ?1) DESC, in_library DESC, id"
+        "SELECT * FROM (
+           SELECT {TRACK_COLUMNS}, t.id AS rid, t.metadata AS rmeta,
+                  t.in_library AND NOT EXISTS (SELECT 1 FROM track_aliases x
+                                               WHERE x.track_id = t.id) AS rlib,
+                  0 AS rank, t.id AS song
+           FROM tracks t WHERE {filter}
+           UNION ALL
+           SELECT {TRACK_COLUMNS}, ra.alias, ra.metadata, ra.in_library,
+                  1 + (ra.in_library = 0), t.id
+           FROM track_aliases ra JOIN tracks t ON t.id = ra.track_id WHERE {filter})
+         ORDER BY song, rank, rid"
     ))?;
-    let rows = stmt.query_map([id], record_from_row(codec))?;
+    let rows = stmt.query_map([song], |row| {
+        let mut track = track_from_row(codec)(row)?;
+        track.id = row.get(extra)?;
+        track.metadata = row.get(extra + 1)?;
+        track.in_library = row.get(extra + 2)?;
+        Ok(track)
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -313,10 +375,10 @@ fn same_title_and_artist(
 ) -> Result<Vec<TrackRecord>, StorageError> {
     let columns = record_columns();
     let mut stmt = conn.prepare(&format!(
-        "SELECT {columns} FROM tracks
-         WHERE title = ?1 COLLATE NOCASE AND artist = ?2 COLLATE NOCASE
-           AND id <> ?3 AND is_custom = 0
-         ORDER BY in_library DESC, id"
+        "SELECT {columns} FROM tracks t
+         WHERE t.title = ?1 COLLATE NOCASE AND t.artist = ?2 COLLATE NOCASE
+           AND t.id <> ?3 AND t.is_custom = 0
+         ORDER BY t.in_library DESC, t.id"
     ))?;
     let rows = stmt.query_map(params![title, artist, exclude_id], record_from_row(codec))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -329,7 +391,8 @@ fn tracks_by_lyrics(
 ) -> Result<Vec<TrackRecord>, StorageError> {
     let columns = record_columns();
     let mut stmt = conn.prepare(&format!(
-        "SELECT {columns} FROM tracks WHERE lyrics_source = ?1 ORDER BY artist, album, title"
+        "SELECT {columns} FROM tracks t WHERE t.lyrics_source = ?1
+         ORDER BY t.artist, t.album, t.title"
     ))?;
     let rows = stmt.query_map([source.as_str()], record_from_row(codec))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -344,10 +407,13 @@ fn search_tracks(
     let columns = record_columns();
     let pattern = format!("%{}%", escape_like(term));
     let mut stmt = conn.prepare(&format!(
-        "SELECT {columns} FROM tracks
-         WHERE metadata IS NOT NULL
-           AND (title LIKE ?1 ESCAPE '\\' OR artist LIKE ?1 ESCAPE '\\' OR album LIKE ?1 ESCAPE '\\')
-         ORDER BY title LIMIT ?2"
+        "SELECT {columns} FROM tracks t
+         WHERE (t.metadata IS NOT NULL
+                OR EXISTS (SELECT 1 FROM track_aliases ta
+                           WHERE ta.track_id = t.id AND ta.metadata IS NOT NULL))
+           AND (t.title LIKE ?1 ESCAPE '\\' OR t.artist LIKE ?1 ESCAPE '\\'
+                OR t.album LIKE ?1 ESCAPE '\\')
+         ORDER BY t.title LIMIT ?2"
     ))?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = stmt.query_map(params![pattern, limit], record_from_row(codec))?;
@@ -371,7 +437,11 @@ fn set_lyrics_source_any(
     source: LyricsSource,
 ) -> Result<usize, StorageError> {
     Ok(conn.execute(
-        "UPDATE tracks SET lyrics_source = ?2, updated_at = ?3 WHERE id = ?1 OR catalog_id = ?1",
+        // No lyrics means no quality (a CHECK on `tracks`).
+        "UPDATE tracks SET lyrics_source = ?2,
+           lyrics_quality = CASE WHEN ?2 = 'none' THEN 'none' ELSE lyrics_quality END,
+           updated_at = ?3
+         WHERE id = COALESCE((SELECT sa.track_id FROM track_aliases sa WHERE sa.alias = ?1), ?1)",
         params![id, source.as_str(), now_unix()],
     )?)
 }
@@ -505,10 +575,12 @@ impl Storage {
     ///
     /// Returns database errors.
     pub async fn apply_catalog_update(&self, update: CatalogUpdate) -> Result<(), StorageError> {
-        self.call(move |c| apply_catalog(c, &update)).await
+        let rekeys = self.call(move |c| apply_catalog(c, &update)).await?;
+        self.publish_rekeys(rekeys);
+        Ok(())
     }
 
-    /// Finds a track by id, or a library track whose catalog id is `id`.
+    /// Finds the song any of whose ids (catalog or library) is `id`.
     ///
     /// # Errors
     ///
@@ -519,8 +591,10 @@ impl Storage {
         self.call(move |c| find_track(c, &codec, &id)).await
     }
 
-    /// Every track row whose id or catalog id is `id` (the row with that id
-    /// first, then saved-library rows).
+    /// Every stored resource of the song `id` names (any of its ids): the
+    /// song's own resource first, then its aliases, saved-library ones first.
+    /// The records share the song's columns and audio; `track.id` and
+    /// `track.metadata` are each resource's.
     ///
     /// # Errors
     ///
@@ -553,9 +627,11 @@ impl Storage {
 
     /// Records that the library item `library_id`, which has no
     /// `playParams.catalogId` of its own, plays as catalog id `catalog_id`
-    /// (its resolved twin). Only fills an empty link; returns whether the row
-    /// changed. Afterwards lookups, audio and lyrics by either id reach the
-    /// row, so it shows as downloaded once the twin is.
+    /// (its resolved twin): the item becomes another id of that song (merged
+    /// into it, see [`super::songs`]). Only a song keyed on a library id is
+    /// linked; returns whether anything changed. Afterwards lookups, audio and
+    /// lyrics by either id reach the one song, so it shows as downloaded once
+    /// the twin is.
     ///
     /// # Errors
     ///
@@ -566,14 +642,31 @@ impl Storage {
         catalog_id: &str,
     ) -> Result<bool, StorageError> {
         let (library_id, catalog_id) = (library_id.to_owned(), catalog_id.to_owned());
-        self.call(move |c| {
-            Ok(c.execute(
-                "UPDATE tracks SET catalog_id = ?2, updated_at = ?3
-                 WHERE id = ?1 AND catalog_id IS NULL AND is_custom = 0",
-                params![library_id, catalog_id, now_unix()],
-            )? > 0)
-        })
-        .await
+        let linked = self
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let Some(song) = songs::song_of(&tx, &library_id)? else {
+                    return Ok(None);
+                };
+                let custom: bool = tx.query_row(
+                    "SELECT is_custom FROM tracks WHERE id = ?1",
+                    [&song],
+                    |row| row.get(0),
+                )?;
+                if custom || songs::is_catalog_id(&song) || song == catalog_id {
+                    return Ok(None);
+                }
+                let mut rekeys = Vec::new();
+                songs::claim(&tx, &library_id, Some(&catalog_id), &mut rekeys)?;
+                tx.commit()?;
+                Ok(Some(rekeys))
+            })
+            .await?;
+        let Some(rekeys) = linked else {
+            return Ok(false);
+        };
+        self.publish_rekeys(rekeys);
+        Ok(true)
     }
 
     /// Tracks with the given lyrics state, ordered by artist, album, title.
@@ -606,8 +699,8 @@ impl Storage {
             .await
     }
 
-    /// Sets the lyrics source of every track whose id or catalog id is `id`;
-    /// returns how many rows changed.
+    /// Sets the lyrics source of the song any of whose ids is `id`; returns
+    /// how many rows changed (0 or 1).
     ///
     /// # Errors
     ///
@@ -752,7 +845,11 @@ mod tests {
             .await
             .unwrap();
         storage
-            .set_track_audio("1", Some(PathBuf::from("a.m4a")))
+            .set_track_audio(
+                "1",
+                crate::storage::AudioVariant::Stereo,
+                Some(PathBuf::from("a.m4a")),
+            )
             .await
             .unwrap();
         storage
@@ -763,7 +860,7 @@ mod tests {
             .await
             .unwrap();
         let track = storage.get_track("1").await.unwrap().unwrap();
-        assert_eq!(track.audio_path, Some(PathBuf::from("a.m4a")));
+        assert_eq!(track.audio.normal, Some(PathBuf::from("a.m4a")));
     }
 
     #[tokio::test]
@@ -779,7 +876,95 @@ mod tests {
             .await
             .unwrap();
         let found = storage.find_track("42").await.unwrap().unwrap();
-        assert_eq!(found.track.id, "i.abc");
+        assert_eq!(found.track.id, "42");
+    }
+
+    #[tokio::test]
+    async fn find_track_should_reach_the_song_by_its_library_id() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut track = meta("i.abc");
+        track.catalog_id = Some("42".to_owned());
+        storage
+            .apply_catalog_update(CatalogUpdate {
+                tracks: vec![track],
+                ..CatalogUpdate::default()
+            })
+            .await
+            .unwrap();
+        let found = storage.find_track("i.abc").await.unwrap().unwrap();
+        assert_eq!(found.catalog_or_id(), "42");
+    }
+
+    #[tokio::test]
+    async fn twins_observed_separately_should_be_one_song() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut library = meta("i.abc");
+        library.catalog_id = Some("42".to_owned());
+        library.metadata = Some(r#"{"id":"i.abc","type":"library-songs"}"#.to_owned());
+        let mut playlist_copy = meta("a.42");
+        playlist_copy.catalog_id = Some("42".to_owned());
+        let mut catalog = meta("42");
+        catalog.metadata = Some(r#"{"id":"42","type":"songs"}"#.to_owned());
+        for track in [library, catalog, playlist_copy] {
+            storage
+                .apply_catalog_update(CatalogUpdate {
+                    tracks: vec![track],
+                    ..CatalogUpdate::default()
+                })
+                .await
+                .unwrap();
+        }
+        let resources: Vec<String> = storage
+            .tracks_by_any_id("a.42")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.track.id)
+            .collect();
+        assert_eq!(
+            (storage.list_tracks().await.unwrap().len(), resources),
+            (
+                1,
+                vec!["42".to_owned(), "a.42".to_owned(), "i.abc".to_owned()]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_library_song_should_join_its_catalog_twin_when_the_link_is_learned() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .apply_catalog_update(CatalogUpdate {
+                tracks: vec![meta("i.abc"), meta("42")],
+                ..CatalogUpdate::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .set_track_audio(
+                "i.abc",
+                crate::storage::AudioVariant::Stereo,
+                Some("a.m4a".into()),
+            )
+            .await
+            .unwrap();
+        let mut linked = meta("i.abc");
+        linked.catalog_id = Some("42".to_owned());
+        storage
+            .apply_catalog_update(CatalogUpdate {
+                tracks: vec![linked],
+                ..CatalogUpdate::default()
+            })
+            .await
+            .unwrap();
+        let song = storage.get_track("42").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                storage.list_tracks().await.unwrap().len(),
+                song.audio.normal
+            ),
+            (1, Some(PathBuf::from("a.m4a")))
+        );
     }
 
     #[tokio::test]

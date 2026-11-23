@@ -10,7 +10,7 @@ It runs on Windows (x64, x86 and ARM64), macOS (one universal build for Intel an
 
 - Offline mode: when Apple Music is unreachable, Cider still shows your library, searches it and plays the songs you have downloaded.
 - Library sync: your playlists, albums and Songs tab are fetched from Apple Music in full and kept up to date while you are online.
-- Downloads: songs (and the audio of music videos) are downloaded and decrypted on your computer, so they play offline. Songs can also be downloaded automatically as you play them.
+- Downloads: save songs (and the audio of music videos) on your computer so they play in Cider offline. You pick the stereo mix, the spatial mix (Dolby Atmos for headphones) where a song has one, or both. Songs can also be downloaded automatically as you play them.
 - Lyrics from Apple Music, Cider Community, AMLL TTML DB, Musixmatch, NetEase Cloud Music, Kugou and LRCLIB, saved locally and served to Cider offline.
 - Your own audio and lyrics: give a song your own audio file or lyrics file (TTML or LRC), or add songs, albums and playlists of your own that show up in Cider's library.
 - One switch to point Cider at the proxy on Windows. On macOS and Linux the app shows the command to use.
@@ -32,6 +32,6 @@ If something doesn't work, see [Troubleshooting](troubleshooting.md). To get rid
 
 ## A note on use
 
-Cider Offline is for personal use with your own Apple Music subscription. It is not affiliated with or endorsed by Apple or the Cider Collective. It decrypts content you are already licensed to stream so you can play it offline on your own machine. Use it at your own risk.
+Cider Offline is for personal use with your own Apple Music subscription, so you can keep listening to your library in Cider when you're offline. It is not affiliated with or endorsed by Apple or the Cider Collective. Use it at your own risk.
 
 The app is open source under the MIT license. The code is at [github.com/semicolonmystery/cider-offline](https://github.com/semicolonmystery/cider-offline).

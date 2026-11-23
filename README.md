@@ -1,6 +1,6 @@
 # Cider Offline
 
-Use Cider (Apple Music client) offline: a local proxy that caches your library, downloads songs and lyrics, and serves them when you're offline.
+Keep listening to your Apple Music library in Cider when you're offline. A local proxy for the Cider client: library sync, songs and lyrics saved for offline playback.
 
 ![The Library page of Cider Offline](docs/src/images/library.png)
 
@@ -8,8 +8,8 @@ Use Cider (Apple Music client) offline: a local proxy that caches your library, 
 
 - Offline mode: Cider keeps working from the local copy when Apple Music is unreachable
 - Library sync of your playlists, albums and songs
-- Song and music video audio downloads, decrypted locally
-- Automatic download of songs as you play them
+- Save songs and music video audio for offline playback in Cider, in stereo, in the spatial mix (Dolby Atmos for headphones), or both
+- Automatically save songs for offline playback as you play them
 - Lyrics from Apple Music, Cider Community, AMLL TTML DB, Musixmatch, NetEase Cloud Music, Kugou and LRCLIB
 - Custom audio and lyrics (TTML or LRC) per song
 - One-click setup of Cider's proxy on Windows
@@ -27,8 +27,8 @@ Use Cider (Apple Music client) offline: a local proxy that caches your library, 
 ## Getting started
 
 1. Download the installer or the portable archive for your system from [Releases](https://github.com/semicolonmystery/cider-offline/releases). Windows has a setup `.exe`, macOS a `.dmg`, Linux an AppImage, `.deb`, `.rpm` and an Arch package. The portable archives run from wherever you unpack them. The builds are not signed, so your system warns you the first time; [Installation](https://cider-offline.podik.cz/docs/installation.html) explains how to get past that on each OS.
-2. Start Cider Offline and click **Install** on the **Certificate** row of the Overview page (it says **Fix** when the app couldn't read the trust store). The app creates its own certificate authority on your computer so it can read Apple Music traffic, and your system asks you to confirm.
-3. Connect Cider. On Windows, turn on **Route Cider through this proxy** on the Overview page. On macOS and Linux, start Cider with `--proxy-server=127.0.0.1:8000`; the Overview page shows the exact command. See [Connecting Cider](https://cider-offline.podik.cz/docs/connecting-cider.html).
+2. Start Cider Offline and click **Install** in **Settings > Certificate** (it says **Fix** when the app couldn't read the trust store). Until the certificate is trusted, the Overview page links there. The app creates its own certificate authority on your computer so it can read Apple Music traffic, and your system asks you to confirm.
+3. Connect Cider. On Windows, turn on **Route Cider through this proxy** in **Settings > Cider**. On macOS and Linux, start Cider with `--proxy-server=127.0.0.1:8000`; **Settings > Cider** shows the exact command. See [Connecting Cider](https://cider-offline.podik.cz/docs/connecting-cider.html).
 4. Use Cider online once so the app can sync your library and pick up your Apple Music session. After that, download what you want to have offline.
 
 [Using the app](https://cider-offline.podik.cz/docs/using.html) covers the library, downloads and lyrics. If something goes wrong, start with [Troubleshooting](https://cider-offline.podik.cz/docs/troubleshooting.html). To remove the app and everything it created, see [Uninstalling](https://cider-offline.podik.cz/docs/uninstalling.html).
@@ -47,6 +47,7 @@ Most options are also on the Settings page. The app rewrites the file when you c
 - `proxy.port` (default `8000`): the port Cider connects to.
 - `auto_cache`: `off`, `instant` (download a song as soon as it plays) or `deferred` (wait until you stop playing for a while).
 - `download_concurrency`: how many downloads run at once, 1 to 6 (default 2).
+- `download_format`: which mix a download saves: `stereo` (the default), `spatial_where_available` or `both`.
 - `lyrics.providers`: which lyrics providers are asked, and in what order.
 - `connectivity.force_offline`: behave as if Apple Music were unreachable, to check what works offline.
 
@@ -82,7 +83,7 @@ Issues and pull requests are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) fi
 
 ## Disclaimer
 
-Cider Offline is for personal use with your own Apple Music subscription. It is not affiliated with or endorsed by Apple or the Cider Collective. It decrypts content you are already licensed to stream so you can play it offline on your own machine. Use it at your own risk.
+Cider Offline is for personal use with your own Apple Music subscription, so you can keep listening to your library in Cider when you're offline. It is not affiliated with or endorsed by Apple or the Cider Collective. Use it at your own risk.
 
 ## License
 

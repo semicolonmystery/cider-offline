@@ -519,7 +519,7 @@ impl Oracle {
                 oracle.all_songs.extend(synced.track_ids.iter().cloned());
             }
         }
-        for track in storage.list_tracks().await? {
+        for track in storage.list_resources().await? {
             let metadata: Option<Value> = track
                 .metadata
                 .as_deref()
@@ -538,7 +538,7 @@ impl Oracle {
             {
                 oracle.album_ids.insert(album.to_owned());
             }
-            let downloaded = track.audio_path.as_deref().is_some_and(Path::is_file);
+            let downloaded = track.audio.iter().any(|(_, path)| path.is_file());
             for id in std::iter::once(track.id.clone()).chain(track.catalog_id.clone()) {
                 if downloaded {
                     oracle.downloaded.insert(id.clone());

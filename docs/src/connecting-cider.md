@@ -2,13 +2,13 @@
 
 Cider has to send its traffic through the proxy, and it has to trust the proxy's certificate. The certificate is covered in [Installation](installation.md#first-run-and-the-local-certificate). This page covers the proxy setting.
 
-![The Setup section of the Overview page](images/overview.png)
+![The Settings page with the Proxy, Certificate and Cider sections](images/settings.png)
 
-The examples use the default address, `127.0.0.1:8000`. If you changed the port, the Overview page shows your address, and the commands it shows already include it.
+The examples use the default address, `127.0.0.1:8000`. If you changed the port, Settings > Proxy shows your address, and the commands it shows already include it.
 
 ## Windows
 
-The Windows build of Cider has its own proxy setting, and the app can turn it on for you. On the Overview page, turn on **Route Cider through this proxy**.
+The Windows build of Cider has its own proxy setting, and the app can turn it on for you. In Settings > Cider, turn on **Route Cider through this proxy**.
 
 Behind the switch, the app edits Cider's settings file, `%APPDATA%\sh.cider.dotnet\client-options.yml`:
 
@@ -30,7 +30,7 @@ You can also make the change by hand: close Cider, set `UseProxy: true` and `Pro
 
 ## macOS and Linux
 
-Cider on macOS and Linux is a different build, and it has no proxy setting the app could change. Instead you start Cider with Chromium's `--proxy-server` option, and the app never touches Cider's files there. The Overview page shows the exact command under **Use Cider with this proxy**.
+Cider on macOS and Linux is a different build, and it has no proxy setting the app could change. Instead you start Cider with Chromium's `--proxy-server` option, and the app never touches Cider's files there. Settings > Cider shows the exact command under **Use Cider with this proxy**.
 
 On macOS, quit Cider and start it from Terminal:
 
@@ -56,4 +56,4 @@ Instead of the option you can set a proxy for the whole system: on macOS in **Sy
 
 ## Checking that it works
 
-With Cider running, the **Requests seen** counter on the Overview page goes up as you use Cider. If it stays at 0, Cider isn't using the proxy. If Cider shows network errors as soon as it goes through the proxy, the certificate isn't trusted yet. [Troubleshooting](troubleshooting.md) has more on both.
+With Cider running, the **Requests seen** counter in Settings > Proxy goes up as you use Cider. If it stays at 0, Cider isn't using the proxy. If Cider shows network errors as soon as it goes through the proxy, the certificate isn't trusted yet. [Troubleshooting](troubleshooting.md) has more on both.

@@ -1,5 +1,7 @@
 //! Small per-OS calls with no portable equivalent.
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
@@ -39,4 +41,22 @@ pub fn set_dock_visible(visible: bool) {
 pub fn activate_app() {
     #[cfg(target_os = "macos")]
     macos::activate_app();
+}
+
+/// Whether the OS asks apps to reduce motion.
+///
+/// Windows: Settings > Accessibility > Visual effects > Animation effects
+/// (`UISettings.AnimationsEnabled`). macOS: Accessibility > Display > Reduce
+/// motion. Linux: GNOME's "enable-animations" through the desktop portal.
+/// `false` when it can't be read.
+pub fn prefers_reduced_motion() -> bool {
+    #[cfg(windows)]
+    let reduced = windows::prefers_reduced_motion();
+    #[cfg(target_os = "macos")]
+    let reduced = macos::prefers_reduced_motion();
+    #[cfg(target_os = "linux")]
+    let reduced = linux::prefers_reduced_motion();
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    let reduced = false;
+    reduced
 }

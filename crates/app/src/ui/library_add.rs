@@ -682,7 +682,7 @@ async fn apply_song_extras(backend: &Backend, sub: &Submission, id: &str) -> Res
 fn existing_audio(track: Option<&Track>) -> CustomAudio {
     match track {
         Some(t) => match t.audio_mode {
-            Some(CustomAudioMode::LocalCopy) => match &t.audio_path {
+            Some(CustomAudioMode::LocalCopy) => match &t.audio.normal {
                 Some(path) => CustomAudio::LocalCopy(path.clone()),
                 None => CustomAudio::None,
             },

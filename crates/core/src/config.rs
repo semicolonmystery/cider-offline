@@ -119,6 +119,65 @@ impl SongsPage {
     }
 }
 
+/// Which mixes of a song a download fetches.
+///
+/// Every Apple Music song has the stereo mix. Songs mastered in
+/// Dolby Atmos also have a spatial stream: the Atmos mix rendered to
+/// headphone stereo (binaural), which Cider plays when its spatial audio
+/// setting is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadFormat {
+    /// Only the stereo mix.
+    #[default]
+    Stereo,
+    /// The spatial mix when the song has one, otherwise the stereo one.
+    SpatialWhereAvailable,
+    /// The stereo mix, plus the spatial one when the song has it.
+    Both,
+}
+
+impl DownloadFormat {
+    /// Stable numeric form for `AtomicU8` storage and UI binding.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Stereo => 0,
+            Self::SpatialWhereAvailable => 1,
+            Self::Both => 2,
+        }
+    }
+
+    /// Parses the numeric form; unknown values map to
+    /// [`DownloadFormat::Stereo`].
+    #[must_use]
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::SpatialWhereAvailable,
+            2 => Self::Both,
+            _ => Self::Stereo,
+        }
+    }
+}
+
+/// What happens to unlinked downloads: downloaded files no album, playlist
+/// or single-song download needs any more (see
+/// [`crate::download_cleanup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlinkedCleanup {
+    /// Kept until the user clicks "Clean up now" in Settings.
+    #[default]
+    Manual,
+    /// Deleted by a check every [`Config::unlinked_cleanup_hours`] hours.
+    Automatic,
+}
+
+/// Default hours between automatic checks for unlinked downloads.
+pub const DEFAULT_UNLINKED_CLEANUP_HOURS: u32 = 6;
+/// Largest accepted number of hours between automatic checks (a week).
+pub const MAX_UNLINKED_CLEANUP_HOURS: u32 = 168;
+
 /// How the proxy presents the Apple Music library to Cider.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -194,9 +253,29 @@ pub struct Config {
     /// `0`, the value until the user picks one in Settings, means
     /// [`crate::DEFAULT_CONCURRENCY`].
     pub download_concurrency: u8,
+    /// Which mixes of a song downloads fetch (stereo, spatial where
+    /// available, or both).
+    pub download_format: DownloadFormat,
+    /// "Play the other downloaded mix": when Cider asks for a mix of a
+    /// song that isn't downloaded (stereo or spatial) but the other one is,
+    /// play the downloaded one instead of streaming from Apple. Offline this
+    /// always happens.
+    pub play_other_downloaded_mix: bool,
+    /// "Remove lyrics when removing downloads": "Remove download(s)" also
+    /// deletes the lyrics the app fetched for those songs. Lyrics the user
+    /// imported (custom lyrics) are never removed this way.
+    pub remove_lyrics_with_downloads: bool,
+    /// Unlinked downloads: kept until cleaned up by hand ("manual") or
+    /// deleted automatically ("automatic").
+    pub unlinked_downloads: UnlinkedCleanup,
+    /// Hours between automatic checks for unlinked downloads (1 to
+    /// [`MAX_UNLINKED_CLEANUP_HOURS`]). `0`, the value until the user picks
+    /// one, means [`DEFAULT_UNLINKED_CLEANUP_HOURS`].
+    pub unlinked_cleanup_hours: u32,
     /// When importing / downloading a track that already has audio, replace it
     /// instead of skipping.
     pub overwrite_audio: bool,
+
     /// When fetching lyrics in bulk (a collection, after a download), look
     /// songs that already have lyrics up again and replace them. Apple
     /// lyrics are always kept; a single song's "Fetch lyrics" always looks up.
@@ -287,6 +366,16 @@ impl Config {
         match self.download_concurrency {
             0 => crate::DEFAULT_CONCURRENCY,
             n => crate::clamp_concurrency(usize::from(n)),
+        }
+    }
+
+    /// Hours between automatic checks for unlinked downloads, clamped to
+    /// `1..=`[`MAX_UNLINKED_CLEANUP_HOURS`] ([`DEFAULT_UNLINKED_CLEANUP_HOURS`]
+    /// when unset).
+    pub fn unlinked_cleanup_hours(&self) -> u32 {
+        match self.unlinked_cleanup_hours {
+            0 => DEFAULT_UNLINKED_CLEANUP_HOURS,
+            n => n.min(MAX_UNLINKED_CLEANUP_HOURS),
         }
     }
 
@@ -785,6 +874,100 @@ mod tests {
         };
         let text = config.to_toml().unwrap();
         assert_eq!(Config::from_toml(&text, Path::new("x")).unwrap(), config);
+    }
+
+    #[test]
+    fn download_format_should_default_to_stereo() {
+        assert_eq!(Config::default().download_format, DownloadFormat::Stereo);
+    }
+
+    #[test]
+    fn download_format_should_parse_snake_case_names() {
+        let config = Config::from_toml(
+            "download_format = \"spatial_where_available\"\n",
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.download_format,
+            DownloadFormat::SpatialWhereAvailable
+        );
+    }
+
+    #[test]
+    fn download_format_should_roundtrip_through_toml() {
+        let config = Config {
+            download_format: DownloadFormat::Both,
+            ..Config::default()
+        };
+        let text = config.to_toml().unwrap();
+        assert_eq!(Config::from_toml(&text, Path::new("x")).unwrap(), config);
+    }
+
+    #[test]
+    fn unlinked_downloads_should_default_to_manual_every_six_hours() {
+        let config = Config::default();
+        assert_eq!(
+            (config.unlinked_downloads, config.unlinked_cleanup_hours()),
+            (UnlinkedCleanup::Manual, 6)
+        );
+    }
+
+    #[test]
+    fn unlinked_downloads_should_parse_from_toml() {
+        let config = Config::from_toml(
+            "unlinked_downloads = \"automatic\"\nunlinked_cleanup_hours = 12\n",
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(
+            (config.unlinked_downloads, config.unlinked_cleanup_hours()),
+            (UnlinkedCleanup::Automatic, 12)
+        );
+    }
+
+    #[test]
+    fn unlinked_cleanup_hours_should_be_capped_at_a_week() {
+        let config = Config {
+            unlinked_cleanup_hours: 10_000,
+            ..Config::default()
+        };
+        assert_eq!(config.unlinked_cleanup_hours(), MAX_UNLINKED_CLEANUP_HOURS);
+    }
+
+    #[test]
+    fn remove_lyrics_with_downloads_should_default_off() {
+        assert!(!Config::default().remove_lyrics_with_downloads);
+    }
+
+    #[test]
+    fn remove_lyrics_with_downloads_should_parse_from_toml() {
+        let config =
+            Config::from_toml("remove_lyrics_with_downloads = true\n", Path::new("x")).unwrap();
+        assert!(config.remove_lyrics_with_downloads);
+    }
+
+    #[test]
+    fn play_other_downloaded_mix_should_default_off() {
+        assert!(!Config::default().play_other_downloaded_mix);
+    }
+
+    #[test]
+    fn play_other_downloaded_mix_should_parse_from_toml() {
+        let config =
+            Config::from_toml("play_other_downloaded_mix = true\n", Path::new("x")).unwrap();
+        assert!(config.play_other_downloaded_mix);
+    }
+
+    #[test]
+    fn download_format_should_roundtrip_through_u8() {
+        for format in [
+            DownloadFormat::Stereo,
+            DownloadFormat::SpatialWhereAvailable,
+            DownloadFormat::Both,
+        ] {
+            assert_eq!(DownloadFormat::from_u8(format.as_u8()), format);
+        }
     }
 
     #[test]

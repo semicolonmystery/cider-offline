@@ -28,7 +28,7 @@ Everything the app stores is inside its `data` folder, but the certificate, the 
 1. It removes the certificate from the trust store, turns off start at login, and turns off Cider's proxy setting when it points at this proxy (Windows only; on macOS and Linux the app never changed Cider's settings).
 2. The app quits. After the proxy has stopped, it deletes the config, data and cache folders. On Windows it also removes the empty `cider-offline\CiderOffline` folders above them.
 
-The confirmation dialog names the folders it will delete. In a portable copy it deletes only the app's own entries inside `data` (`config`, `cache`, `store.sqlite` and its `-wal`, `-shm` and `-journal` files, `media`, `lyrics`, `ca`, `captures`, `instance.lock`, `device.wvd` and `.keep`). The `data` folder itself and anything else you keep in it stay.
+The confirmation dialog names the folders it will delete. In a portable copy it deletes only the app's own entries inside `data` (`config`, `cache`, `store.sqlite` and its `-wal`, `-shm` and `-journal` files, `media`, `lyrics`, `ca`, `captures`, `instance.lock`, `.keep` and the optional `device.wvd`). The `data` folder itself and anything else you keep in it stay.
 
 Files you picked from elsewhere, such as linked audio files or lyrics files, are never touched.
 

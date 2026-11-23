@@ -25,10 +25,10 @@
 mod apple;
 mod cdm;
 mod cenc;
+mod duration;
 mod error;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -37,15 +37,16 @@ use async_trait::async_trait;
 use base64::prelude::*;
 use cider_offline_core::CancellationToken;
 use cider_offline_core::download::{
-    DownloadError, DownloadProgress, DownloadRequest, DownloadStage, Downloader,
+    DownloadError, DownloadProgress, DownloadRequest, DownloadStage, Downloaded, Downloader,
     DownloaderCapabilities,
 };
-use cider_offline_core::storage::{Storage, TokenKind};
+use cider_offline_core::storage::{AudioVariant, Storage, TokenKind};
 use reqwest::header::HeaderMap;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::apple::{Apple, Manifest, SegmentRange};
+use crate::cenc::ContentKeys;
 
 pub use cdm::build_pssh_box;
 pub use error::DrmError;
@@ -56,6 +57,11 @@ pub const DRM_DOWNLOADER_ID: &str = "drm";
 /// Max concurrent segment downloads from the aod-ssl CDN. A small bound keeps
 /// the request pattern close to what a real browser issues.
 const SEGMENT_CONCURRENCY: usize = 6;
+
+/// Pause between the license requests of one spatial download (one per key
+/// group). Apple refuses licenses when many arrive within a second; two a
+/// fraction of a second apart match what Cider itself sends.
+const LICENSE_SPACING: Duration = Duration::from_millis(400);
 
 /// Bundled fallback WVD device blob. Used when no user-provided
 /// `device.wvd` is found in the app data directory. Enables DRM
@@ -201,41 +207,144 @@ impl Downloader for DrmDownloader {
     }
 
     fn capabilities(&self) -> DownloaderCapabilities {
-        DownloaderCapabilities::new().with_music_videos(true)
+        DownloaderCapabilities::new()
+            .with_music_videos(true)
+            .with_spatial(true)
     }
 
-    async fn fetch(&self, request: &DownloadRequest) -> Result<PathBuf, DownloadError> {
-        let path = fetch_inner(self, request)
+    async fn fetch(&self, request: &DownloadRequest) -> Result<Downloaded, DownloadError> {
+        fetch_inner(self, request)
             .await
-            .map_err(DownloadError::from)?;
-        Ok(path)
+            .map_err(DownloadError::from)
     }
 }
 
-async fn fetch_inner(dl: &DrmDownloader, request: &DownloadRequest) -> Result<PathBuf, DrmError> {
+/// Reports `stage` when the request has a progress sink.
+fn report_stage(progress: Option<&DownloadProgress>, stage: DownloadStage) {
+    if let Some(progress) = progress {
+        progress.stage(stage);
+    }
+}
+
+/// The encrypted file and the keys that decrypt it.
+struct Encrypted {
+    bytes: Vec<u8>,
+    keys: ContentKeys,
+}
+
+async fn fetch_inner(
+    dl: &DrmDownloader,
+    request: &DownloadRequest,
+) -> Result<Downloaded, DrmError> {
     let Tokens {
         developer: auth_token,
         media_user: media_user_token,
     } = dl.tokens().await?;
     let apple = Apple::new(dl.client.clone(), &auth_token, &media_user_token)?;
+    let adam_id = request.playback.adam_id();
+    let variant = request.variant;
 
-    let playback = &request.playback;
-    let adam_id = playback.adam_id();
+    tracing::info!(adam_id = %adam_id, kind = ?request.kind, %variant, "fetching playback info");
 
-    // Progress sink: cheap to Option-clone (the inner `DownloadProgress` is an
-    // mpsc sender). A tiny closure centralises the "Some → stage(), None → no-op"
-    // check so the call-site reads as a straight list of phase transitions.
-    let progress = request.progress.as_ref();
-    let stage = |s: DownloadStage| {
-        if let Some(p) = progress {
-            p.stage(s);
-        }
+    let encrypted = match variant {
+        AudioVariant::Stereo => fetch_normal(dl, &apple, request).await?,
+        AudioVariant::Spatial => fetch_spatial(dl, &apple, request).await?,
     };
 
-    tracing::info!(adam_id = %adam_id, kind = ?request.kind, "fetching playback info");
+    tracing::info!(
+        adam_id = %adam_id,
+        size = encrypted.bytes.len(),
+        "decrypting"
+    );
+
+    // Decrypt CENC fMP4, then write the real duration into its headers.
+    // Cancellation point right before the CPU-heavy step (the queue's
+    // contract: check between segments and before decryption), and the work
+    // runs on a blocking worker so a slow decrypt cannot stall the runtime.
+    report_stage(request.progress.as_ref(), DownloadStage::Decrypting);
+    if request.cancel.is_cancelled() {
+        return Err(DrmError::Cancelled);
+    }
+    let (decrypted, duration_ms) = tokio::task::spawn_blocking(move || {
+        let mut decrypted = cenc::decrypt(encrypted.bytes, &encrypted.keys)?;
+        // A file whose duration cannot be written still plays (players
+        // scan the fragments), so this never fails the download.
+        let duration_ms = match duration::write_duration(&mut decrypted) {
+            Ok(millis) => Some(millis),
+            Err(error) => {
+                tracing::warn!(%error, "could not write the file duration");
+                None
+            }
+        };
+        Ok::<_, DrmError>((decrypted, duration_ms))
+    })
+    .await
+    .map_err(|e| DrmError::Join(e.to_string()))??;
+
+    // Write atomically to request.output_path via `tempfile::NamedTempFile`:
+    // create a uniquely-named temp file in the destination directory, write
+    // all bytes, `sync_all` so the data hits disk before the rename, then
+    // `persist` to swap it into place. The temp file is deleted on drop if
+    // anything fails, so there is no `.m4a.part` to garbage-collect.
+    //
+    // `tempfile` is a synchronous std::fs API, so it runs on
+    // `spawn_blocking` to avoid stalling tokio workers (same pattern as the
+    // decrypt step above).
+    report_stage(request.progress.as_ref(), DownloadStage::Saving);
+    let dest = request.output_path.clone();
+    if let Some(dir) = dest.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let dest_for_write = dest.clone();
+    let cancel = request.cancel.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), DrmError> {
+        use std::io::Write as _;
+
+        let dir = dest_for_write.parent().ok_or_else(|| {
+            DrmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "output_path has no parent directory",
+            ))
+        })?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(DrmError::Io)?;
+        tmp.write_all(&decrypted).map_err(DrmError::Io)?;
+        tmp.as_file().sync_all().map_err(DrmError::Io)?;
+        // Last cancellation point: a cancelled download must not replace or
+        // create the file. Returning drops `tmp`, which deletes it.
+        if cancel.is_cancelled() {
+            return Err(DrmError::Cancelled);
+        }
+        tmp.persist(&dest_for_write)
+            .map_err(|e| DrmError::Io(e.error))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| DrmError::Join(e.to_string()))??;
+
+    tracing::info!(
+        adam_id = %adam_id,
+        %variant,
+        duration_ms = ?duration_ms,
+        path = %dest.display(),
+        "download complete"
+    );
+
+    Ok(Downloaded::new(dest, variant).with_duration_ms(duration_ms))
+}
+
+/// The normal version: webPlayback's `ctrp256` asset (or a music video's
+/// audio rendition), one Widevine key for the whole file.
+async fn fetch_normal(
+    dl: &DrmDownloader,
+    apple: &Apple,
+    request: &DownloadRequest,
+) -> Result<Encrypted, DrmError> {
+    let playback = &request.playback;
+    let adam_id = playback.adam_id();
+    let progress = request.progress.as_ref();
 
     // 1. webPlayback: pick the song asset OR the music-video master playlist URL.
-    stage(DownloadStage::Requesting);
+    report_stage(progress, DownloadStage::Requesting);
     let playback_info = apple.fetch_playback(playback, request.kind).await?;
 
     // 2. Resolve HLS manifest -> PSSH + segment list + init segment. For a song
@@ -256,7 +365,7 @@ async fn fetch_inner(dl: &DrmDownloader, request: &DownloadRequest) -> Result<Pa
     );
 
     // 3. widevineCert: binary service certificate.
-    stage(DownloadStage::License);
+    report_stage(progress, DownloadStage::License);
     let service_cert = apple.fetch_widevine_cert(&playback_info.cert_url).await?;
 
     // 4. Open CDM session with PSSH init-data + cert; produce challenge.
@@ -280,7 +389,7 @@ async fn fetch_inner(dl: &DrmDownloader, request: &DownloadRequest) -> Result<Pa
         .await?;
 
     // 6. Parse license to recover the AES-128 content key.
-    let content_key = session.parse_license_response(&license_bytes)?;
+    let content_key = cenc::content_key(&session.parse_license_response(&license_bytes)?)?;
 
     tracing::info!(
         adam_id = %adam_id,
@@ -292,67 +401,142 @@ async fn fetch_inner(dl: &DrmDownloader, request: &DownloadRequest) -> Result<Pa
     //    Byte progress is reported from inside each per-URL chunk loop; cancel
     //    is checked between chunks so a Pause / remove during a long body read
     //    cleanly returns `DrmError::Cancelled`.
-    stage(DownloadStage::Fetching);
-    let encrypted = download_segments(&dl.client, &hls, progress, &request.cancel).await?;
+    report_stage(progress, DownloadStage::Fetching);
+    let assembled = download_segments(
+        &dl.client,
+        &hls.init_segment,
+        &hls.segments,
+        progress,
+        &request.cancel,
+    )
+    .await?;
+    Ok(Encrypted {
+        bytes: assembled.bytes,
+        keys: ContentKeys::single(content_key),
+    })
+}
+
+/// The spatial version: the binaural variant of the song's enhancedHls
+/// master, with one Widevine key per key group (Apple uses two: `s1/e1` for
+/// the first segment, the content key for the rest).
+///
+/// No webPlayback or widevineCert call is made: the playlists are public,
+/// the license endpoint is fixed, and the challenge carries the client id in
+/// cleartext as on the normal path. The license requests are spaced
+/// [`LICENSE_SPACING`] apart.
+async fn fetch_spatial(
+    dl: &DrmDownloader,
+    apple: &Apple,
+    request: &DownloadRequest,
+) -> Result<Encrypted, DrmError> {
+    let playback = &request.playback;
+    let adam_id = playback.adam_id();
+    let progress = request.progress.as_ref();
+    let unavailable = || DrmError::VariantUnavailable(AudioVariant::Spatial);
+
+    report_stage(progress, DownloadStage::Requesting);
+    let master = request.enhanced_hls.as_deref().ok_or_else(unavailable)?;
+    let hls = apple::fetch_spatial_hls(&dl.client, master)
+        .await?
+        .ok_or_else(unavailable)?;
 
     tracing::info!(
         adam_id = %adam_id,
-        size = encrypted.len(),
-        "decrypting"
+        key_groups = hls.key_groups.len(),
+        segments = hls.segments.len(),
+        "negotiating Widevine licenses for the spatial stream"
     );
 
-    // 8. Decrypt CENC fMP4. Cancellation point right before the CPU-heavy step
-    //    (the queue's contract: check between segments and before
-    //    decryption), and the actual AES pass runs on a blocking worker so a
-    //    slow decrypt cannot stall the tokio runtime.
-    stage(DownloadStage::Decrypting);
-    if request.cancel.is_cancelled() {
-        return Err(DrmError::Cancelled);
+    report_stage(progress, DownloadStage::License);
+    let mut group_keys: Vec<[u8; 16]> = Vec::with_capacity(hls.key_groups.len());
+    for (index, group) in hls.key_groups.iter().enumerate() {
+        // The same key line twice needs one license only.
+        if let Some(earlier) = hls.key_groups[..index]
+            .iter()
+            .position(|g| g.key_uri == group.key_uri)
+        {
+            group_keys.push(group_keys[earlier]);
+            continue;
+        }
+        if index > 0 {
+            tokio::select! {
+                biased;
+                () = request.cancel.cancelled() => return Err(DrmError::Cancelled),
+                () = tokio::time::sleep(LICENSE_SPACING) => {}
+            }
+        }
+        let mut session = dl.cdm.open_session(&group.pssh)?;
+        let challenge = BASE64_STANDARD.encode(session.create_license_request()?);
+        let license = apple
+            .acquire_license(apple::LICENSE_URL, &challenge, &group.key_uri, playback)
+            .await?;
+        group_keys.push(cenc::content_key(
+            &session.parse_license_response(&license)?,
+        )?);
+        tracing::debug!(
+            adam_id = %adam_id,
+            group = index,
+            segments = ?group.segments,
+            "spatial key group licensed"
+        );
     }
-    let pssh_init = hls.pssh_init_data.clone();
-    let decrypted =
-        tokio::task::spawn_blocking(move || cenc::decrypt(encrypted, &pssh_init, &content_key))
-            .await
-            .map_err(|e| DrmError::Join(e.to_string()))??;
 
-    // 9. Write atomically to request.output_path via `tempfile::NamedTempFile`:
-    //    create a uniquely-named temp file in the destination directory, write
-    //    all bytes, `sync_all` so the data hits disk before the rename, then
-    //    `persist` to swap it into place. The temp file is deleted on drop if
-    //    anything fails, so there is no `.m4a.part` to garbage-collect.
-    //
-    //    `tempfile` is a synchronous std::fs API, so it runs on
-    //    `spawn_blocking` to avoid stalling tokio workers (same pattern as the
-    //    decrypt step above).
-    stage(DownloadStage::Saving);
-    let dest = request.output_path.clone();
-    if let Some(dir) = dest.parent() {
-        tokio::fs::create_dir_all(dir).await?;
-    }
-    let decrypted_for_write = decrypted;
-    let dest_for_write = dest.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), DrmError> {
-        use std::io::Write as _;
-
-        let dir = dest_for_write.parent().ok_or_else(|| {
-            DrmError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "output_path has no parent directory",
-            ))
-        })?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(DrmError::Io)?;
-        tmp.write_all(&decrypted_for_write).map_err(DrmError::Io)?;
-        tmp.as_file().sync_all().map_err(DrmError::Io)?;
-        tmp.persist(&dest_for_write)
-            .map_err(|e| DrmError::Io(e.error))?;
-        Ok(())
+    report_stage(progress, DownloadStage::Fetching);
+    let assembled = download_segments(
+        &dl.client,
+        &hls.init_segment,
+        &hls.segments,
+        progress,
+        &request.cancel,
+    )
+    .await?;
+    let keys = spatial_keys(&assembled, &hls.key_groups, &group_keys)?;
+    Ok(Encrypted {
+        bytes: assembled.bytes,
+        keys,
     })
-    .await
-    .map_err(|e| DrmError::Join(e.to_string()))??;
+}
 
-    tracing::info!(adam_id = %adam_id, path = %dest.display(), "download complete");
-
-    Ok(dest)
+/// Maps each sample description to its key group's key: every `moof` lies
+/// in one segment, the segment in one key group, and the `moof` names its
+/// sample description. A sample description reached from two groups with
+/// different keys is an error.
+fn spatial_keys(
+    assembled: &Assembled,
+    groups: &[apple::KeyGroup],
+    group_keys: &[[u8; 16]],
+) -> Result<ContentKeys, DrmError> {
+    let mut by_index: Vec<(u32, [u8; 16])> = Vec::new();
+    for (moof, index) in cenc::fragment_sample_descriptions(&assembled.bytes)? {
+        // Piece 0 is the init segment; piece n + 1 is media segment n.
+        let piece = assembled
+            .starts
+            .partition_point(|&start| start <= moof)
+            .checked_sub(1)
+            .ok_or_else(|| DrmError::Decrypt(format!("moof at {moof} precedes every segment")))?;
+        let segment = piece
+            .checked_sub(1)
+            .ok_or_else(|| DrmError::Decrypt(format!("moof at {moof} lies in the init segment")))?;
+        let group = groups
+            .iter()
+            .position(|g| g.segments.contains(&segment))
+            .ok_or_else(|| DrmError::Decrypt(format!("segment {segment} has no key group")))?;
+        let key = group_keys[group];
+        match by_index.iter().find(|(i, _)| *i == index) {
+            Some((_, known)) if *known != key => {
+                return Err(DrmError::Decrypt(format!(
+                    "sample description {index} is used by two key groups"
+                )));
+            }
+            Some(_) => {}
+            None => by_index.push((index, key)),
+        }
+    }
+    tracing::debug!(
+        sample_descriptions = ?by_index.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        "spatial keys mapped"
+    );
+    Ok(ContentKeys::by_sample_description(by_index))
 }
 
 /// Union of the ranges requested from a single URL.
@@ -409,6 +593,15 @@ struct FetchContext {
     total: Arc<AtomicU64>,
 }
 
+/// The downloaded file: the init segment and every media segment, in
+/// playlist order.
+struct Assembled {
+    bytes: Vec<u8>,
+    /// Offset in `bytes` where each piece starts: index 0 is the init
+    /// segment, index `n + 1` media segment `n`.
+    starts: Vec<usize>,
+}
+
 /// Downloads the init segment plus every media segment, honoring
 /// `#EXT-X-BYTERANGE` / `#EXT-X-MAP:BYTERANGE`.
 ///
@@ -419,14 +612,15 @@ struct FetchContext {
 /// while remaining correct for streams that genuinely span many URLs.
 async fn download_segments(
     client: &reqwest::Client,
-    hls: &apple::HlsInfo,
+    init_segment: &SegmentRange,
+    segments: &[SegmentRange],
     progress: Option<&DownloadProgress>,
     cancel: &CancellationToken,
-) -> Result<Vec<u8>, DrmError> {
+) -> Result<Assembled, DrmError> {
     // 1. Assemble the ordered list of pieces: init first, then media segments.
-    let mut refs: Vec<SegmentRange> = Vec::with_capacity(hls.segments.len() + 1);
-    refs.push(hls.init_segment.clone());
-    refs.extend(hls.segments.iter().cloned());
+    let mut refs: Vec<SegmentRange> = Vec::with_capacity(segments.len() + 1);
+    refs.push(init_segment.clone());
+    refs.extend(segments.iter().cloned());
 
     // 2. Compute each unique URL's union-range, preserving first-seen order
     //    so logs and traces stay deterministic.
@@ -658,7 +852,7 @@ fn parse_content_range(value: &str) -> Option<(u64, u64)> {
 fn assemble_from_fetched(
     refs: &[SegmentRange],
     fetched: &HashMap<String, FetchedUrl>,
-) -> Result<Vec<u8>, DrmError> {
+) -> Result<Assembled, DrmError> {
     // Reserve for the ranged portions; whole-file pieces are a rare path and
     // the extend_from_slice below will grow the vec as needed.
     let hinted: usize = refs
@@ -666,7 +860,9 @@ fn assemble_from_fetched(
         .filter_map(|r| r.byte_range.and_then(|(_, len)| usize::try_from(len).ok()))
         .sum();
     let mut out = Vec::with_capacity(hinted);
+    let mut starts = Vec::with_capacity(refs.len());
     for r in refs {
+        starts.push(out.len());
         let got = fetched.get(&r.url).ok_or_else(|| {
             DrmError::Api(format!("internal: no fetched buffer for url {}", r.url))
         })?;
@@ -704,7 +900,7 @@ fn assemble_from_fetched(
             }
         }
     }
-    Ok(out)
+    Ok(Assembled { bytes: out, starts })
 }
 
 #[cfg(test)]
@@ -743,7 +939,7 @@ mod tests {
                 bytes: full[..5006].to_vec(),
             },
         )]);
-        let out = assemble_from_fetched(&refs, &fetched).unwrap();
+        let out = assemble_from_fetched(&refs, &fetched).unwrap().bytes;
         let expected_len: u64 = refs
             .iter()
             .map(|r| r.byte_range.map_or(0, |(_, l)| l))
@@ -781,7 +977,7 @@ mod tests {
                 bytes: full.clone(),
             },
         )]);
-        let out = assemble_from_fetched(&refs, &fetched).unwrap();
+        let out = assemble_from_fetched(&refs, &fetched).unwrap().bytes;
         assert_eq!(out.len(), 250);
         assert_eq!(&out[..50], &full[100..150]);
         assert_eq!(&out[50..250], &full[1000..1200]);
@@ -802,7 +998,7 @@ mod tests {
                 bytes: full[200..550].to_vec(),
             },
         )]);
-        let out = assemble_from_fetched(&refs, &fetched).unwrap();
+        let out = assemble_from_fetched(&refs, &fetched).unwrap().bytes;
         assert_eq!(out.len(), 150);
         assert_eq!(&out[..100], &full[200..300]);
         assert_eq!(&out[100..150], &full[500..550]);
@@ -819,8 +1015,7 @@ mod tests {
         // Minimal non-CENC payload: one `ftyp` box with no body. `decrypt`
         // walks the structure, finds no `moov`, and returns a typed error.
         let data: Vec<u8> = vec![0, 0, 0, 8, b'f', b't', b'y', b'p'];
-        let key_id = vec![0u8; 16];
-        let content_key = vec![0u8; 16];
+        let keys = ContentKeys::single([0u8; 16]);
 
         // A current-thread runtime is enough — the test only awaits the
         // single `JoinHandle` and exercises the error-mapping glue. No new
@@ -831,7 +1026,7 @@ mod tests {
             .build()
             .unwrap();
         let out = rt.block_on(async move {
-            tokio::task::spawn_blocking(move || cenc::decrypt(data, &key_id, &content_key))
+            tokio::task::spawn_blocking(move || cenc::decrypt(data, &keys))
                 .await
                 .map_err(|e| DrmError::Join(e.to_string()))
         });
@@ -944,5 +1139,90 @@ mod tests {
             vec![(400, 1_000), (800, 1_000), (1_200, 1_200)],
             "`report(done, Some(total))` must always satisfy done <= total"
         );
+    }
+
+    // --- spatial key mapping -------------------------------------------------
+
+    fn mk_box(ty: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut v = u32::try_from(8 + payload.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        v.extend_from_slice(ty);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A `moof` whose `tfhd` names `index`, or relies on the default.
+    fn mk_moof(index: Option<u32>) -> Vec<u8> {
+        let tfhd = match index {
+            Some(i) => mk_box(
+                b"tfhd",
+                &[&[0, 0, 0, 2][..], &1u32.to_be_bytes(), &i.to_be_bytes()].concat(),
+            ),
+            None => mk_box(b"tfhd", &[&[0, 0, 0, 0][..], &1u32.to_be_bytes()].concat()),
+        };
+        mk_box(b"moof", &mk_box(b"traf", &tfhd))
+    }
+
+    /// Init piece + three one-moof segments (default, 2, 2).
+    fn assembled() -> Assembled {
+        let pieces = [
+            mk_box(b"ftyp", b"iso5"),
+            mk_moof(None),
+            mk_moof(Some(2)),
+            mk_moof(Some(2)),
+        ];
+        let mut bytes = Vec::new();
+        let mut starts = Vec::new();
+        for piece in &pieces {
+            starts.push(bytes.len());
+            bytes.extend_from_slice(piece);
+        }
+        Assembled { bytes, starts }
+    }
+
+    fn group(segments: std::ops::Range<usize>) -> apple::KeyGroup {
+        apple::KeyGroup {
+            key_uri: format!("data:;base64,{}", segments.start),
+            pssh: Vec::new(),
+            segments,
+        }
+    }
+
+    #[test]
+    fn spatial_keys_should_map_each_sample_description_to_its_group_key() {
+        let keys = spatial_keys(
+            &assembled(),
+            &[group(0..1), group(1..3)],
+            &[[1; 16], [2; 16]],
+        );
+        assert_eq!(
+            format!("{:?}", keys.unwrap()),
+            "ContentKeys { single: false, sample_descriptions: [1, 2], .. }"
+        );
+    }
+
+    #[test]
+    fn spatial_keys_should_reject_one_description_with_two_keys() {
+        let keys = spatial_keys(
+            &assembled(),
+            &[group(0..2), group(2..3)],
+            &[[1; 16], [2; 16]],
+        );
+        assert!(matches!(keys, Err(DrmError::Decrypt(_))));
+    }
+
+    #[test]
+    fn spatial_keys_should_reject_a_segment_outside_every_group() {
+        let keys = spatial_keys(&assembled(), &[group(0..1)], &[[1; 16]]);
+        assert!(matches!(keys, Err(DrmError::Decrypt(_))));
+    }
+
+    #[test]
+    fn drm_downloader_should_declare_spatial_support() {
+        let storage = Storage::open_in_memory().unwrap();
+        let drm = DrmDownloader::with_default_device(storage).unwrap();
+        assert!(drm.capabilities().spatial);
     }
 }

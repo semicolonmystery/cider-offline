@@ -1,7 +1,9 @@
 //! macOS calls (all safe objc2 bindings).
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSRunningApplication};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace,
+};
 
 /// Yields activation to process `pid` (macOS 14+, where cooperative
 /// activation applies). Must run on the main thread; otherwise a no-op.
@@ -58,4 +60,9 @@ pub fn activate_app() {
         )]
         app.activateIgnoringOtherApps(true);
     }
+}
+
+/// Accessibility > Display > Reduce motion.
+pub fn prefers_reduced_motion() -> bool {
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }
